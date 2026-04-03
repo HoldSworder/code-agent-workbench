@@ -36,6 +36,9 @@ importers:
         specifier: '4'
         version: 4.6.4(vue@3.5.31)
     devDependencies:
+      '@iconify-json/carbon':
+        specifier: ^1.2.20
+        version: 1.2.20
       '@tauri-apps/cli':
         specifier: ^2.10.1
         version: 2.10.1
@@ -685,6 +688,12 @@ packages:
   /@humanwhocodes/retry@0.4.3:
     resolution: {integrity: sha512-bV0Tgo9K4hfPCek+aMAn81RppFKv2ySDQeMoSZuvTASywNTnVJCArCZE2FWqpvIatKu7VMRLWlR1EazvVhDyhQ==}
     engines: {node: '>=18.18'}
+    dev: true
+
+  /@iconify-json/carbon@1.2.20:
+    resolution: {integrity: sha512-wqyxKEbIRdzGdfCAwQqn8iSfO6jx0m1toZAAQdx1NFjxd6iFl1YY4eKI1woWt7XOxs7s7phMW530kDD867JZGw==}
+    dependencies:
+      '@iconify/types': 2.0.0
     dev: true
 
   /@iconify/types@2.0.0:
