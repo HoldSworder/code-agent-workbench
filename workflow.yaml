@@ -1,0 +1,85 @@
+name: fe-dev-workflow
+description: 前端需求研发工作流
+
+phases:
+  - id: design
+    name: 设计探索
+    requires_confirm: true
+    provider: api
+    skill: skills/design.md
+    tools:
+      - read-file
+      - list-directory
+
+  - id: plan
+    name: 任务规划
+    requires_confirm: true
+    provider: api
+    skill: skills/plan.md
+    tools:
+      - read-file
+      - write-file
+
+  - id: t1-dev
+    name: T1 前端开发
+    requires_confirm: false
+    provider: external-cli
+    skill: skills/t1-dev.md
+    mcp_config: mcp-configs/dev.json
+    completion_check: tasks-all-checked
+
+  - id: review
+    name: 代码审查
+    requires_confirm: true
+    provider: api
+    skill: skills/review.md
+    tools:
+      - git-diff
+      - read-file
+    confirm_files:
+      - __agent_output__
+
+  - id: verify
+    name: 验证
+    requires_confirm: false
+    provider: script
+    script: scripts/verify.sh
+
+  - id: mr
+    name: 创建 MR
+    requires_confirm: true
+    provider: script
+    script: scripts/gitlab-mr.sh
+    args:
+      - --target
+      - develop
+      - --auto-merge
+
+events:
+  - id: backend-spec-arrived
+    name: 后端 Spec 到达
+    after_phase: t1-dev
+    skill: skills/integration.md
+    provider: external-cli
+    mcp_config: mcp-configs/integration.json
+
+  - id: test-spec-arrived
+    name: 测试 Spec 到达
+    after_phase: t1-dev
+    skill: skills/test-spec.md
+    provider: api
+
+  - id: e2e-verify
+    name: E2E 验证
+    after_phase: t1-dev
+    skill: skills/e2e.md
+    provider: external-cli
+    mcp_config: mcp-configs/e2e.json
+    confirm_files:
+      - "{{openspec_path}}/e2e-report.md"
+
+  - id: archive
+    name: 归档
+    after_phase: e2e-verify
+    provider: script
+    script: scripts/archive.sh
