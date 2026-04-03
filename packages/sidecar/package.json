@@ -9,6 +9,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
     "better-sqlite3": "^12.8.0",
     "yaml": "^2.8.3",
     "zod": "^4.3.6"
