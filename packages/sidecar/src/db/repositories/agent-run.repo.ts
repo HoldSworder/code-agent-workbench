@@ -11,6 +11,7 @@ export interface AgentRun {
   finished_at: string | null
   token_usage: number | null
   error: string | null
+  session_id: string | null
 }
 
 export interface CreateAgentRunInput {
@@ -39,6 +40,24 @@ export class AgentRunRepository {
     return this.db.prepare('SELECT * FROM agent_runs WHERE id = ?').get(id) as AgentRun | undefined
   }
 
+  findLastByTask(repoTaskId: string): AgentRun | undefined {
+    return this.db
+      .prepare('SELECT * FROM agent_runs WHERE repo_task_id = ? ORDER BY started_at DESC LIMIT 1')
+      .get(repoTaskId) as AgentRun | undefined
+  }
+
+  deleteByTask(repoTaskId: string): void {
+    this.db.prepare('DELETE FROM agent_runs WHERE repo_task_id = ?').run(repoTaskId)
+  }
+
+  deleteByTaskAndPhases(repoTaskId: string, phaseIds: string[]): void {
+    if (!phaseIds.length) return
+    const placeholders = phaseIds.map(() => '?').join(',')
+    this.db.prepare(
+      `DELETE FROM agent_runs WHERE repo_task_id = ? AND phase_id IN (${placeholders})`,
+    ).run(repoTaskId, ...phaseIds)
+  }
+
   findByTaskId(repoTaskId: string): AgentRun[] {
     return this.db
       .prepare('SELECT * FROM agent_runs WHERE repo_task_id = ? ORDER BY started_at ASC')
@@ -50,6 +69,7 @@ export class AgentRunRepository {
     status: string,
     tokenUsage?: number,
     error?: string,
+    sessionId?: string,
   ): void {
     this.db
       .prepare(
@@ -58,10 +78,22 @@ export class AgentRunRepository {
       SET status = ?,
           finished_at = datetime('now'),
           token_usage = ?,
-          error = ?
+          error = ?,
+          session_id = ?
       WHERE id = ?
     `,
       )
-      .run(status, tokenUsage ?? null, error ?? null, id)
+      .run(status, tokenUsage ?? null, error ?? null, sessionId ?? null, id)
+  }
+
+  findLastSessionId(repoTaskId: string, phaseId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT session_id FROM agent_runs
+         WHERE repo_task_id = ? AND phase_id = ? AND session_id IS NOT NULL AND status = 'success'
+         ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(repoTaskId, phaseId) as { session_id: string } | undefined
+    return row?.session_id ?? null
   }
 }

@@ -1,37 +1,126 @@
 name: fe-dev-workflow
-description: 前端需求研发工作流
+description: >-
+  前端 Spec-Driven 研发工作流。
+  对齐 fe-sdd / fe-specflow：设计探索 → 任务规划 → T1 开发 → 审查 → 验证 → MR，
+  T1 后事件驱动（后端 Spec / 测试 Spec / E2E / 归档）。
+  OpenSpec CLI 命令由 Agent 直接执行，Superpowers 技能由 Agent 直接调用。
 
+# ──────────────────────────────────────────────
+# 外部依赖声明
+# ──────────────────────────────────────────────
+dependencies:
+  openspec:
+    type: cli
+    check: "which openspec"
+    install_hint: "npm install -g openspec"
+    commands:
+      - openspec new change
+      - openspec continue
+      - openspec validate
+      - openspec archive
+
+  superpowers:
+    type: skill-pack
+    skills:
+      brainstorming: superpowers:brainstorming
+      test-driven-development: superpowers:test-driven-development
+      verification-before-completion: superpowers:verification-before-completion
+      writing-plans: superpowers:writing-plans
+
+  fe-specflow:
+    type: skill-pack
+    skills:
+      design-to-opsx: fe-specflow:design-to-opsx
+      pull-spec: fe-specflow:pull-spec
+      e2e-verify: fe-specflow:e2e-verify
+
+# ──────────────────────────────────────────────
+# 状态推断（基于 openspec 变更目录中的文件产物）
+# ──────────────────────────────────────────────
+state_inference:
+  rules:
+    - condition: no_change_dir
+      phase: design
+      description: 无变更目录 → 设计探索
+
+    - condition: has_proposal_and_specs_no_tasks
+      phase: plan
+      description: 有 proposal.md + specs/ 但无 tasks.md → 任务规划
+
+    - condition: tasks_has_unchecked
+      phase: t1-dev
+      description: tasks.md 有未勾选项 → T1 前端开发
+
+    - condition: tasks_all_checked
+      phase: waiting_event
+      description: tasks.md 全部勾选 → 进入事件驱动阶段
+
+    - condition: e2e_report_pass
+      phase: archive
+      description: e2e-report.md 且验收结论允许归档 → 可归档
+
+    - condition: e2e_report_fail_no_consent
+      phase: e2e-verify
+      description: e2e-report.md 结论不通过且未同意带债 → 须继续修/重跑
+
+# ──────────────────────────────────────────────
+# 线性阶段定义（按顺序执行）
+# ──────────────────────────────────────────────
 phases:
   - id: design
     name: 设计探索
     requires_confirm: true
-    provider: api
+    provider: external-cli
     skill: skills/design.md
+    invoke_skills:
+      - superpowers:brainstorming
+      - fe-specflow:design-to-opsx
+    invoke_commands:
+      - openspec new change "{{change_id}}"
     tools:
+      - feishu-read-doc
+      - figma-get-node
       - read-file
       - list-directory
+      - gitlab-read-file
+      - shell-execute
+    confirm_files:
+      - "{{openspec_path}}/proposal.md"
+      - "{{openspec_path}}/specs/*/spec.md"
+    guardrails:
+      - must_brainstorm_before_code
+      - no_openspec_write_before_confirm
 
   - id: plan
     name: 任务规划
     requires_confirm: true
-    provider: api
+    provider: external-cli
     skill: skills/plan.md
+    invoke_commands:
+      - openspec continue "{{change_id}}"
+      - openspec validate "{{change_id}}"
     tools:
       - read-file
       - write-file
+      - shell-execute
+    confirm_files:
+      - "{{openspec_path}}/tasks.md"
 
   - id: t1-dev
     name: T1 前端开发
     requires_confirm: false
     provider: external-cli
     skill: skills/t1-dev.md
+    invoke_skills:
+      - superpowers:test-driven-development
+      - superpowers:verification-before-completion
     mcp_config: mcp-configs/dev.json
     completion_check: tasks-all-checked
 
   - id: review
     name: 代码审查
     requires_confirm: true
-    provider: api
+    provider: external-cli
     skill: skills/review.md
     tools:
       - git-diff
@@ -44,6 +133,8 @@ phases:
     requires_confirm: false
     provider: script
     script: scripts/verify.sh
+    invoke_skills:
+      - superpowers:verification-before-completion
 
   - id: mr
     name: 创建 MR
@@ -55,31 +146,85 @@ phases:
       - develop
       - --auto-merge
 
+# ──────────────────────────────────────────────
+# 事件驱动阶段（T1 完成后，等待外部事件触发）
+# ──────────────────────────────────────────────
 events:
   - id: backend-spec-arrived
     name: 后端 Spec 到达
     after_phase: t1-dev
-    skill: skills/integration.md
     provider: external-cli
+    skill: skills/integration.md
+    invoke_skills:
+      - fe-specflow:pull-spec
     mcp_config: mcp-configs/integration.json
+    triggers:
+      - "后端spec到了"
+      - "后端接口文档来了"
+      - "API文档到了"
+      - "后端给了spec"
 
   - id: test-spec-arrived
     name: 测试 Spec 到达
     after_phase: t1-dev
+    provider: external-cli
     skill: skills/test-spec.md
-    provider: api
+    invoke_skills:
+      - fe-specflow:pull-spec
+    triggers:
+      - "测试spec到了"
+      - "测试用例来了"
+      - "QA文档到了"
+      - "测试给了spec"
 
   - id: e2e-verify
-    name: E2E 验证
+    name: E2E Browser 交叉验证
     after_phase: t1-dev
-    skill: skills/e2e.md
     provider: external-cli
+    skill: skills/e2e.md
+    invoke_skills:
+      - fe-specflow:e2e-verify
+      - superpowers:verification-before-completion
     mcp_config: mcp-configs/e2e.json
     confirm_files:
       - "{{openspec_path}}/e2e-report.md"
+    triggers:
+      - "跑自动化验证"
+      - "跑e2e"
+      - "浏览器验证"
+      - "用这个spec跑e2e"
 
   - id: archive
     name: 归档
     after_phase: e2e-verify
+    invoke_commands:
+      - openspec archive "{{change_id}}" --yes
     provider: script
     script: scripts/archive.sh
+    precondition: e2e_report_pass
+    triggers:
+      - "归档"
+      - "archive"
+      - "可以归档了"
+
+# ──────────────────────────────────────────────
+# 触发语 → 阶段映射（自然语言路由）
+# ──────────────────────────────────────────────
+trigger_mapping:
+  - patterns: ["新需求", "新功能", "开始开发", "做个新feature"]
+    target: design
+
+  - patterns: ["继续开发", "接着做", "继续这个需求"]
+    target: infer_from_state
+
+  - patterns: ["后端spec", "后端接口文档", "API文档"]
+    target: backend-spec-arrived
+
+  - patterns: ["测试spec", "测试用例", "QA文档"]
+    target: test-spec-arrived
+
+  - patterns: ["跑e2e", "浏览器验证", "自动化验证"]
+    target: e2e-verify
+
+  - patterns: ["归档", "archive"]
+    target: archive

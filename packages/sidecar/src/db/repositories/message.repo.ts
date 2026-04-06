@@ -33,6 +33,18 @@ export class MessageRepository {
     return this.db.prepare('SELECT * FROM conversation_messages WHERE id = ?').get(id) as Message
   }
 
+  deleteByTask(taskId: string): void {
+    this.db.prepare('DELETE FROM conversation_messages WHERE repo_task_id = ?').run(taskId)
+  }
+
+  deleteByTaskAndPhases(taskId: string, phaseIds: string[]): void {
+    if (!phaseIds.length) return
+    const placeholders = phaseIds.map(() => '?').join(',')
+    this.db.prepare(
+      `DELETE FROM conversation_messages WHERE repo_task_id = ? AND phase_id IN (${placeholders})`,
+    ).run(taskId, ...phaseIds)
+  }
+
   findByTaskAndPhase(taskId: string, phaseId: string): Message[] {
     return this.db
       .prepare(

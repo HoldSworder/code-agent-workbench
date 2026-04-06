@@ -44,7 +44,8 @@ export function applySchema(db: Database.Database): void {
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       finished_at TEXT,
       token_usage INTEGER,
-      error TEXT
+      error TEXT,
+      session_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -56,9 +57,21 @@ export function applySchema(db: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_repo_tasks_requirement ON repo_tasks(requirement_id);
     CREATE INDEX IF NOT EXISTS idx_repo_tasks_repo ON repo_tasks(repo_id);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_task ON agent_runs(repo_task_id);
     CREATE INDEX IF NOT EXISTS idx_messages_task ON conversation_messages(repo_task_id);
   `)
+
+  // Migration: add session_id column if missing (existing DBs)
+  const cols = db.prepare(`PRAGMA table_info(agent_runs)`).all() as { name: string }[]
+  if (!cols.some(c => c.name === 'session_id')) {
+    db.exec(`ALTER TABLE agent_runs ADD COLUMN session_id TEXT`)
+  }
 }
