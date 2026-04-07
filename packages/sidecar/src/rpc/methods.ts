@@ -9,7 +9,8 @@ import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { spawn as spawnChild } from 'node:child_process'
 import type { WorkflowEngine } from '../workflow/engine'
-import { createWorktree } from '../git/operations'
+import { createWorktree, getChangedFiles, getFileDiff } from '../git/operations'
+import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 
 function changeIdFromRequirementTitle(title: string): string {
   const slug = title
@@ -40,6 +41,7 @@ export function registerMethods(
   const msgRepo = new MessageRepository(db)
   const runRepo = new AgentRunRepository(db)
   const settingsRepo = new SettingsRepository(db)
+  const commitRepo = new PhaseCommitRepository(db)
 
   // ── Repo CRUD ──
   server.register('repo.list', async () => repoRepo.findAll())
@@ -102,6 +104,33 @@ export function registerMethods(
     return { error: run.error ?? 'Unknown error', phase: run.phase_id, finishedAt: run.finished_at }
   })
 
+  // ── Changed files (git diff against initial commit) ──
+  server.register('task.changedFiles', async ({ repoTaskId }) => {
+    const task = taskRepo.findById(repoTaskId)
+    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
+    const baseSha = commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+    try {
+      const files = await getChangedFiles(task.worktree_path, baseSha)
+      return { files }
+    }
+    catch {
+      return { files: [] }
+    }
+  })
+
+  server.register('task.fileDiff', async ({ repoTaskId, filePath }) => {
+    const task = taskRepo.findById(repoTaskId)
+    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
+    const baseSha = commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+    try {
+      const diff = await getFileDiff(task.worktree_path, baseSha, filePath)
+      return { diff }
+    }
+    catch {
+      return { diff: '' }
+    }
+  })
+
   // ── Conversation ──
   server.register('message.list', async ({ taskId, phaseId }) =>
     msgRepo.findByTaskAndPhase(taskId, phaseId),
@@ -156,6 +185,13 @@ export function registerMethods(
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
     await engine.resetTask(repoTaskId)
+    return { ok: true }
+  })
+
+  server.register('workflow.resetPhase', async ({ repoTaskId }) => {
+    engine.resetCurrentPhase(repoTaskId).catch((err) => {
+      process.stderr.write(`[workflow] resetPhase failed for ${repoTaskId}: ${err}\n`)
+    })
     return { ok: true }
   })
 

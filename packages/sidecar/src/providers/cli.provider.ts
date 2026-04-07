@@ -1,5 +1,13 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AgentProvider, PhaseContext, PhaseResult, RunOptions } from './types'
+
+const LOG_FILE = join(tmpdir(), 'code-agent-provider.log')
+function log(msg: string) {
+  try { appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`) } catch {}
+}
 
 export interface CliProviderConfig {
   type: 'claude-code' | 'cursor-cli' | 'codex'
@@ -7,15 +15,16 @@ export interface CliProviderConfig {
   model?: string
   timeoutMs?: number
   resumeSessionId?: string
+  maxRetries?: number
 }
 
-const DEFAULT_IDLE_TIMEOUT_MS = 90 * 1000       // no *visible text* for 90s → kill
-const DEFAULT_FIRST_TEXT_TIMEOUT_MS = 3 * 60 * 1000  // first visible text must arrive within 3 min
-const DEFAULT_MAX_TIMEOUT_MS = 5 * 60 * 1000    // absolute cap: 5 min
+const DEFAULT_ACTIVITY_TIMEOUT_MS = 3 * 60 * 1000 // no stdout at all for 3 min → kill
+const DEFAULT_MAX_TIMEOUT_MS = 15 * 60 * 1000     // absolute cap: 15 min
 const GRACE_KILL_MS = 5_000
 
 export class ExternalCliProvider implements AgentProvider {
   private childProcess: ChildProcess | null = null
+  private abortController: AbortController | null = null
   private config: CliProviderConfig
   private lastSessionId: string | null = null
 
@@ -27,105 +36,172 @@ export class ExternalCliProvider implements AgentProvider {
     return this.lastSessionId
   }
 
-  run(context: PhaseContext, options?: RunOptions): Promise<PhaseResult> {
+  async run(context: PhaseContext, options?: RunOptions): Promise<PhaseResult> {
+    const maxRetries = this.config.maxRetries ?? 1
+    let lastError = ''
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (attempt > 0) {
+        const delay = Math.min(1000 * 2 ** (attempt - 1), 10_000)
+        await sleep(delay)
+      }
+
+      const result = await this.executeOnce(context, options)
+
+      if (result.status === 'success') return result
+
+      lastError = result.error ?? 'Unknown error'
+      const retryable = lastError.includes('timeout') || lastError.includes('ENOENT')
+      if (!retryable) return result
+    }
+
+    return { status: 'failed', error: lastError }
+  }
+
+  async cancel(): Promise<void> {
+    this.abortController?.abort()
+    if (!this.childProcess) return
+
+    this.childProcess.kill('SIGTERM')
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.childProcess?.kill('SIGKILL')
+        resolve()
+      }, GRACE_KILL_MS)
+      this.childProcess?.on('close', () => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+  }
+
+  // ── Core execution ──
+
+  private executeOnce(context: PhaseContext, options?: RunOptions): Promise<PhaseResult> {
     const prompt = this.buildPrompt(context)
     const binary = this.config.binaryPath ?? this.defaultBinary()
     const useStreamJson = this.config.type !== 'codex'
+    const { args, stdinData } = this.buildSpawnArgs(context.repoPath, prompt)
+
+    this.abortController = new AbortController()
+    const { signal } = this.abortController
+
+    log(`spawn: binary=${binary} type=${this.config.type} cwd=${context.repoPath}`)
+    log(`spawn: args=${JSON.stringify(args.slice(0, 10))} stdinLen=${stdinData?.length ?? 0}`)
 
     return new Promise((resolve) => {
-      const { args, stdinData } = this.buildSpawnArgs(context.repoPath, prompt)
-      const env = this.buildCleanEnv()
-
       let stdout = ''
       let stderr = ''
       let lineBuf = ''
       let assistantText = ''
       let resolved = false
-      let gotFirstText = false
-      let maxTimer: ReturnType<typeof setTimeout>
-      let idleTimer: ReturnType<typeof setTimeout>
-      let firstTextTimer: ReturnType<typeof setTimeout>
+      let stdoutChunks = 0
 
       const finish = (result: PhaseResult) => {
         if (resolved) return
         resolved = true
         clearTimeout(maxTimer)
-        clearTimeout(idleTimer)
-        clearTimeout(firstTextTimer)
+        clearTimeout(activityTimer)
+        log(`finish: status=${result.status} stdoutChunks=${stdoutChunks} assistantLen=${assistantText.length} error=${result.error ?? 'none'}`)
         resolve(result)
       }
 
       const killAgent = (reason: string) => {
-        if (this.childProcess) {
+        log(`killAgent: ${reason} (stderrLen=${stderr.length})`)
+        if (stderr) log(`stderr tail: ${stderr.slice(-500)}`)
+        if (this.childProcess && !this.childProcess.killed) {
           this.childProcess.kill('SIGTERM')
-          setTimeout(() => this.childProcess?.kill('SIGKILL'), GRACE_KILL_MS)
+          setTimeout(() => {
+            if (this.childProcess && !this.childProcess.killed)
+              this.childProcess.kill('SIGKILL')
+          }, GRACE_KILL_MS)
         }
         finish({ status: 'failed', error: reason })
       }
 
+      // Timer 1: absolute max — hard ceiling regardless of activity
       const maxMs = this.config.timeoutMs ?? DEFAULT_MAX_TIMEOUT_MS
-      maxTimer = setTimeout(() => {
-        killAgent(`Agent exceeded maximum time limit (${maxMs / 1000}s)`)
-      }, maxMs)
+      const maxTimer = setTimeout(
+        () => killAgent(`Agent exceeded maximum time limit (${maxMs / 1000}s)`),
+        maxMs,
+      )
 
-      const idleMs = DEFAULT_IDLE_TIMEOUT_MS
+      // Timer 2: activity-based — resets on ANY stdout data
+      const activityMs = DEFAULT_ACTIVITY_TIMEOUT_MS
+      let activityTimer = setTimeout(
+        () => killAgent(`No agent activity for ${activityMs / 1000}s`),
+        activityMs,
+      )
 
-      firstTextTimer = setTimeout(() => {
-        if (!gotFirstText)
-          killAgent(`Agent produced no visible text within ${DEFAULT_FIRST_TEXT_TIMEOUT_MS / 1000}s`)
-      }, DEFAULT_FIRST_TEXT_TIMEOUT_MS)
-
-      const startIdleTimeout = () => {
-        clearTimeout(idleTimer)
-        idleTimer = setTimeout(() => {
-          killAgent(`Agent idle timeout — no visible text for ${idleMs / 1000}s`)
-        }, idleMs)
+      const resetActivityTimer = () => {
+        clearTimeout(activityTimer)
+        activityTimer = setTimeout(
+          () => killAgent(`No agent activity for ${activityMs / 1000}s`),
+          activityMs,
+        )
       }
+
+      // Abort signal listener
+      const onAbort = () => killAgent('Cancelled')
+      signal.addEventListener('abort', onAbort, { once: true })
 
       this.childProcess = spawn(binary, args, {
         cwd: context.repoPath,
-        env,
+        env: this.buildCleanEnv(),
         shell: false,
         stdio: [stdinData != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       })
 
+      log(`spawned: pid=${this.childProcess.pid}`)
+
+      this.childProcess.on('error', (err) => {
+        this.childProcess = null
+        const code = (err as NodeJS.ErrnoException).code
+        if (code === 'ENOENT')
+          finish({ status: 'failed', error: `CLI "${binary}" not found. Please install it or update the path in settings.` })
+        else
+          finish({ status: 'failed', error: err?.message ?? 'Unknown spawn error' })
+      })
+
+      // Write prompt via stdin for large payload support
       if (stdinData != null && this.childProcess.stdin) {
-        this.childProcess.stdin.write(stdinData)
-        this.childProcess.stdin.end()
+        this.childProcess.stdin.on('error', () => { /* swallow broken pipe */ })
+        const ok = this.childProcess.stdin.write(stdinData)
+        if (!ok) {
+          this.childProcess.stdin.once('drain', () => this.childProcess?.stdin?.end())
+        }
+        else {
+          this.childProcess.stdin.end()
+        }
       }
 
+      // ── stdout processing ──
       this.childProcess.stdout?.on('data', (data) => {
         const chunk = String(data)
         stdout += chunk
+        stdoutChunks++
+        resetActivityTimer()
 
         if (useStreamJson && options?.onChunk) {
           lineBuf += chunk
           const lines = lineBuf.split('\n')
           lineBuf = lines.pop()!
+
           for (const line of lines) {
             const normalized = normalizeLine(line)
             if (!normalized) continue
             this.extractSessionId(normalized)
+
             const { text, isComplete } = extractStreamText(normalized)
             if (text) {
               if (isComplete && assistantText.endsWith(text)) continue
               assistantText += text
               options.onChunk(text)
-              if (!gotFirstText) {
-                gotFirstText = true
-                clearTimeout(firstTextTimer)
-              }
-              startIdleTimeout()
             }
           }
         }
         else {
           options?.onChunk?.(chunk)
-          if (!gotFirstText) {
-            gotFirstText = true
-            clearTimeout(firstTextTimer)
-          }
-          startIdleTimeout()
         }
       })
 
@@ -133,19 +209,12 @@ export class ExternalCliProvider implements AgentProvider {
         stderr += String(data)
       })
 
-      this.childProcess.on('error', (err) => {
+      this.childProcess.on('close', (code, sig) => {
+        log(`close: code=${code} signal=${sig} stdoutLen=${stdout.length} stderrLen=${stderr.length}`)
         this.childProcess = null
-        if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-          finish({ status: 'failed', error: `CLI "${binary}" not found. Please install it or update the path in settings.` })
-        }
-        else {
-          finish({ status: 'failed', error: err?.message ?? 'Unknown spawn error' })
-        }
-      })
+        signal.removeEventListener('abort', onAbort)
 
-      this.childProcess.on('close', (code, signal) => {
-        this.childProcess = null
-
+        // Flush remaining line buffer
         if (lineBuf.trim()) {
           const normalized = normalizeLine(lineBuf)
           if (normalized) {
@@ -156,11 +225,10 @@ export class ExternalCliProvider implements AgentProvider {
           lineBuf = ''
         }
 
-        if (signal) {
-          finish({ status: 'failed', error: stderr || `Killed by signal: ${signal}` })
+        if (sig) {
+          finish({ status: 'failed', error: stderr || `Killed by signal: ${sig}` })
           return
         }
-
         if (code !== 0 && code !== null) {
           finish({ status: 'failed', error: stderr || `Exit code: ${code}` })
           return
@@ -175,27 +243,8 @@ export class ExternalCliProvider implements AgentProvider {
         }
         else {
           const output = parseJsonOutput(stdout)
-          finish({
-            status: 'success',
-            output: output.text,
-            tokenUsage: output.tokenUsage,
-          })
+          finish({ status: 'success', output: output.text, tokenUsage: output.tokenUsage })
         }
-      })
-    })
-  }
-
-  async cancel(): Promise<void> {
-    if (!this.childProcess) return
-    this.childProcess.kill('SIGTERM')
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        this.childProcess?.kill('SIGKILL')
-        resolve()
-      }, GRACE_KILL_MS)
-      this.childProcess?.on('close', () => {
-        clearTimeout(timer)
-        resolve()
       })
     })
   }
@@ -206,7 +255,7 @@ export class ExternalCliProvider implements AgentProvider {
     switch (this.config.type) {
       case 'cursor-cli': {
         const args = ['agent', '-p', '--output-format', 'stream-json', '--stream-partial-output', '--yolo', '--trust', '--workspace', cwd]
-        if (this.config.model)
+        if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         if (this.config.resumeSessionId)
           args.push('--resume', this.config.resumeSessionId)
@@ -214,7 +263,7 @@ export class ExternalCliProvider implements AgentProvider {
       }
       case 'claude-code': {
         const args = ['--print', '-', '--output-format', 'stream-json', '--verbose']
-        if (this.config.model)
+        if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         if (this.config.resumeSessionId)
           args.push('--resume', this.config.resumeSessionId)
@@ -222,14 +271,12 @@ export class ExternalCliProvider implements AgentProvider {
       }
       case 'codex': {
         const args = ['-p', prompt, '--output-format', 'json']
-        if (this.config.model)
+        if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         return { args, stdinData: null }
       }
     }
   }
-
-  // ── Environment ──
 
   private buildCleanEnv(): Record<string, string> {
     const env: Record<string, string> = {}
@@ -243,26 +290,19 @@ export class ExternalCliProvider implements AgentProvider {
     return env
   }
 
-  // ── Session ID extraction ──
-
   private extractSessionId(line: string): void {
     try {
       const evt = JSON.parse(line) as Record<string, any>
-      const id = evt.session_id ?? evt.sessionId ?? evt.sessionID
-        ?? evt.message?.session_id
+      const id = evt.session_id ?? evt.sessionId ?? evt.sessionID ?? evt.message?.session_id
       if (typeof id === 'string' && id)
         this.lastSessionId = id
     }
     catch { /* ignore */ }
   }
 
-  // ── Prompt builder ──
-
   private buildPrompt(context: PhaseContext): string {
-    // Resume mode: only user message matters, agent already has full context
-    if (this.config.resumeSessionId && context.userMessage) {
+    if (this.config.resumeSessionId && context.userMessage)
       return context.userMessage
-    }
 
     const sections: string[] = []
     const canReadFiles = this.config.type === 'cursor-cli' || this.config.type === 'claude-code'
@@ -280,15 +320,13 @@ export class ExternalCliProvider implements AgentProvider {
     if (context.invokeSkills?.length) {
       if (canReadFiles) {
         sections.push('---\n\n## 必须调用的外部技能\n\n请先读取以下技能文件，然后按其中的指令执行：')
-        for (const skill of context.invokeSkills) {
+        for (const skill of context.invokeSkills)
           sections.push(`- \`${skill.id}\`: 请用工具读取此技能的完整内容后执行`)
-        }
       }
       else {
         sections.push('---\n\n## 必须调用的外部技能')
-        for (const skill of context.invokeSkills) {
+        for (const skill of context.invokeSkills)
           sections.push(`### INVOKE SKILL: \`${skill.id}\`\n\n${skill.content}`)
-        }
       }
     }
 
@@ -325,9 +363,12 @@ export class ExternalCliProvider implements AgentProvider {
   }
 }
 
-// ── Pure parsing functions ──
+// ── Pure parsing helpers ──
 
-/** Strip optional `stdout:` / `stderr:` prefixes from cursor stream lines */
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms))
+}
+
 function normalizeLine(raw: string): string {
   const trimmed = raw.replace(/\r/g, '').trim()
   if (!trimmed) return ''
@@ -335,45 +376,27 @@ function normalizeLine(raw: string): string {
   return prefixed ? prefixed[1].trim() : trimmed
 }
 
-/** Strip `<think>`/`<thinking>` tags from content (ref: AionUi ThinkTagDetector) */
 function stripThinkTags(text: string): string {
-  return text
-    .replace(/<\/?think(?:ing)?>/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
+  return text.replace(/<\/?think(?:ing)?>/gi, '').replace(/\n{3,}/g, '\n\n')
 }
 
-/**
- * Extract readable text from a single stream-json NDJSON event.
- *
- * Returns `{ text, isComplete }`:
- * - Deltas (`subtype: "delta"`) → `isComplete = false`, streamed incrementally
- * - Complete assistant messages (no subtype) → `isComplete = true`, caller must
- *   deduplicate against already-delivered delta text
- *
- * Cursor agent may only send complete messages without prior deltas;
- * Claude Code sends deltas followed by a duplicate complete message.
- */
 function extractStreamText(line: string): { text: string, isComplete: boolean } {
   const EMPTY = { text: '', isComplete: false }
   try {
     const evt = JSON.parse(line) as Record<string, any>
 
-    // Incremental delta
     if (evt.type === 'assistant' && evt.subtype === 'delta' && typeof evt.text === 'string')
       return { text: stripThinkTags(evt.text), isComplete: false }
 
-    // Simple text event
     if (evt.type === 'text' && typeof evt.text === 'string')
       return { text: stripThinkTags(evt.text), isComplete: false }
 
-    // Claude stream_event → content_block_delta
     if (evt.type === 'stream_event') {
       const delta = evt.event?.delta
       if (delta?.type === 'text_delta' && typeof delta.text === 'string')
         return { text: delta.text, isComplete: false }
     }
 
-    // Complete assistant message (cursor agent often sends ONLY this, no deltas)
     if (evt.type === 'assistant' && !evt.subtype) {
       const blocks = evt.message?.content ?? evt.content
       let fullText = ''
@@ -381,17 +404,15 @@ function extractStreamText(line: string): { text: string, isComplete: boolean } 
         fullText = blocks.filter((b: any) => b.type === 'text' && typeof b.text === 'string').map((b: any) => b.text).join('')
       else if (typeof blocks === 'string')
         fullText = blocks
-
       fullText = stripThinkTags(fullText)
       if (fullText)
         return { text: fullText, isComplete: true }
     }
   }
-  catch { /* not valid JSON, skip */ }
+  catch { /* not valid JSON */ }
   return EMPTY
 }
 
-/** Fallback: reassemble text from all stdout lines */
 function parseStreamResult(stdout: string): string {
   const lines = stdout.split('\n')
   const deltas: string[] = []
@@ -402,32 +423,21 @@ function parseStreamResult(stdout: string): string {
     if (!normalized) continue
     try {
       const evt = JSON.parse(normalized) as Record<string, any>
-
       if (evt.type === 'result') {
         const r = evt.result ?? evt.text
         if (typeof r === 'string') return stripThinkTags(r)
       }
-
-      // complete assistant message — keep as fallback if no deltas collected
       if (evt.type === 'assistant' && !evt.subtype) {
         const blocks = evt.message?.content ?? evt.content
-        if (Array.isArray(blocks)) {
-          lastCompleteAssistant = stripThinkTags(
-            blocks
-              .filter((b: any) => b.type === 'text' && typeof b.text === 'string')
-              .map((b: any) => b.text)
-              .join(''),
-          )
-        }
-        else if (typeof blocks === 'string') {
+        if (Array.isArray(blocks))
+          lastCompleteAssistant = stripThinkTags(blocks.filter((b: any) => b.type === 'text' && typeof b.text === 'string').map((b: any) => b.text).join(''))
+        else if (typeof blocks === 'string')
           lastCompleteAssistant = stripThinkTags(blocks)
-        }
         continue
       }
     }
     catch { /* skip */ }
-
-    const text = extractStreamText(normalized)
+    const { text } = extractStreamText(normalized)
     if (text) deltas.push(text)
   }
 
@@ -436,7 +446,6 @@ function parseStreamResult(stdout: string): string {
   return stdout
 }
 
-/** Extract token usage from result event */
 function extractTokenUsage(stdout: string): number | undefined {
   const lines = stdout.split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -444,23 +453,18 @@ function extractTokenUsage(stdout: string): number | undefined {
     if (!line) continue
     try {
       const evt = JSON.parse(line) as Record<string, any>
-      if (evt.type === 'result') {
+      if (evt.type === 'result')
         return evt.total_tokens ?? evt.usage?.total_tokens ?? evt.num_tokens
-      }
     }
     catch { /* skip */ }
   }
   return undefined
 }
 
-/** Parse codex-style single JSON output */
 function parseJsonOutput(stdout: string): { text: string, tokenUsage?: number } {
   try {
     const json = JSON.parse(stdout) as Record<string, any>
-    return {
-      text: json.result ?? json.output ?? stdout,
-      tokenUsage: json.usage?.total_tokens,
-    }
+    return { text: json.result ?? json.output ?? stdout, tokenUsage: json.usage?.total_tokens }
   }
   catch {
     return { text: stdout }

@@ -93,8 +93,22 @@ function phaseState(index: number): 'done' | 'active' | 'future' {
   return 'future'
 }
 
-async function handleRollback(targetPhaseId: string) {
+const rollbackTarget = ref<{ id: string, name: string } | null>(null)
+
+function requestRollback(targetPhaseId: string) {
   if (!task.value || isRunning.value || rollingBack.value) return
+  const phase = workflowPhases.value.find(p => p.id === targetPhaseId)
+  if (phase) rollbackTarget.value = { id: phase.id, name: phase.name }
+}
+
+function cancelRollback() {
+  rollbackTarget.value = null
+}
+
+async function confirmRollback() {
+  if (!task.value || !rollbackTarget.value) return
+  const targetPhaseId = rollbackTarget.value.id
+  rollbackTarget.value = null
   rollingBack.value = true
   try {
     await rpc('workflow.rollback', { repoTaskId: task.value.id, targetPhaseId })
@@ -110,16 +124,18 @@ async function handleRollback(targetPhaseId: string) {
   }
 }
 
-interface FileNode {
-  name: string
-  type: 'file' | 'dir'
-  children?: FileNode[]
-  content?: string
+interface ChangedFile {
+  path: string
+  status: 'added' | 'modified' | 'deleted' | 'renamed'
+  additions: number
+  deletions: number
 }
 
-const fileTree = ref<FileNode[]>([])
-const selectedFile = ref<FileNode | null>(null)
-const expandedDirs = ref<Set<string>>(new Set(['openspec', 'specs']))
+const changedFiles = ref<ChangedFile[]>([])
+const selectedFilePath = ref<string | null>(null)
+const fileDiff = ref('')
+const loadingFiles = ref(false)
+const loadingDiff = ref(false)
 
 function normalizeTime(iso: string) {
   return iso.includes('T') || iso.includes('Z') ? iso : `${iso.replace(' ', 'T')}Z`
@@ -190,6 +206,10 @@ watch(isRunning, (running) => {
   else stopPolling()
 })
 
+watch(activeTab, (tab) => {
+  if (tab === 'files') loadChangedFiles()
+})
+
 async function refreshMessages() {
   if (!task.value) return
   const msgs = await rpc<ChatMessage[]>('message.list', {
@@ -215,16 +235,49 @@ onMounted(async () => {
 
 onUnmounted(() => stopPolling())
 
-function toggleDir(name: string) {
-  if (expandedDirs.value.has(name))
-    expandedDirs.value.delete(name)
-  else
-    expandedDirs.value.add(name)
+async function loadChangedFiles() {
+  if (!task.value) return
+  loadingFiles.value = true
+  try {
+    const res = await rpc<{ files: ChangedFile[] }>('task.changedFiles', { repoTaskId: task.value.id })
+    changedFiles.value = res?.files ?? []
+  }
+  catch { changedFiles.value = [] }
+  finally { loadingFiles.value = false }
 }
 
-function selectFile(node: FileNode) {
-  if (node.type === 'file')
-    selectedFile.value = node
+async function selectChangedFile(filePath: string) {
+  if (selectedFilePath.value === filePath) return
+  selectedFilePath.value = filePath
+  loadingDiff.value = true
+  try {
+    const res = await rpc<{ diff: string }>('task.fileDiff', { repoTaskId: task.value!.id, filePath })
+    fileDiff.value = res?.diff ?? ''
+  }
+  catch { fileDiff.value = '' }
+  finally { loadingDiff.value = false }
+}
+
+function fileStatusColor(status: ChangedFile['status']) {
+  return {
+    added: 'text-emerald-500',
+    modified: 'text-amber-500',
+    deleted: 'text-red-500',
+    renamed: 'text-blue-500',
+  }[status]
+}
+
+function fileStatusLabel(status: ChangedFile['status']) {
+  return { added: 'A', modified: 'M', deleted: 'D', renamed: 'R' }[status]
+}
+
+function fileName(path: string) {
+  return path.split('/').pop() ?? path
+}
+
+function fileDir(path: string) {
+  const parts = path.split('/')
+  return parts.length > 1 ? parts.slice(0, -1).join('/') : ''
 }
 
 async function sendMessage() {
@@ -263,6 +316,16 @@ async function handleConfirm() {
 }
 
 const composing = ref(false)
+let compositionEndTimer: ReturnType<typeof setTimeout> | null = null
+
+function onCompositionStart() {
+  if (compositionEndTimer) { clearTimeout(compositionEndTimer); compositionEndTimer = null }
+  composing.value = true
+}
+
+function onCompositionEnd() {
+  compositionEndTimer = setTimeout(() => { composing.value = false }, 50)
+}
 
 function onKeydownEnter(e: KeyboardEvent) {
   if (e.isComposing || composing.value) return
@@ -293,16 +356,22 @@ async function handleAbort() {
 }
 
 const resetting = ref(false)
+const showResetConfirm = ref(false)
 
-async function handleReset() {
+function requestReset() {
+  if (!task.value || resetting.value) return
+  showResetConfirm.value = true
+}
+
+async function confirmReset() {
+  showResetConfirm.value = false
   if (!task.value || resetting.value) return
   resetting.value = true
   try {
-    await rpc('workflow.reset', { repoTaskId: task.value.id })
+    await rpc('workflow.resetPhase', { repoTaskId: task.value.id })
     messages.value = []
     liveOutput.value = ''
 
-    await rpc('workflow.start', { repoTaskId: task.value.id })
     await new Promise(r => setTimeout(r, 300))
     const t = await rpc<RepoTask>('task.get', { id: taskId })
     if (t) task.value = t
@@ -311,6 +380,43 @@ async function handleReset() {
   finally {
     resetting.value = false
   }
+}
+
+interface DiffLine {
+  type: 'add' | 'del' | 'ctx' | 'hunk'
+  content: string
+  oldNum?: number
+  newNum?: number
+}
+
+function parseDiffLines(raw: string): DiffLine[] {
+  const lines = raw.split('\n')
+  const result: DiffLine[] = []
+  let oldN = 0
+  let newN = 0
+
+  for (const line of lines) {
+    if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++'))
+      continue
+
+    if (line.startsWith('@@')) {
+      const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)/)
+      if (m) { oldN = Number.parseInt(m[1], 10); newN = Number.parseInt(m[2], 10) }
+      result.push({ type: 'hunk', content: line })
+      continue
+    }
+
+    if (line.startsWith('+')) {
+      result.push({ type: 'add', content: line.slice(1), newNum: newN++ })
+    }
+    else if (line.startsWith('-')) {
+      result.push({ type: 'del', content: line.slice(1), oldNum: oldN++ })
+    }
+    else if (line.startsWith(' ') || line === '') {
+      result.push({ type: 'ctx', content: line.slice(1), oldNum: oldN++, newNum: newN++ })
+    }
+  }
+  return result
 }
 
 async function handleCancel() {
@@ -357,7 +463,7 @@ async function handleCancel() {
         v-if="task && !isRunning"
         class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
         :disabled="resetting"
-        @click="handleReset"
+        @click="requestReset"
       >
         <div class="w-3.5 h-3.5" :class="resetting ? 'i-carbon-circle-dash animate-spin' : 'i-carbon-reset'" />
         {{ resetting ? '重置中...' : '重置' }}
@@ -404,7 +510,7 @@ async function handleCancel() {
           }"
           :disabled="phaseState(idx) === 'future' || phaseState(idx) === 'active' || isRunning"
           :title="phaseState(idx) === 'done' ? `回滚到「${phase.name}」` : ''"
-          @click="phaseState(idx) === 'done' && handleRollback(phase.id)"
+          @click="phaseState(idx) === 'done' && requestRollback(phase.id)"
         >
           <div
             class="w-4 h-4 rounded-full flex items-center justify-center shrink-0 text-[9px] font-bold border transition-colors"
@@ -509,8 +615,8 @@ async function handleCancel() {
               type="text"
               placeholder="输入反馈或指令..."
               class="flex-1 px-4 py-2.5 rounded-xl bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
-              @compositionstart="composing = true"
-              @compositionend="composing = false"
+              @compositionstart="onCompositionStart"
+              @compositionend="onCompositionEnd"
               @keydown.enter="onKeydownEnter"
             >
             <button
@@ -532,77 +638,137 @@ async function handleCancel() {
         </div>
       </div>
 
-      <!-- Files tab — sidebar + content -->
+      <!-- Files tab — changed files + diff -->
       <div v-show="activeTab === 'files'" class="flex h-full">
-        <div class="w-56 border-r border-gray-200 dark:border-white/5 overflow-y-auto py-2 bg-[#fafafa] dark:bg-[#1e1e22]">
-          <template v-for="node in fileTree" :key="node.name">
-            <div
-              class="flex items-center gap-1.5 px-3 py-1.5 text-[13px] cursor-pointer hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-              :class="node.type === 'dir' ? 'font-medium text-gray-600 dark:text-gray-300' : 'text-gray-500 dark:text-gray-400'"
-              @click="node.type === 'dir' ? toggleDir(node.name) : selectFile(node)"
+        <!-- File list sidebar -->
+        <div class="w-72 border-r border-gray-200 dark:border-white/5 overflow-y-auto bg-[#fafafa] dark:bg-[#1e1e22] flex flex-col">
+          <!-- Summary header -->
+          <div class="px-3 py-2.5 border-b border-gray-100 dark:border-white/[0.03] flex items-center justify-between">
+            <span class="text-[12px] font-medium text-gray-500 dark:text-gray-400">
+              变更文件
+              <span v-if="changedFiles.length" class="ml-1 text-gray-400 dark:text-gray-500">({{ changedFiles.length }})</span>
+            </span>
+            <button
+              class="p-1 rounded hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+              title="刷新"
+              @click="loadChangedFiles"
             >
-              <div
-                v-if="node.type === 'dir'"
-                :class="expandedDirs.has(node.name) ? 'i-carbon-chevron-down' : 'i-carbon-chevron-right'"
-                class="w-3 h-3 text-gray-400 opacity-60"
-              />
-              <div :class="node.type === 'dir' ? 'i-carbon-folder w-4 h-4 text-indigo-500/70' : 'i-carbon-document w-4 h-4 text-gray-400 opacity-60'" />
-              {{ node.name }}
-            </div>
-            <template v-if="node.type === 'dir' && expandedDirs.has(node.name) && node.children">
-              <template v-for="child in node.children" :key="child.name">
-                <div
-                  class="flex items-center gap-1.5 pl-7 pr-3 py-1.5 text-[13px] cursor-pointer hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-                  :class="[
-                    child.type === 'dir' ? 'font-medium text-gray-600 dark:text-gray-300' : 'text-gray-500 dark:text-gray-400',
-                    selectedFile?.name === child.name ? 'bg-indigo-50 dark:bg-indigo-500/10 !text-indigo-600 dark:!text-indigo-400' : '',
-                  ]"
-                  @click="child.type === 'dir' ? toggleDir(child.name) : selectFile(child)"
-                >
-                  <div
-                    v-if="child.type === 'dir'"
-                    :class="expandedDirs.has(child.name) ? 'i-carbon-chevron-down' : 'i-carbon-chevron-right'"
-                    class="w-3 h-3 text-gray-400 opacity-60"
-                  />
-                  <div :class="child.type === 'dir' ? 'i-carbon-folder w-4 h-4 text-indigo-500/70' : 'i-carbon-document w-4 h-4 text-gray-400 opacity-60'" />
-                  {{ child.name }}
-                </div>
-                <template v-if="child.type === 'dir' && expandedDirs.has(child.name) && child.children">
-                  <div
-                    v-for="leaf in child.children"
-                    :key="leaf.name"
-                    class="flex items-center gap-1.5 pl-12 pr-3 py-1.5 text-[13px] cursor-pointer hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-                    :class="selectedFile?.name === leaf.name ? 'bg-indigo-50 dark:bg-indigo-500/10 !text-indigo-600 dark:!text-indigo-400' : 'text-gray-500 dark:text-gray-400'"
-                    @click="selectFile(leaf)"
-                  >
-                    <div class="i-carbon-document w-4 h-4 text-gray-400 opacity-60" />
-                    {{ leaf.name }}
-                  </div>
-                </template>
-              </template>
-            </template>
-          </template>
+              <div class="i-carbon-renew w-3.5 h-3.5 text-gray-400" :class="loadingFiles && 'animate-spin'" />
+            </button>
+          </div>
 
+          <!-- File entries -->
+          <div class="flex-1 overflow-y-auto py-1">
+            <div v-if="loadingFiles" class="flex items-center justify-center h-20 text-[12px] text-gray-400">
+              <div class="i-carbon-circle-dash w-4 h-4 animate-spin mr-2" />
+              加载中...
+            </div>
+            <div
+              v-else-if="changedFiles.length === 0"
+              class="flex flex-col items-center justify-center h-32 text-[12px] text-gray-300 dark:text-gray-600"
+            >
+              <div class="i-carbon-document-add w-8 h-8 mb-2 opacity-30" />
+              暂无变更文件
+            </div>
+            <button
+              v-for="file in changedFiles"
+              :key="file.path"
+              class="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+              :class="selectedFilePath === file.path && 'bg-indigo-50 dark:bg-indigo-500/10'"
+              @click="selectChangedFile(file.path)"
+            >
+              <span
+                class="shrink-0 w-4 text-center text-[10px] font-bold"
+                :class="fileStatusColor(file.status)"
+              >{{ fileStatusLabel(file.status) }}</span>
+              <div class="flex-1 min-w-0">
+                <div
+                  class="text-[12px] truncate"
+                  :class="selectedFilePath === file.path
+                    ? 'text-indigo-600 dark:text-indigo-400 font-medium'
+                    : 'text-gray-700 dark:text-gray-300'"
+                >{{ fileName(file.path) }}</div>
+                <div v-if="fileDir(file.path)" class="text-[10px] text-gray-400 dark:text-gray-600 truncate">
+                  {{ fileDir(file.path) }}
+                </div>
+              </div>
+              <div class="shrink-0 flex items-center gap-1 text-[10px] tabular-nums">
+                <span v-if="file.additions" class="text-emerald-500">+{{ file.additions }}</span>
+                <span v-if="file.deletions" class="text-red-400">-{{ file.deletions }}</span>
+              </div>
+            </button>
+          </div>
+
+          <!-- Stats footer -->
           <div
-            v-if="fileTree.length === 0"
-            class="flex items-center justify-center h-32 text-[12px] text-gray-300 dark:text-gray-600"
+            v-if="changedFiles.length"
+            class="px-3 py-2 border-t border-gray-100 dark:border-white/[0.03] text-[11px] text-gray-400 dark:text-gray-500 tabular-nums flex gap-3"
           >
-            暂无文件
+            <span class="text-emerald-500">+{{ changedFiles.reduce((s, f) => s + f.additions, 0) }}</span>
+            <span class="text-red-400">-{{ changedFiles.reduce((s, f) => s + f.deletions, 0) }}</span>
           </div>
         </div>
 
-        <div class="flex-1 overflow-y-auto p-6">
-          <div v-if="selectedFile" class="max-w-3xl">
-            <div class="flex items-center gap-2 mb-4">
-              <div class="i-carbon-document w-4 h-4 text-gray-400 opacity-60" />
-              <span class="text-[13px] font-medium text-gray-600 dark:text-gray-300">{{ selectedFile.name }}</span>
+        <!-- Diff view -->
+        <div class="flex-1 overflow-y-auto">
+          <div v-if="loadingDiff" class="flex items-center justify-center h-full text-[13px] text-gray-400">
+            <div class="i-carbon-circle-dash w-5 h-5 animate-spin mr-2" />
+            加载 diff...
+          </div>
+          <div v-else-if="fileDiff && selectedFilePath" class="diff-view">
+            <!-- Diff file header -->
+            <div class="sticky top-0 z-10 flex items-center gap-2 px-4 py-2 bg-gray-50 dark:bg-[#1a1a1e] border-b border-gray-200 dark:border-white/5">
+              <span
+                class="text-[10px] font-bold px-1 rounded"
+                :class="fileStatusColor(changedFiles.find(f => f.path === selectedFilePath)?.status ?? 'modified')"
+              >{{ fileStatusLabel(changedFiles.find(f => f.path === selectedFilePath)?.status ?? 'modified') }}</span>
+              <span class="text-[13px] font-mono text-gray-600 dark:text-gray-300">{{ selectedFilePath }}</span>
             </div>
-            <pre class="whitespace-pre-wrap text-[13px] text-gray-600 dark:text-gray-300 bg-[#fafafa] dark:bg-[#1e1e22] rounded-xl p-5 leading-relaxed">{{ selectedFile.content }}</pre>
+            <!-- Diff lines -->
+            <table class="diff-table w-full text-[12px] font-mono leading-[1.6]">
+              <tbody>
+                <template v-for="(line, idx) in parseDiffLines(fileDiff)" :key="idx">
+                  <tr v-if="line.type === 'hunk'" class="diff-hunk">
+                    <td colspan="3" class="px-4 py-1 text-[11px] text-blue-500 dark:text-blue-400 bg-blue-50/50 dark:bg-blue-500/5 select-none">
+                      {{ line.content }}
+                    </td>
+                  </tr>
+                  <tr
+                    v-else
+                    class="diff-line"
+                    :class="{
+                      'bg-emerald-50 dark:bg-emerald-500/[0.06]': line.type === 'add',
+                      'bg-red-50 dark:bg-red-500/[0.06]': line.type === 'del',
+                    }"
+                  >
+                    <td class="diff-ln w-10 text-right pr-2 select-none text-gray-300 dark:text-gray-600">{{ line.oldNum ?? '' }}</td>
+                    <td class="diff-ln w-10 text-right pr-2 select-none text-gray-300 dark:text-gray-600">{{ line.newNum ?? '' }}</td>
+                    <td class="px-3 whitespace-pre-wrap break-all">
+                      <span
+                        class="select-none mr-1"
+                        :class="{
+                          'text-emerald-500': line.type === 'add',
+                          'text-red-400': line.type === 'del',
+                          'text-gray-300 dark:text-gray-600': line.type === 'ctx',
+                        }"
+                      >{{ line.type === 'add' ? '+' : line.type === 'del' ? '-' : ' ' }}</span>
+                      <span
+                        :class="{
+                          'text-emerald-700 dark:text-emerald-300': line.type === 'add',
+                          'text-red-600 dark:text-red-300': line.type === 'del',
+                          'text-gray-600 dark:text-gray-400': line.type === 'ctx',
+                        }"
+                      >{{ line.content }}</span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
           </div>
           <div v-else class="flex items-center justify-center h-full text-gray-300 dark:text-gray-600 text-[13px]">
             <div class="text-center">
-              <div class="i-carbon-document-blank w-10 h-10 mx-auto mb-2 opacity-30" />
-              <p>选择左侧文件查看内容</p>
+              <div class="i-carbon-compare w-10 h-10 mx-auto mb-2 opacity-30" />
+              <p>选择左侧文件查看变更</p>
             </div>
           </div>
         </div>
@@ -637,6 +803,77 @@ async function handleCancel() {
         确认通过
       </button>
     </div>
+
+    <!-- Rollback confirm dialog -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div
+          v-if="rollbackTarget"
+          class="fixed inset-0 z-50 flex items-center justify-center"
+        >
+          <div class="absolute inset-0 bg-black/30 backdrop-blur-[2px]" @click="cancelRollback" />
+          <div class="relative bg-white dark:bg-[#28282c] rounded-2xl shadow-xl shadow-black/10 dark:shadow-black/40 w-[360px] p-5 mx-4">
+            <div class="flex items-center gap-2.5 mb-3">
+              <div class="w-8 h-8 rounded-full bg-amber-50 dark:bg-amber-500/10 flex items-center justify-center">
+                <div class="i-carbon-warning-alt w-4 h-4 text-amber-500" />
+              </div>
+              <h3 class="text-[14px] font-semibold text-gray-800 dark:text-gray-100">确认回滚</h3>
+            </div>
+            <p class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed mb-5 pl-[42px]">
+              将回滚到「<span class="font-medium text-gray-700 dark:text-gray-200">{{ rollbackTarget.name }}</span>」阶段，该阶段及之后的所有产出（对话、代码变更）将被清除且不可恢复。
+            </p>
+            <div class="flex justify-end gap-2">
+              <button
+                class="px-4 py-2 rounded-lg text-[13px] text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                @click="cancelRollback"
+              >
+                取消
+              </button>
+              <button
+                class="px-4 py-2 rounded-lg bg-amber-500 text-white text-[13px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
+                @click="confirmRollback"
+              >
+                确认回滚
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+
+      <Transition name="modal">
+        <div
+          v-if="showResetConfirm"
+          class="fixed inset-0 z-50 flex items-center justify-center"
+        >
+          <div class="absolute inset-0 bg-black/30 backdrop-blur-[2px]" @click="showResetConfirm = false" />
+          <div class="relative bg-white dark:bg-[#28282c] rounded-2xl shadow-xl shadow-black/10 dark:shadow-black/40 w-[360px] p-5 mx-4">
+            <div class="flex items-center gap-2.5 mb-3">
+              <div class="w-8 h-8 rounded-full bg-red-50 dark:bg-red-500/10 flex items-center justify-center">
+                <div class="i-carbon-reset w-4 h-4 text-red-500" />
+              </div>
+              <h3 class="text-[14px] font-semibold text-gray-800 dark:text-gray-100">确认重置当前阶段</h3>
+            </div>
+            <p class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed mb-5 pl-[42px]">
+              将重置当前阶段，该阶段的对话记录和代码变更将被清除并重新执行。如需重置整个任务，请点击第一阶段标签进行回滚。
+            </p>
+            <div class="flex justify-end gap-2">
+              <button
+                class="px-4 py-2 rounded-lg text-[13px] text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                @click="showResetConfirm = false"
+              >
+                取消
+              </button>
+              <button
+                class="px-4 py-2 rounded-lg bg-red-500 text-white text-[13px] font-medium hover:bg-red-400 shadow-sm shadow-red-500/20 transition-all duration-150 active:scale-[0.97]"
+                @click="confirmReset"
+              >
+                确认重置
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -736,5 +973,43 @@ async function handleCancel() {
 .prose-chat img {
   max-width: 100%;
   border-radius: 8px;
+}
+.diff-table {
+  border-collapse: collapse;
+}
+.diff-table td {
+  vertical-align: top;
+}
+.diff-ln {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  min-width: 2.5em;
+  border-right: 1px solid rgba(0,0,0,0.06);
+}
+:is(.dark) .diff-ln {
+  border-right-color: rgba(255,255,255,0.04);
+}
+.diff-hunk td {
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, monospace;
+}
+.modal-enter-active,
+.modal-leave-active {
+  transition: opacity 0.15s ease;
+}
+.modal-enter-active > div:last-child,
+.modal-leave-active > div:last-child {
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+.modal-enter-from > div:last-child {
+  transform: scale(0.95);
+  opacity: 0;
+}
+.modal-leave-to > div:last-child {
+  transform: scale(0.95);
+  opacity: 0;
 }
 </style>

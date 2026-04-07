@@ -1,7 +1,13 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+
+const LOG_FILE = join(tmpdir(), 'code-agent-engine.log')
+function elog(msg: string) {
+  try { appendFileSync(LOG_FILE, `${new Date().toISOString()} [engine] ${msg}\n`) } catch {}
+}
 import type Database from 'better-sqlite3'
 import type { AgentProvider, PhaseContext, PhaseResult } from '../providers/types'
 import { parseWorkflow } from './parser'
@@ -11,6 +17,8 @@ import { RepoTaskRepository } from '../db/repositories/repo-task.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { MessageRepository } from '../db/repositories/message.repo'
 import { RequirementRepository } from '../db/repositories/requirement.repo'
+import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
+import { getHead, getMergeBase, resetHard } from '../git/operations'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
@@ -32,6 +40,7 @@ export class WorkflowEngine {
   private runRepo: AgentRunRepository
   private msgRepo: MessageRepository
   private reqRepo: RequirementRepository
+  private commitRepo: PhaseCommitRepository
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
 
@@ -44,6 +53,7 @@ export class WorkflowEngine {
     this.runRepo = new AgentRunRepository(this.db)
     this.msgRepo = new MessageRepository(this.db)
     this.reqRepo = new RequirementRepository(this.db)
+    this.commitRepo = new PhaseCommitRepository(this.db)
   }
 
   // ── 实时输出 ──
@@ -177,6 +187,14 @@ export class WorkflowEngine {
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
 
+    if (!this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)) {
+      try {
+        const sha = await getMergeBase(task.worktree_path) ?? await getHead(task.worktree_path)
+        this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, sha)
+      }
+      catch { /* non-git worktree, skip */ }
+    }
+
     const inferredPhaseId = this.inferPhase(task.worktree_path, task.openspec_path)
     const phase = this.config.phases.find(p => p.id === inferredPhaseId)
       ?? this.config.phases[0]
@@ -187,10 +205,12 @@ export class WorkflowEngine {
 
   async confirmPhase(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
+    elog(`confirmPhase: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
     if (!task || task.phase_status !== 'waiting_confirm')
       throw new Error(`Task ${repoTaskId} is not in waiting_confirm state`)
 
     const nextPhase = this.getNextPhase(task.current_phase)
+    elog(`confirmPhase: nextPhase=${nextPhase?.id ?? 'none'}`)
     if (!nextPhase) {
       this.taskRepo.updatePhase(repoTaskId, task.current_phase, 'waiting_event')
       return
@@ -202,10 +222,15 @@ export class WorkflowEngine {
 
   async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
-    if (!task || task.phase_status !== 'waiting_confirm')
-      throw new Error(`Task ${repoTaskId} is not in waiting_confirm state`)
+    elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} feedback=${feedback.slice(0, 100)}`)
+    const allowedStates = ['waiting_confirm', 'failed', 'cancelled']
+    if (!task || !allowedStates.includes(task.phase_status))
+      throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
 
     const phase = this.config.phases.find(p => p.id === task.current_phase)
+      ?? (this.config.events?.find(e => e.id === task.current_phase)
+        ? this.eventToPhaseConfig(this.config.events.find(e => e.id === task.current_phase)!)
+        : null)
     if (!phase)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
 
@@ -292,18 +317,42 @@ export class WorkflowEngine {
   async resetTask(repoTaskId: string): Promise<void> {
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
+
+    const task = this.taskRepo.findById(repoTaskId)
+    if (task) {
+      let initialSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+      if (!initialSha) initialSha = await getMergeBase(task.worktree_path)
+      if (initialSha) {
+        if (!this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID))
+          this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, initialSha)
+        try { await resetHard(task.worktree_path, initialSha) }
+        catch (e) { process.stderr.write(`[workflow] git reset failed on resetTask: ${e}\n`) }
+      }
+    }
+
     this.msgRepo.deleteByTask(repoTaskId)
     this.runRepo.deleteByTask(repoTaskId)
+    this.commitRepo.deleteByTask(repoTaskId)
     const firstPhase = this.config.phases[0]
     this.taskRepo.updatePhase(repoTaskId, firstPhase.id, 'pending')
   }
 
+  async resetCurrentPhase(repoTaskId: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
+    elog(`resetCurrentPhase: task=${repoTaskId} current_phase=${task.current_phase} status=${task.phase_status}`)
+
+    await this.rollbackToPhase(repoTaskId, task.current_phase)
+  }
+
   async rollbackToPhase(repoTaskId: string, targetPhaseId: string): Promise<void> {
+    elog(`rollbackToPhase: task=${repoTaskId} target=${targetPhaseId}`)
     const task = this.taskRepo.findById(repoTaskId)
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
 
     const targetIdx = this.config.phases.findIndex(p => p.id === targetPhaseId)
+    elog(`rollbackToPhase: targetIdx=${targetIdx} currentPhase=${task.current_phase} currentStatus=${task.phase_status}`)
     if (targetIdx === -1)
       throw new Error(`Phase "${targetPhaseId}" not found in workflow config`)
 
@@ -314,11 +363,31 @@ export class WorkflowEngine {
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
 
+    let resetSha: string | null = null
+    if (targetIdx === 0) {
+      resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+    }
+    else {
+      const prevPhaseId = this.config.phases[targetIdx - 1].id
+      resetSha = this.commitRepo.get(repoTaskId, prevPhaseId)
+    }
+
+    if (!resetSha) {
+      resetSha = await getMergeBase(task.worktree_path)
+      if (resetSha) this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, resetSha)
+    }
+
+    if (resetSha) {
+      try { await resetHard(task.worktree_path, resetSha) }
+      catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
+    }
+
     const phasesToClear = this.config.phases
       .slice(targetIdx)
       .map(p => p.id)
     this.msgRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.runRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
+    this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
 
     const phase = this.config.phases[targetIdx]
     this.taskRepo.updatePhase(repoTaskId, targetPhaseId, 'running')
@@ -348,6 +417,7 @@ export class WorkflowEngine {
     phase: PhaseConfig,
     userMessage?: string,
   ): Promise<void> {
+    elog(`executePhase: task=${repoTaskId} phase=${phase.id} provider=${phase.provider} hasUserMsg=${!!userMessage}`)
     let agentRunId: string | null = null
 
     try {
@@ -447,10 +517,20 @@ export class WorkflowEngine {
     phase: PhaseConfig,
     result: PhaseResult,
   ): Promise<void> {
+    elog(`handlePhaseResult: phase=${phase.id} status=${result.status} requires_confirm=${phase.requires_confirm} error=${result.error?.slice(0, 200) ?? 'none'}`)
     if (result.status === 'failed' || result.status === 'cancelled') {
       this.taskRepo.updatePhase(repoTaskId, phase.id, result.status)
       return
     }
+
+    try {
+      const task = this.taskRepo.findById(repoTaskId)
+      if (task) {
+        const sha = await getHead(task.worktree_path)
+        this.commitRepo.save(repoTaskId, phase.id, sha)
+      }
+    }
+    catch { /* non-git worktree */ }
 
     if (phase.requires_confirm) {
       this.taskRepo.updatePhase(repoTaskId, phase.id, 'waiting_confirm')

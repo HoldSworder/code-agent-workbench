@@ -63,6 +63,14 @@ export function applySchema(db: Database.Database): void {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS phase_commits (
+      repo_task_id TEXT NOT NULL REFERENCES repo_tasks(id),
+      phase_id TEXT NOT NULL,
+      commit_sha TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (repo_task_id, phase_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_repo_tasks_requirement ON repo_tasks(requirement_id);
     CREATE INDEX IF NOT EXISTS idx_repo_tasks_repo ON repo_tasks(repo_id);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_task ON agent_runs(repo_task_id);

@@ -62,6 +62,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'workflow.start':
     case 'workflow.retry':
     case 'workflow.reset':
+    case 'workflow.resetPhase':
     case 'workflow.rollback':
     case 'repo.delete':
     case 'workflow.confirm':
@@ -83,6 +84,10 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
       return { output: '' } as T
     case 'task.getLastError':
       return { error: null } as T
+    case 'task.changedFiles':
+      return { files: [] } as T
+    case 'task.fileDiff':
+      return { diff: '' } as T
     case 'settings.get':
       return { value: null } as T
     case 'settings.set':
