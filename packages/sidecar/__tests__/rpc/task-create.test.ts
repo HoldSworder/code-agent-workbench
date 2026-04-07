@@ -41,7 +41,7 @@ describe('task.create RPC', () => {
     repoId = r.id
     requirementId = q.id
 
-    vi.spyOn(gitOps, 'createWorktree').mockResolvedValue(undefined)
+    vi.spyOn(gitOps, 'createBranch').mockResolvedValue(undefined)
 
     const engine = new WorkflowEngine({
       db,
@@ -62,7 +62,7 @@ describe('task.create RPC', () => {
     db.close()
   })
 
-  it('creates task with slug change_id and calls createWorktree', async () => {
+  it('creates task with slug change_id and calls createBranch', async () => {
     const raw = await server.handle(
       JSON.stringify({
         jsonrpc: '2.0',
@@ -73,14 +73,15 @@ describe('task.create RPC', () => {
     )
     const parsed = JSON.parse(raw)
     expect(parsed.error).toBeUndefined()
-    expect(parsed.result.change_id).toBe('hello-world-feature')
-    expect(parsed.result.branch_name).toBe('feature/hello-world-feature')
-    expect(parsed.result.worktree_path).toBe('/tmp/app/.worktrees/hello-world-feature')
-    expect(parsed.result.openspec_path).toBe('openspec/changes/hello-world-feature')
-    expect(gitOps.createWorktree).toHaveBeenCalledWith(
+
+    const changeId: string = parsed.result.change_id
+    expect(changeId).toMatch(/^hello-world-feature-[a-z0-9]{4}$/)
+    expect(parsed.result.branch_name).toBe(`feature/${changeId}`)
+    expect(parsed.result.worktree_path).toBe('/tmp/app')
+    expect(parsed.result.openspec_path).toBe(`openspec/changes/${changeId}`)
+    expect(gitOps.createBranch).toHaveBeenCalledWith(
       '/tmp/app',
-      '/tmp/app/.worktrees/hello-world-feature',
-      'feature/hello-world-feature',
+      `feature/${changeId}`,
       'main',
     )
   })

@@ -48,4 +48,5 @@ export interface RunOptions {
 export interface AgentProvider {
   run(context: PhaseContext, options?: RunOptions): Promise<PhaseResult>
   cancel(): Promise<void>
+  readonly model?: string | null
 }

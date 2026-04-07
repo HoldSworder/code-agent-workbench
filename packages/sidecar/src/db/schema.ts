@@ -77,9 +77,12 @@ export function applySchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_task ON conversation_messages(repo_task_id);
   `)
 
-  // Migration: add session_id column if missing (existing DBs)
+  // Migrations: add missing columns to agent_runs for existing DBs
   const cols = db.prepare(`PRAGMA table_info(agent_runs)`).all() as { name: string }[]
   if (!cols.some(c => c.name === 'session_id')) {
     db.exec(`ALTER TABLE agent_runs ADD COLUMN session_id TEXT`)
+  }
+  if (!cols.some(c => c.name === 'model')) {
+    db.exec(`ALTER TABLE agent_runs ADD COLUMN model TEXT`)
   }
 }

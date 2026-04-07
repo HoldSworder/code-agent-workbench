@@ -1,6 +1,5 @@
-import { existsSync, readdirSync, appendFileSync } from 'node:fs'
+import { existsSync, readdirSync, appendFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { readFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 
@@ -136,6 +135,66 @@ export class WorkflowEngine {
     }
   }
 
+  /**
+   * 校验 confirm_files 列表中的文件是否全部存在。
+   * 支持 {{openspec_path}} / {{change_id}} 模板变量和单层通配符 `*`。
+   * 特殊标记 `__agent_output__` 视为始终通过。
+   */
+  private validateConfirmFiles(
+    patterns: string[],
+    worktreePath: string,
+    openspecPath: string,
+    changeId: string,
+  ): string[] {
+    const missing: string[] = []
+    const vars: Record<string, string> = {
+      openspec_path: openspecPath,
+      change_id: changeId,
+    }
+
+    for (const raw of patterns) {
+      if (raw === '__agent_output__') continue
+
+      const resolved = raw.replace(/\{\{(\w+)\}\}/g, (_, key: string) => vars[key] ?? `{{${key}}}`)
+      const abs = join(worktreePath, resolved)
+
+      if (abs.includes('*')) {
+        if (!this.matchSimpleGlob(abs))
+          missing.push(resolved)
+      }
+      else {
+        if (!existsSync(abs))
+          missing.push(resolved)
+      }
+    }
+    return missing
+  }
+
+  /**
+   * 简单通配符匹配：仅支持路径中的单个 `*` 段（如 `dir/* /file.md`）。
+   * 返回是否有至少一个匹配。
+   */
+  private matchSimpleGlob(pattern: string): boolean {
+    const starIdx = pattern.indexOf('*')
+    if (starIdx === -1) return existsSync(pattern)
+
+    const dir = pattern.slice(0, pattern.lastIndexOf('/', starIdx))
+    const suffix = pattern.slice(pattern.indexOf('/', starIdx + 1))
+
+    if (!existsSync(dir)) return false
+    try {
+      const entries = readdirSync(dir, { withFileTypes: true })
+      return entries.some((entry) => {
+        if (!entry.isDirectory()) return false
+        const candidate = join(dir, entry.name, suffix.startsWith('/') ? suffix.slice(1) : suffix)
+        return existsSync(candidate)
+      })
+    }
+    catch {
+      return false
+    }
+  }
+
   private tasksHaveUnchecked(openspecDir: string): boolean {
     const tasksPath = join(openspecDir, 'tasks.md')
     if (!existsSync(tasksPath))
@@ -209,6 +268,33 @@ export class WorkflowEngine {
     if (!task || task.phase_status !== 'waiting_confirm')
       throw new Error(`Task ${repoTaskId} is not in waiting_confirm state`)
 
+    const phase = this.config.phases.find(p => p.id === task.current_phase)
+      ?? (this.config.events?.find(e => e.id === task.current_phase)
+        ? this.eventToPhaseConfig(this.config.events.find(e => e.id === task.current_phase)!)
+        : null)
+
+    // confirm_files 存在性校验（跳过 __agent_output__ 等特殊标记）
+    if (phase?.confirm_files?.length) {
+      const missing = this.validateConfirmFiles(phase.confirm_files, task.worktree_path, task.openspec_path, task.change_id)
+      if (missing.length) {
+        elog(`confirmPhase: blocked — missing files: ${missing.join(', ')}`)
+        const reason = `确认被阻止：以下预期产出文件缺失\n${missing.map(f => `- ${f}`).join('\n')}`
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: task.current_phase,
+          role: 'assistant',
+          content: reason,
+        })
+        throw new Error(`Confirmation blocked: missing files: ${missing.join(', ')}`)
+      }
+    }
+
+    // 终态事件确认 → completed
+    if (phase?.is_terminal) {
+      this.taskRepo.updatePhase(repoTaskId, task.current_phase, 'completed')
+      return
+    }
+
     const nextPhase = this.getNextPhase(task.current_phase)
     elog(`confirmPhase: nextPhase=${nextPhase?.id ?? 'none'}`)
     if (!nextPhase) {
@@ -253,6 +339,17 @@ export class WorkflowEngine {
     const event = this.config.events?.find(e => e.id === eventId)
     if (!event)
       throw new Error(`Event ${eventId} not found in workflow config`)
+
+    // after_phase 门禁：事件只能在指定阶段走完之后触发
+    if (event.after_phase) {
+      const passed = this.hasPhaseCompleted(repoTaskId, event.after_phase)
+      if (!passed) {
+        throw new Error(
+          `Event "${eventId}" requires phase "${event.after_phase}" to be completed first, `
+          + `but current phase is "${task.current_phase}"`,
+        )
+      }
+    }
 
     if (event.precondition) {
       const absOpenspec = join(task.worktree_path, task.openspec_path)
@@ -422,6 +519,29 @@ export class WorkflowEngine {
 
     try {
       const task = this.taskRepo.findById(repoTaskId)!
+
+      // entry_gate: 进入本阶段前的前置条件校验
+      if (phase.entry_gate) {
+        const absOpenspec = join(task.worktree_path, task.openspec_path)
+        const gatePassed = this.evaluateCondition(
+          phase.entry_gate,
+          absOpenspec,
+          existsSync(absOpenspec),
+        )
+        if (!gatePassed) {
+          elog(`executePhase: entry_gate "${phase.entry_gate}" BLOCKED for phase ${phase.id}`)
+          const reason = `阶段「${phase.name}」的入口门禁「${phase.entry_gate}」未通过，前置产出缺失。请确认上一阶段已正确完成。`
+          this.msgRepo.create({
+            repo_task_id: repoTaskId,
+            phase_id: phase.id,
+            role: 'assistant',
+            content: reason,
+          })
+          this.taskRepo.updatePhase(repoTaskId, phase.id, 'failed')
+          return
+        }
+      }
+
       const requirement = this.reqRepo.findById(task.requirement_id)
 
       // Check if we can resume a previous session for faster startup
@@ -484,7 +604,8 @@ export class WorkflowEngine {
       this.activeProviders.delete(repoTaskId)
 
       const sessionId = (provider as any).sessionId ?? undefined
-      this.runRepo.finish(agentRun.id, result.status, result.tokenUsage, result.error, sessionId)
+      const modelUsed = provider.model ?? undefined
+      this.runRepo.finish(agentRun.id, result.status, result.tokenUsage, result.error, sessionId, modelUsed)
 
       if (result.output) {
         this.msgRepo.create({
@@ -517,7 +638,7 @@ export class WorkflowEngine {
     phase: PhaseConfig,
     result: PhaseResult,
   ): Promise<void> {
-    elog(`handlePhaseResult: phase=${phase.id} status=${result.status} requires_confirm=${phase.requires_confirm} error=${result.error?.slice(0, 200) ?? 'none'}`)
+    elog(`handlePhaseResult: phase=${phase.id} status=${result.status} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} error=${result.error?.slice(0, 200) ?? 'none'}`)
     if (result.status === 'failed' || result.status === 'cancelled') {
       this.taskRepo.updatePhase(repoTaskId, phase.id, result.status)
       return
@@ -532,8 +653,39 @@ export class WorkflowEngine {
     }
     catch { /* non-git worktree */ }
 
+    // completion_check: 校验阶段产出是否达标
+    if (phase.completion_check) {
+      const task = this.taskRepo.findById(repoTaskId)
+      if (task) {
+        const absOpenspec = join(task.worktree_path, task.openspec_path)
+        const passed = this.evaluateCondition(
+          phase.completion_check,
+          absOpenspec,
+          existsSync(absOpenspec),
+        )
+        elog(`handlePhaseResult: completion_check="${phase.completion_check}" passed=${passed}`)
+        if (!passed) {
+          const reason = `阶段「${phase.name}」的完成条件「${phase.completion_check}」未满足，请检查产出后重试或提供反馈。`
+          this.msgRepo.create({
+            repo_task_id: repoTaskId,
+            phase_id: phase.id,
+            role: 'assistant',
+            content: reason,
+          })
+          this.taskRepo.updatePhase(repoTaskId, phase.id, 'waiting_confirm')
+          return
+        }
+      }
+    }
+
     if (phase.requires_confirm) {
       this.taskRepo.updatePhase(repoTaskId, phase.id, 'waiting_confirm')
+      return
+    }
+
+    // 终态事件完成 → completed
+    if (phase.is_terminal) {
+      this.taskRepo.updatePhase(repoTaskId, phase.id, 'completed')
       return
     }
 
@@ -554,6 +706,26 @@ export class WorkflowEngine {
     return this.config.phases[idx + 1]
   }
 
+  /**
+   * 判断指定阶段是否已经完成。
+   * 依据：存在该阶段的 commit 记录，或当前阶段索引已超过目标阶段。
+   */
+  private hasPhaseCompleted(repoTaskId: string, phaseId: string): boolean {
+    if (this.commitRepo.get(repoTaskId, phaseId))
+      return true
+
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return false
+
+    const targetIdx = this.config.phases.findIndex(p => p.id === phaseId)
+    const currentIdx = this.config.phases.findIndex(p => p.id === task.current_phase)
+
+    if (targetIdx === -1) return false
+    if (currentIdx === -1) return true
+
+    return currentIdx > targetIdx
+  }
+
   private eventToPhaseConfig(event: EventConfig): PhaseConfig {
     return {
       id: event.id,
@@ -567,6 +739,7 @@ export class WorkflowEngine {
       mcp_config: event.mcp_config,
       confirm_files: event.confirm_files,
       script: event.script,
+      is_terminal: event.is_terminal,
     }
   }
 }

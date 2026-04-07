@@ -18,6 +18,16 @@ export async function createWorktree(
   await git(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, `origin/${baseBranch}`])
 }
 
+export async function createBranch(
+  repoPath: string,
+  branchName: string,
+  baseBranch: string,
+): Promise<void> {
+  await git(repoPath, ['checkout', baseBranch])
+  await git(repoPath, ['pull', 'origin', baseBranch])
+  await git(repoPath, ['checkout', '-b', branchName])
+}
+
 export async function removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
   await git(repoPath, ['worktree', 'remove', worktreePath, '--force'])
 }

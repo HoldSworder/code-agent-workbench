@@ -44,9 +44,12 @@ const PhaseSchema = z.object({
   mcp_config: z.string().nullable().optional(),
   confirm_files: z.array(z.string()).optional(),
   completion_check: z.string().optional(),
+  /** 入口门禁：进入本阶段前必须满足的条件（复用 state_inference 条件名） */
+  entry_gate: z.string().optional(),
   script: z.string().optional(),
   args: z.array(z.string()).optional(),
   guardrails: z.array(z.string()).optional(),
+  is_terminal: z.boolean().optional(),
 })
 
 // ── 事件配置 ──
@@ -65,6 +68,7 @@ const EventSchema = z.object({
   script: z.string().optional(),
   triggers: z.array(z.string()).optional(),
   precondition: z.string().optional(),
+  is_terminal: z.boolean().optional(),
 })
 
 // ── 完整工作流 ──

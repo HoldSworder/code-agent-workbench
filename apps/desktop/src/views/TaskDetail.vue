@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch, type ComponentPublicInstance } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { rpc } from '../composables/use-sidecar'
 import MarkdownIt from 'markdown-it'
@@ -11,7 +11,7 @@ const router = useRouter()
 const taskId = route.params.taskId as string
 const repoId = route.params.repoId as string
 
-const activeTab = ref<'chat' | 'files'>('chat')
+const activeTab = ref<'chat' | 'files' | 'sessions'>('chat')
 
 interface RepoTask {
   id: string
@@ -29,6 +29,7 @@ interface RepoTask {
 
 interface ChatMessage {
   id: string
+  phase_id: string
   role: 'user' | 'assistant'
   content: string
   created_at: string
@@ -47,6 +48,12 @@ interface WorkflowPhase {
 
 const workflowPhases = ref<WorkflowPhase[]>([])
 const rollingBack = ref(false)
+const viewingPhaseId = ref<string | null>(null)
+
+const isViewingPastPhase = computed(() => {
+  if (!task.value || !viewingPhaseId.value) return false
+  return viewingPhaseId.value !== task.value.current_phase
+})
 
 const phaseLabel: Record<string, string> = {
   design: '设计探索',
@@ -68,6 +75,7 @@ const statusLabel: Record<string, string> = {
   completed: '已完成',
   failed: '失败',
   cancelled: '已取消',
+  pending: '未开始',
 }
 
 const displayPhase = computed(() =>
@@ -86,6 +94,7 @@ const currentPhaseIndex = computed(() => {
 })
 
 function phaseState(index: number): 'done' | 'active' | 'future' {
+  if (task.value?.phase_status === 'completed') return 'done'
   const ci = currentPhaseIndex.value
   if (ci === -1) return 'future'
   if (index < ci) return 'done'
@@ -93,35 +102,51 @@ function phaseState(index: number): 'done' | 'active' | 'future' {
   return 'future'
 }
 
-const rollbackTarget = ref<{ id: string, name: string } | null>(null)
-
-function requestRollback(targetPhaseId: string) {
-  if (!task.value || isRunning.value || rollingBack.value) return
-  const phase = workflowPhases.value.find(p => p.id === targetPhaseId)
-  if (phase) rollbackTarget.value = { id: phase.id, name: phase.name }
+interface PhaseGroup {
+  phaseId: string
+  phaseName: string
+  messages: ChatMessage[]
+  state: 'done' | 'active' | 'future'
 }
 
-function cancelRollback() {
-  rollbackTarget.value = null
+const messageGroups = computed<PhaseGroup[]>(() => {
+  if (!workflowPhases.value.length) return []
+
+  const msgsByPhase = new Map<string, ChatMessage[]>()
+  for (const msg of messages.value) {
+    const arr = msgsByPhase.get(msg.phase_id) ?? []
+    arr.push(msg)
+    msgsByPhase.set(msg.phase_id, arr)
+  }
+
+  return workflowPhases.value
+    .map((phase, idx) => ({
+      phaseId: phase.id,
+      phaseName: phaseLabel[phase.id] ?? phase.name,
+      messages: msgsByPhase.get(phase.id) ?? [],
+      state: phaseState(idx),
+    }))
+    .filter(g => g.messages.length > 0 || g.state === 'active')
+})
+
+const hasAnyMessages = computed(() => messages.value.length > 0)
+
+const phaseGroupEls = new Map<string, HTMLElement>()
+
+function setPhaseGroupRef(phaseId: string) {
+  return (el: Element | ComponentPublicInstance | null) => {
+    if (el instanceof HTMLElement) phaseGroupEls.set(phaseId, el)
+    else phaseGroupEls.delete(phaseId)
+  }
 }
 
-async function confirmRollback() {
-  if (!task.value || !rollbackTarget.value) return
-  const targetPhaseId = rollbackTarget.value.id
-  rollbackTarget.value = null
-  rollingBack.value = true
-  try {
-    await rpc('workflow.rollback', { repoTaskId: task.value.id, targetPhaseId })
-    messages.value = []
-    liveOutput.value = ''
-    await new Promise(r => setTimeout(r, 300))
-    const t = await rpc<RepoTask>('task.get', { id: taskId })
-    if (t) task.value = t
-    startPolling()
-  }
-  finally {
-    rollingBack.value = false
-  }
+function selectPhase(phaseId: string) {
+  if (!task.value || rollingBack.value) return
+  viewingPhaseId.value = phaseId
+  nextTick(() => {
+    const el = phaseGroupEls.get(phaseId)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
 }
 
 interface ChangedFile {
@@ -136,6 +161,54 @@ const selectedFilePath = ref<string | null>(null)
 const fileDiff = ref('')
 const loadingFiles = ref(false)
 const loadingDiff = ref(false)
+
+// ── Session transcript ──
+
+interface AgentRun {
+  id: string
+  repo_task_id: string
+  phase_id: string
+  provider: string
+  status: string
+  started_at: string
+  finished_at: string | null
+  token_usage: number | null
+  error: string | null
+  session_id: string | null
+  model: string | null
+}
+
+interface ToolCall {
+  tool_use_id: string
+  name: string
+  input: Record<string, any>
+  result: string | null
+  resultTimestamp: string | null
+  is_error: boolean
+}
+
+interface AssistantBlock {
+  kind: 'text' | 'thinking' | 'tool_use'
+  text: string
+  tool_call: ToolCall | null
+  timestamp: string | null
+}
+
+interface TranscriptTurn {
+  index: number
+  user_text: string
+  blocks: AssistantBlock[]
+  timestamp: string
+}
+
+const agentRuns = ref<AgentRun[]>([])
+const selectedRunId = ref<string | null>(null)
+const transcriptTurns = ref<TranscriptTurn[]>([])
+const transcriptFormat = ref('')
+const transcriptFilePath = ref<string | null>(null)
+const loadingRuns = ref(false)
+const loadingTranscript = ref(false)
+const expandedBlocks = ref<Set<string>>(new Set())
 
 function normalizeTime(iso: string) {
   return iso.includes('T') || iso.includes('Z') ? iso : `${iso.replace(' ', 'T')}Z`
@@ -168,7 +241,9 @@ async function pollLiveOutput() {
     }
     const t = await rpc<RepoTask>('task.get', { id: taskId })
     if (t) {
+      const phaseChanged = task.value?.current_phase !== t.current_phase
       task.value = t
+      if (phaseChanged) viewingPhaseId.value = t.current_phase
       if (t.phase_status !== 'running') {
         clearInterval(pollTimer!)
         pollTimer = null
@@ -208,13 +283,13 @@ watch(isRunning, (running) => {
 
 watch(activeTab, (tab) => {
   if (tab === 'files') loadChangedFiles()
+  if (tab === 'sessions') loadAgentRuns()
 })
 
 async function refreshMessages() {
   if (!task.value) return
-  const msgs = await rpc<ChatMessage[]>('message.list', {
+  const msgs = await rpc<ChatMessage[]>('message.listAll', {
     taskId: task.value.id,
-    phaseId: task.value.current_phase,
   })
   if (msgs) {
     messages.value = msgs
@@ -227,7 +302,10 @@ onMounted(async () => {
     rpc<RepoTask>('task.get', { id: taskId }),
     rpc<{ phases: WorkflowPhase[] }>('workflow.phases'),
   ])
-  if (t) task.value = t
+  if (t) {
+    task.value = t
+    viewingPhaseId.value = t.current_phase
+  }
   if (phasesRes?.phases) workflowPhases.value = phasesRes.phases
   await refreshMessages()
   if (isRunning.value) startPolling()
@@ -244,6 +322,69 @@ async function loadChangedFiles() {
   }
   catch { changedFiles.value = [] }
   finally { loadingFiles.value = false }
+}
+
+async function loadAgentRuns() {
+  if (!task.value) return
+  loadingRuns.value = true
+  try {
+    const runs = await rpc<AgentRun[]>('task.agentRuns', { repoTaskId: task.value.id })
+    agentRuns.value = runs ?? []
+  }
+  catch { agentRuns.value = [] }
+  finally { loadingRuns.value = false }
+}
+
+async function selectAgentRun(run: AgentRun) {
+  if (selectedRunId.value === run.id) return
+  selectedRunId.value = run.id
+  transcriptTurns.value = []
+  transcriptFilePath.value = null
+  transcriptFormat.value = ''
+
+  if (!run.session_id) return
+
+  loadingTranscript.value = true
+  try {
+    const res = await rpc<{ turns: TranscriptTurn[], format: string, filePath: string | null }>(
+      'task.sessionTranscript',
+      { sessionId: run.session_id },
+    )
+    transcriptTurns.value = res?.turns ?? []
+    transcriptFormat.value = res?.format ?? ''
+    transcriptFilePath.value = res?.filePath ?? null
+  }
+  catch { transcriptTurns.value = [] }
+  finally { loadingTranscript.value = false }
+}
+
+function toggleBlock(id: string) {
+  const s = new Set(expandedBlocks.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  expandedBlocks.value = s
+}
+
+function truncateText(text: string, maxLen = 200): string {
+  if (text.length <= maxLen) return text
+  return `${text.slice(0, maxLen)}...`
+}
+
+function formatToolInput(input: Record<string, any>): string {
+  try { return JSON.stringify(input, null, 2) }
+  catch { return String(input) }
+}
+
+function toolSummary(tc: ToolCall): string {
+  const inp = tc.input
+  if (inp.description) return truncateText(inp.description, 60)
+  if (inp.command) return truncateText(inp.command, 60)
+  if (inp.path) return inp.path.split('/').pop() ?? inp.path
+  if (inp.query) return truncateText(inp.query, 60)
+  if (inp.pattern) return truncateText(inp.pattern, 60)
+  if (inp.glob_pattern) return truncateText(inp.glob_pattern, 60)
+  if (inp.search_term) return truncateText(inp.search_term, 60)
+  return ''
 }
 
 async function selectChangedFile(filePath: string) {
@@ -288,6 +429,7 @@ async function sendMessage() {
 
   messages.value.push({
     id: `local-${Date.now()}`,
+    phase_id: task.value.current_phase,
     role: 'user',
     content,
     created_at: new Date().toISOString(),
@@ -368,17 +510,27 @@ async function confirmReset() {
   if (!task.value || resetting.value) return
   resetting.value = true
   try {
-    await rpc('workflow.resetPhase', { repoTaskId: task.value.id })
-    messages.value = []
+    if (isViewingPastPhase.value && viewingPhaseId.value) {
+      rollingBack.value = true
+      await rpc('workflow.rollback', { repoTaskId: task.value.id, targetPhaseId: viewingPhaseId.value })
+    }
+    else {
+      await rpc('workflow.resetPhase', { repoTaskId: task.value.id })
+    }
     liveOutput.value = ''
 
     await new Promise(r => setTimeout(r, 300))
     const t = await rpc<RepoTask>('task.get', { id: taskId })
-    if (t) task.value = t
+    if (t) {
+      task.value = t
+      viewingPhaseId.value = t.current_phase
+    }
+    await refreshMessages()
     startPolling()
   }
   finally {
     resetting.value = false
+    rollingBack.value = false
   }
 }
 
@@ -450,23 +602,32 @@ async function handleCancel() {
             'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400': task.phase_status === 'failed',
             'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400': task.phase_status === 'running',
             'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400': task.phase_status === 'completed',
-            'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-500': task.phase_status === 'cancelled',
+            'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-500': task.phase_status === 'cancelled' || task.phase_status === 'pending',
           }"
         >
-          {{ displayPhase }} · {{ displayStatus }}
+          <template v-if="task.phase_status === 'completed'">
+            <div class="i-carbon-checkmark-filled w-3 h-3 inline-block mr-0.5 align-[-2px]" />
+            全部完成
+          </template>
+          <template v-else>
+            {{ displayPhase }} · {{ displayStatus }}
+          </template>
         </span>
       </div>
       <div v-else class="flex-1 text-[13px] text-gray-400">加载中...</div>
 
-      <!-- Reset button -->
+      <!-- Reset / Rollback button -->
       <button
         v-if="task && !isRunning"
-        class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
-        :disabled="resetting"
+        class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium transition-colors"
+        :class="isViewingPastPhase
+          ? 'text-amber-500 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-500/10'
+          : 'text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10'"
+        :disabled="resetting || rollingBack"
         @click="requestReset"
       >
-        <div class="w-3.5 h-3.5" :class="resetting ? 'i-carbon-circle-dash animate-spin' : 'i-carbon-reset'" />
-        {{ resetting ? '重置中...' : '重置' }}
+        <div class="w-3.5 h-3.5" :class="resetting || rollingBack ? 'i-carbon-circle-dash animate-spin' : isViewingPastPhase ? 'i-carbon-undo' : 'i-carbon-reset'" />
+        {{ resetting || rollingBack ? '处理中...' : isViewingPastPhase ? '回滚到此阶段' : '重置' }}
       </button>
 
       <!-- Tab toggle -->
@@ -491,6 +652,16 @@ async function handleCancel() {
           <div class="i-carbon-document w-3.5 h-3.5" />
           文件
         </button>
+        <button
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12px] font-medium transition-all duration-150"
+          :class="activeTab === 'sessions'
+            ? 'bg-white dark:bg-[#2c2c30] text-gray-800 dark:text-gray-100 shadow-sm'
+            : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'"
+          @click="activeTab = 'sessions'"
+        >
+          <div class="i-carbon-data-base w-3.5 h-3.5" />
+          会话
+        </button>
       </div>
     </div>
 
@@ -504,13 +675,15 @@ async function handleCancel() {
           class="group flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-medium whitespace-nowrap transition-all duration-150"
           :class="{
             'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-500/10 cursor-pointer': phaseState(idx) === 'done' && !isRunning,
-            'text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-500/10': phaseState(idx) === 'active',
+            'text-indigo-600 dark:text-indigo-400 cursor-pointer': phaseState(idx) === 'active',
+            'bg-indigo-50 dark:bg-indigo-500/10': viewingPhaseId === phase.id,
             'text-gray-300 dark:text-gray-600 cursor-default': phaseState(idx) === 'future',
             'pointer-events-none': isRunning || rollingBack,
+            'ring-1 ring-indigo-400/50 dark:ring-indigo-500/30': viewingPhaseId === phase.id && phaseState(idx) !== 'future',
           }"
-          :disabled="phaseState(idx) === 'future' || phaseState(idx) === 'active' || isRunning"
-          :title="phaseState(idx) === 'done' ? `回滚到「${phase.name}」` : ''"
-          @click="phaseState(idx) === 'done' && requestRollback(phase.id)"
+          :disabled="phaseState(idx) === 'future' || isRunning"
+          :title="phaseState(idx) === 'done' ? `查看「${phase.name}」阶段对话` : phaseState(idx) === 'active' ? '当前阶段' : ''"
+          @click="phaseState(idx) !== 'future' && selectPhase(phase.id)"
         >
           <div
             class="w-4 h-4 rounded-full flex items-center justify-center shrink-0 text-[9px] font-bold border transition-colors"
@@ -540,63 +713,103 @@ async function handleCancel() {
       <!-- Chat tab — full width -->
       <div v-show="activeTab === 'chat'" class="flex flex-col h-full">
         <div ref="chatContainer" class="flex-1 overflow-y-auto px-6 py-4">
-          <div class="max-w-2xl mx-auto space-y-3">
-            <div
-              v-for="msg in messages"
-              :key="msg.id"
-              class="flex"
-              :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
-            >
+          <div class="max-w-5xl mx-auto space-y-3">
+            <template v-for="group in messageGroups" :key="group.phaseId">
+              <!-- Phase start divider -->
+              <div :ref="setPhaseGroupRef(group.phaseId)" class="phase-divider flex items-center gap-2.5 py-4 max-w-[85%]">
+                <div class="flex-1 h-px bg-gray-200 dark:bg-white/8" />
+                <div
+                  class="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium shrink-0"
+                  :class="{
+                    'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400': group.state === 'done',
+                    'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400': group.state === 'active',
+                  }"
+                >
+                  <div
+                    class="w-3 h-3 rounded-full flex items-center justify-center shrink-0"
+                    :class="{
+                      'bg-emerald-500 text-white': group.state === 'done',
+                      'bg-indigo-500 text-white': group.state === 'active',
+                    }"
+                  >
+                    <div v-if="group.state === 'done'" class="i-carbon-checkmark w-2 h-2" />
+                    <div v-else-if="group.state === 'active' && isRunning" class="i-carbon-circle-dash w-2 h-2 animate-spin" />
+                    <div v-else class="w-1 h-1 rounded-full bg-white" />
+                  </div>
+                  {{ group.phaseName }}
+                </div>
+                <div class="flex-1 h-px bg-gray-200 dark:bg-white/8" />
+              </div>
+
+              <!-- Messages for this phase -->
               <div
-                class="max-w-[85%] rounded-2xl px-4 py-3 text-[13px] leading-relaxed"
-                :class="msg.role === 'user'
-                  ? 'bg-indigo-600 text-white rounded-br-md'
-                  : 'bg-white dark:bg-[#28282c] text-gray-700 dark:text-gray-200 rounded-bl-md shadow-sm shadow-black/[0.04] dark:shadow-none'"
+                v-for="msg in group.messages"
+                :key="msg.id"
+                class="flex"
+                :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
               >
                 <div
-                  v-if="msg.role === 'assistant'"
-                  class="prose-chat"
-                  v-html="md.render(msg.content)"
-                />
-                <p v-else class="whitespace-pre-wrap">{{ msg.content }}</p>
-                <div
-                  class="text-[11px] mt-1.5 text-right tabular-nums"
-                  :class="msg.role === 'user' ? 'text-indigo-300' : 'text-gray-300 dark:text-gray-600'"
+                  class="max-w-[85%] min-w-0 rounded-2xl px-4 py-3 text-[13px] leading-relaxed overflow-hidden"
+                  :class="msg.role === 'user'
+                    ? 'bg-indigo-600 text-white rounded-br-md'
+                    : 'bg-white dark:bg-[#28282c] text-gray-700 dark:text-gray-200 rounded-bl-md shadow-sm shadow-black/[0.04] dark:shadow-none'"
                 >
-                  {{ formatTime(msg.created_at) }}
+                  <div
+                    v-if="msg.role === 'assistant'"
+                    class="prose-chat"
+                    v-html="md.render(msg.content)"
+                  />
+                  <p v-else class="whitespace-pre-wrap">{{ msg.content }}</p>
+                  <div
+                    class="text-[11px] mt-1.5 text-right tabular-nums"
+                    :class="msg.role === 'user' ? 'text-indigo-300' : 'text-gray-300 dark:text-gray-600'"
+                  >
+                    {{ formatTime(msg.created_at) }}
+                  </div>
                 </div>
               </div>
-            </div>
 
-            <!-- Live streaming output -->
-            <div v-if="liveOutput" class="flex justify-start">
-              <div class="max-w-[85%] rounded-2xl rounded-bl-md px-4 py-3 bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none">
-                <div
-                  class="prose-chat text-[13px] text-gray-700 dark:text-gray-200 leading-relaxed"
-                  v-html="md.render(liveOutput)"
-                />
-                <div class="flex items-center gap-1.5 mt-2 text-[11px] text-indigo-500 dark:text-indigo-400">
-                  <div class="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-                  正在输出...
+              <!-- Live streaming output (current phase only) -->
+              <template v-if="group.state === 'active'">
+                <div v-if="liveOutput" class="flex justify-start">
+                  <div class="max-w-[85%] min-w-0 rounded-2xl rounded-bl-md px-4 py-3 bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none overflow-hidden">
+                    <div
+                      class="prose-chat text-[13px] text-gray-700 dark:text-gray-200 leading-relaxed"
+                      v-html="md.render(liveOutput)"
+                    />
+                    <div class="flex items-center gap-1.5 mt-2 text-[11px] text-indigo-500 dark:text-indigo-400">
+                      <div class="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
+                      正在输出...
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
 
-            <!-- Running indicator (no output yet) -->
-            <div v-else-if="isRunning && !liveOutput" class="flex justify-start">
-              <div class="flex items-center gap-2 px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none">
-                <div class="flex gap-1">
-                  <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0ms" />
-                  <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 150ms" />
-                  <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 300ms" />
+                <div v-else-if="isRunning && !liveOutput" class="flex justify-start">
+                  <div class="flex items-center gap-2 px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none">
+                    <div class="flex gap-1">
+                      <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0ms" />
+                      <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 150ms" />
+                      <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 300ms" />
+                    </div>
+                    <span class="text-[12px] text-gray-400">Agent 正在启动...{{ waitSeconds > 5 ? ` (${waitSeconds}s)` : '' }}</span>
+                  </div>
                 </div>
-                <span class="text-[12px] text-gray-400">Agent 正在启动...{{ waitSeconds > 5 ? ` (${waitSeconds}s)` : '' }}</span>
+              </template>
+
+              <!-- Phase end divider (completed phases only) -->
+              <div v-if="group.state === 'done'" class="flex items-center gap-2.5 py-3 max-w-[85%]">
+                <div class="flex-1 h-px bg-gradient-to-r from-transparent via-gray-200 dark:via-white/6 to-transparent" />
+                <span class="text-[10px] text-gray-300 dark:text-gray-500 flex items-center gap-1 shrink-0">
+                  <div class="i-carbon-checkmark-filled w-2.5 h-2.5 text-emerald-400/50 dark:text-emerald-500/30" />
+                  {{ group.phaseName }} 完成
+                </span>
+                <div class="flex-1 h-px bg-gradient-to-r from-transparent via-gray-200 dark:via-white/6 to-transparent" />
               </div>
-            </div>
+            </template>
 
             <!-- Empty state -->
             <div
-              v-if="messages.length === 0 && !liveOutput && !isRunning"
+              v-if="!hasAnyMessages && !liveOutput && !isRunning"
               class="flex items-center justify-center py-20 text-gray-300 dark:text-gray-600 text-[13px]"
             >
               <div class="text-center">
@@ -609,7 +822,7 @@ async function handleCancel() {
 
         <!-- Input bar -->
         <div class="border-t border-gray-200 dark:border-white/5 p-4 bg-white/60 dark:bg-[#1e1e22]/60 backdrop-blur-sm">
-          <div class="max-w-2xl mx-auto flex gap-2">
+          <div class="max-w-5xl mx-auto flex gap-2">
             <input
               v-model="chatInput"
               type="text"
@@ -634,6 +847,238 @@ async function handleCancel() {
             >
               <div class="i-carbon-send w-4 h-4" />
             </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sessions tab — agent runs + transcript (Turn-based, inspired by claude-replay) -->
+      <div v-show="activeTab === 'sessions'" class="flex h-full">
+        <!-- Run list sidebar -->
+        <div class="w-72 border-r border-gray-200 dark:border-white/5 overflow-y-auto bg-[#fafafa] dark:bg-[#1e1e22] flex flex-col">
+          <div class="px-3 py-2.5 border-b border-gray-100 dark:border-white/[0.03] flex items-center justify-between">
+            <span class="text-[12px] font-medium text-gray-500 dark:text-gray-400">
+              Agent 会话
+              <span v-if="agentRuns.length" class="ml-1 text-gray-400 dark:text-gray-500">({{ agentRuns.length }})</span>
+            </span>
+            <button
+              class="p-1 rounded hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+              title="刷新"
+              @click="loadAgentRuns"
+            >
+              <div class="i-carbon-renew w-3.5 h-3.5 text-gray-400" :class="loadingRuns && 'animate-spin'" />
+            </button>
+          </div>
+
+          <div class="flex-1 overflow-y-auto py-1">
+            <div v-if="loadingRuns" class="flex items-center justify-center h-20 text-[12px] text-gray-400">
+              <div class="i-carbon-circle-dash w-4 h-4 animate-spin mr-2" />
+              加载中...
+            </div>
+            <div
+              v-else-if="agentRuns.length === 0"
+              class="flex flex-col items-center justify-center h-32 text-[12px] text-gray-300 dark:text-gray-600"
+            >
+              <div class="i-carbon-data-base w-8 h-8 mb-2 opacity-30" />
+              暂无会话记录
+            </div>
+            <button
+              v-for="run in agentRuns"
+              :key="run.id"
+              class="w-full flex items-start gap-2 px-3 py-2 text-left hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+              :class="selectedRunId === run.id && 'bg-indigo-50 dark:bg-indigo-500/10'"
+              @click="selectAgentRun(run)"
+            >
+              <div
+                class="shrink-0 w-2 h-2 mt-1.5 rounded-full"
+                :class="{
+                  'bg-emerald-500': run.status === 'success',
+                  'bg-red-500': run.status === 'failed',
+                  'bg-indigo-500 animate-pulse': run.status === 'running',
+                  'bg-gray-300 dark:bg-gray-600': !['success', 'failed', 'running'].includes(run.status),
+                }"
+              />
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-1.5">
+                  <span
+                    class="text-[12px] font-medium truncate"
+                    :class="selectedRunId === run.id
+                      ? 'text-indigo-600 dark:text-indigo-400'
+                      : 'text-gray-700 dark:text-gray-300'"
+                  >{{ phaseLabel[run.phase_id] ?? run.phase_id }}</span>
+                  <span
+                    class="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium"
+                    :class="{
+                      'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400': run.status === 'success',
+                      'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400': run.status === 'failed',
+                      'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400': run.status === 'running',
+                      'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-500': !['success', 'failed', 'running'].includes(run.status),
+                    }"
+                  >{{ run.status }}</span>
+                </div>
+                <div class="text-[10px] text-gray-400 dark:text-gray-600 mt-0.5">
+                  {{ formatTime(run.started_at) }}
+                  <span v-if="run.session_id" class="ml-1 font-mono">{{ run.session_id.slice(0, 8) }}</span>
+                  <span v-else class="ml-1 italic">无 session</span>
+                </div>
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span v-if="run.model" class="text-[10px] font-mono text-violet-500 dark:text-violet-400">{{ run.model }}</span>
+                  <span v-if="run.token_usage" class="text-[10px] text-gray-400 dark:text-gray-600 tabular-nums">
+                    {{ run.token_usage.toLocaleString() }} tokens
+                  </span>
+                </div>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        <!-- Transcript view (Turn-based) -->
+        <div class="flex-1 overflow-y-auto">
+          <div v-if="loadingTranscript" class="flex items-center justify-center h-full text-[13px] text-gray-400">
+            <div class="i-carbon-circle-dash w-5 h-5 animate-spin mr-2" />
+            加载会话数据...
+          </div>
+          <div v-else-if="selectedRunId && transcriptTurns.length > 0" class="transcript-view">
+            <!-- Header -->
+            <div class="sticky top-0 z-10 flex items-center gap-2 px-4 py-2 bg-gray-50 dark:bg-[#1a1a1e] border-b border-gray-200 dark:border-white/5">
+              <div class="i-carbon-data-base w-3.5 h-3.5 text-gray-400" />
+              <span class="text-[12px] text-gray-500 dark:text-gray-400">
+                {{ transcriptTurns.length }} 轮对话
+              </span>
+              <span v-if="transcriptFormat" class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 dark:bg-white/5 text-gray-500 dark:text-gray-400">
+                {{ transcriptFormat }}
+              </span>
+              <span
+                v-if="agentRuns.find(r => r.id === selectedRunId)?.model"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium font-mono bg-violet-50 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400"
+              >
+                {{ agentRuns.find(r => r.id === selectedRunId)?.model }}
+              </span>
+              <span v-if="transcriptFilePath" class="text-[10px] font-mono text-gray-400 dark:text-gray-600 truncate ml-auto">
+                {{ transcriptFilePath }}
+              </span>
+            </div>
+
+            <!-- Turns -->
+            <div class="p-4 space-y-4">
+              <div
+                v-for="turn in transcriptTurns"
+                :key="turn.index"
+                class="turn-group"
+              >
+                <!-- User message -->
+                <div v-if="turn.user_text" class="mb-3">
+                  <div class="flex items-center gap-2 mb-1.5">
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-400">
+                      Turn {{ turn.index }}
+                    </span>
+                    <span v-if="turn.timestamp" class="text-[10px] text-gray-400 dark:text-gray-600 tabular-nums">
+                      {{ turn.timestamp }}
+                    </span>
+                  </div>
+                  <div class="rounded-xl px-4 py-3 bg-indigo-50/50 dark:bg-indigo-500/[0.04] border border-indigo-100 dark:border-indigo-500/10">
+                    <div class="prose-chat text-[13px] leading-relaxed text-gray-700 dark:text-gray-200" v-html="md.render(turn.user_text)" />
+                  </div>
+                </div>
+                <div v-else class="flex items-center gap-2 mb-2">
+                  <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400">
+                    Turn {{ turn.index }}
+                  </span>
+                </div>
+
+                <!-- Assistant blocks -->
+                <div class="space-y-2 pl-3 border-l-2 border-emerald-200 dark:border-emerald-500/20">
+                  <template v-for="(block, bIdx) in turn.blocks" :key="bIdx">
+                    <!-- Text block -->
+                    <div v-if="block.kind === 'text'" class="rounded-xl px-4 py-3 bg-white dark:bg-[#28282c] border border-gray-100 dark:border-white/[0.04] shadow-sm shadow-black/[0.02] dark:shadow-none">
+                      <div class="prose-chat text-[13px] leading-relaxed text-gray-700 dark:text-gray-200" v-html="md.render(block.text)" />
+                    </div>
+
+                    <!-- Thinking block -->
+                    <div v-else-if="block.kind === 'thinking'" class="rounded-lg overflow-hidden border border-purple-200/50 dark:border-purple-500/10">
+                      <button
+                        class="w-full flex items-center gap-2 px-3 py-2 text-left bg-purple-50/50 dark:bg-purple-500/[0.03] hover:bg-purple-50 dark:hover:bg-purple-500/5 transition-colors"
+                        @click="toggleBlock(`think-${turn.index}-${bIdx}`)"
+                      >
+                        <div
+                          class="i-carbon-chevron-right w-3 h-3 text-gray-400 transition-transform duration-150"
+                          :class="expandedBlocks.has(`think-${turn.index}-${bIdx}`) && 'rotate-90'"
+                        />
+                        <div class="i-carbon-idea w-3.5 h-3.5 text-purple-500" />
+                        <span class="text-[12px] font-medium text-purple-600 dark:text-purple-400">Thinking</span>
+                        <span class="text-[11px] text-gray-400 dark:text-gray-500 truncate flex-1">
+                          {{ truncateText(block.text, 80) }}
+                        </span>
+                      </button>
+                      <div v-if="expandedBlocks.has(`think-${turn.index}-${bIdx}`)" class="px-4 py-3 bg-purple-50/30 dark:bg-purple-500/[0.02]">
+                        <div class="prose-chat text-[12px] leading-relaxed text-gray-600 dark:text-gray-400" v-html="md.render(block.text)" />
+                      </div>
+                    </div>
+
+                    <!-- Tool use block -->
+                    <div
+                      v-else-if="block.kind === 'tool_use' && block.tool_call"
+                      class="rounded-lg overflow-hidden border"
+                      :class="block.tool_call.is_error
+                        ? 'border-red-200 dark:border-red-500/15'
+                        : 'border-gray-200 dark:border-white/[0.06]'"
+                    >
+                      <!-- Tool header -->
+                      <button
+                        class="w-full flex items-center gap-2 px-3 py-2 text-left transition-colors"
+                        :class="block.tool_call.is_error
+                          ? 'bg-red-50/50 dark:bg-red-500/[0.03] hover:bg-red-50 dark:hover:bg-red-500/5'
+                          : 'bg-gray-50 dark:bg-[#1a1a1e] hover:bg-gray-100 dark:hover:bg-white/5'"
+                        @click="toggleBlock(`tool-${turn.index}-${bIdx}`)"
+                      >
+                        <div
+                          class="i-carbon-chevron-right w-3 h-3 text-gray-400 transition-transform duration-150"
+                          :class="expandedBlocks.has(`tool-${turn.index}-${bIdx}`) && 'rotate-90'"
+                        />
+                        <div class="w-3.5 h-3.5" :class="block.tool_call.is_error ? 'i-carbon-warning-alt text-red-500' : 'i-carbon-terminal text-blue-500'" />
+                        <span
+                          class="text-[12px] font-medium"
+                          :class="block.tool_call.is_error ? 'text-red-600 dark:text-red-400' : 'text-blue-600 dark:text-blue-400'"
+                        >{{ block.tool_call.name }}</span>
+                        <span class="text-[11px] text-gray-400 dark:text-gray-500 truncate flex-1 font-mono">
+                          {{ toolSummary(block.tool_call) }}
+                        </span>
+                        <span v-if="block.tool_call.result !== null" class="shrink-0">
+                          <div v-if="block.tool_call.is_error" class="i-carbon-close-filled w-3 h-3 text-red-400" />
+                          <div v-else class="i-carbon-checkmark-filled w-3 h-3 text-emerald-400" />
+                        </span>
+                      </button>
+                      <!-- Expanded: input + result -->
+                      <div v-if="expandedBlocks.has(`tool-${turn.index}-${bIdx}`)" class="border-t border-gray-100 dark:border-white/[0.04]">
+                        <!-- Input -->
+                        <div class="px-3 py-2 bg-[#fafafa] dark:bg-[#161618]">
+                          <div class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-1">Input</div>
+                          <pre class="text-[11px] font-mono text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-all leading-relaxed max-h-60 overflow-y-auto">{{ formatToolInput(block.tool_call.input) }}</pre>
+                        </div>
+                        <!-- Result -->
+                        <div v-if="block.tool_call.result !== null" class="px-3 py-2 border-t border-gray-100 dark:border-white/[0.04]" :class="block.tool_call.is_error ? 'bg-red-50/30 dark:bg-red-500/[0.02]' : 'bg-emerald-50/30 dark:bg-emerald-500/[0.02]'">
+                          <div class="text-[10px] font-bold uppercase tracking-wider mb-1" :class="block.tool_call.is_error ? 'text-red-400' : 'text-emerald-500'">
+                            {{ block.tool_call.is_error ? 'Error' : 'Result' }}
+                          </div>
+                          <pre class="text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-60 overflow-y-auto" :class="block.tool_call.is_error ? 'text-red-600 dark:text-red-400' : 'text-gray-600 dark:text-gray-400'">{{ block.tool_call.result }}</pre>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else-if="selectedRunId && !agentRuns.find(r => r.id === selectedRunId)?.session_id" class="flex items-center justify-center h-full text-gray-300 dark:text-gray-600 text-[13px]">
+            <div class="text-center">
+              <div class="i-carbon-warning-alt w-10 h-10 mx-auto mb-2 opacity-30" />
+              <p>该次运行无关联的 session ID</p>
+            </div>
+          </div>
+          <div v-else class="flex items-center justify-center h-full text-gray-300 dark:text-gray-600 text-[13px]">
+            <div class="text-center">
+              <div class="i-carbon-data-base w-10 h-10 mx-auto mb-2 opacity-30" />
+              <p>选择左侧会话查看数据</p>
+            </div>
           </div>
         </div>
       </div>
@@ -804,42 +1249,8 @@ async function handleCancel() {
       </button>
     </div>
 
-    <!-- Rollback confirm dialog -->
+    <!-- Reset / Rollback confirm dialog -->
     <Teleport to="body">
-      <Transition name="modal">
-        <div
-          v-if="rollbackTarget"
-          class="fixed inset-0 z-50 flex items-center justify-center"
-        >
-          <div class="absolute inset-0 bg-black/30 backdrop-blur-[2px]" @click="cancelRollback" />
-          <div class="relative bg-white dark:bg-[#28282c] rounded-2xl shadow-xl shadow-black/10 dark:shadow-black/40 w-[360px] p-5 mx-4">
-            <div class="flex items-center gap-2.5 mb-3">
-              <div class="w-8 h-8 rounded-full bg-amber-50 dark:bg-amber-500/10 flex items-center justify-center">
-                <div class="i-carbon-warning-alt w-4 h-4 text-amber-500" />
-              </div>
-              <h3 class="text-[14px] font-semibold text-gray-800 dark:text-gray-100">确认回滚</h3>
-            </div>
-            <p class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed mb-5 pl-[42px]">
-              将回滚到「<span class="font-medium text-gray-700 dark:text-gray-200">{{ rollbackTarget.name }}</span>」阶段，该阶段及之后的所有产出（对话、代码变更）将被清除且不可恢复。
-            </p>
-            <div class="flex justify-end gap-2">
-              <button
-                class="px-4 py-2 rounded-lg text-[13px] text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-                @click="cancelRollback"
-              >
-                取消
-              </button>
-              <button
-                class="px-4 py-2 rounded-lg bg-amber-500 text-white text-[13px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
-                @click="confirmRollback"
-              >
-                确认回滚
-              </button>
-            </div>
-          </div>
-        </div>
-      </Transition>
-
       <Transition name="modal">
         <div
           v-if="showResetConfirm"
@@ -848,13 +1259,26 @@ async function handleCancel() {
           <div class="absolute inset-0 bg-black/30 backdrop-blur-[2px]" @click="showResetConfirm = false" />
           <div class="relative bg-white dark:bg-[#28282c] rounded-2xl shadow-xl shadow-black/10 dark:shadow-black/40 w-[360px] p-5 mx-4">
             <div class="flex items-center gap-2.5 mb-3">
-              <div class="w-8 h-8 rounded-full bg-red-50 dark:bg-red-500/10 flex items-center justify-center">
-                <div class="i-carbon-reset w-4 h-4 text-red-500" />
+              <div
+                class="w-8 h-8 rounded-full flex items-center justify-center"
+                :class="isViewingPastPhase ? 'bg-amber-50 dark:bg-amber-500/10' : 'bg-red-50 dark:bg-red-500/10'"
+              >
+                <div
+                  class="w-4 h-4"
+                  :class="isViewingPastPhase ? 'i-carbon-warning-alt text-amber-500' : 'i-carbon-reset text-red-500'"
+                />
               </div>
-              <h3 class="text-[14px] font-semibold text-gray-800 dark:text-gray-100">确认重置当前阶段</h3>
+              <h3 class="text-[14px] font-semibold text-gray-800 dark:text-gray-100">
+                {{ isViewingPastPhase ? '确认回滚' : '确认重置当前阶段' }}
+              </h3>
             </div>
             <p class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed mb-5 pl-[42px]">
-              将重置当前阶段，该阶段的对话记录和代码变更将被清除并重新执行。如需重置整个任务，请点击第一阶段标签进行回滚。
+              <template v-if="isViewingPastPhase">
+                将回滚到「<span class="font-medium text-gray-700 dark:text-gray-200">{{ workflowPhases.find(p => p.id === viewingPhaseId)?.name }}</span>」阶段，该阶段及之后的所有产出（对话、代码变更）将被清除且不可恢复。
+              </template>
+              <template v-else>
+                将重置当前阶段，该阶段的对话记录和代码变更将被清除并重新执行。
+              </template>
             </p>
             <div class="flex justify-end gap-2">
               <button
@@ -864,10 +1288,13 @@ async function handleCancel() {
                 取消
               </button>
               <button
-                class="px-4 py-2 rounded-lg bg-red-500 text-white text-[13px] font-medium hover:bg-red-400 shadow-sm shadow-red-500/20 transition-all duration-150 active:scale-[0.97]"
+                class="px-4 py-2 rounded-lg text-white text-[13px] font-medium shadow-sm transition-all duration-150 active:scale-[0.97]"
+                :class="isViewingPastPhase
+                  ? 'bg-amber-500 hover:bg-amber-400 shadow-amber-500/20'
+                  : 'bg-red-500 hover:bg-red-400 shadow-red-500/20'"
                 @click="confirmReset"
               >
-                确认重置
+                {{ isViewingPastPhase ? '确认回滚' : '确认重置' }}
               </button>
             </div>
           </div>
@@ -881,6 +1308,9 @@ async function handleCancel() {
 .prose-chat {
   font-size: 13px;
   line-height: 1.7;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  min-width: 0;
 }
 .prose-chat p { margin: 0.4em 0; }
 .prose-chat h1, .prose-chat h2, .prose-chat h3,
@@ -942,10 +1372,12 @@ async function handleCancel() {
   text-underline-offset: 2px;
 }
 .prose-chat table {
-  width: 100%;
+  max-width: 100%;
   border-collapse: collapse;
   margin: 0.5em 0;
   font-size: 0.95em;
+  display: block;
+  overflow-x: auto;
 }
 .prose-chat th, .prose-chat td {
   border: 1px solid #e5e7eb;

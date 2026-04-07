@@ -1,4 +1,3 @@
-import { join } from 'node:path'
 import type { RpcServer } from './server'
 import type Database from 'better-sqlite3'
 import { RepoRepository } from '../db/repositories/repo.repo'
@@ -9,8 +8,9 @@ import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { spawn as spawnChild } from 'node:child_process'
 import type { WorkflowEngine } from '../workflow/engine'
-import { createWorktree, getChangedFiles, getFileDiff } from '../git/operations'
+import { createBranch, getChangedFiles, getFileDiff } from '../git/operations'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
+import { readTranscript, listSessionsForRepo } from '../transcript/reader'
 
 function changeIdFromRequirementTitle(title: string): string {
   const slug = title
@@ -48,6 +48,18 @@ export function registerMethods(
   server.register('repo.create', async (params) => repoRepo.create(params))
   server.register('repo.delete', async ({ id }) => repoRepo.delete(id))
 
+  server.register('repo.sessions', async ({ repoId }: { repoId: string }) => {
+    const repo = repoRepo.findById(repoId)
+    if (!repo) throw new Error(`Repo not found: ${repoId}`)
+    return listSessionsForRepo(repo.local_path)
+  })
+
+  server.register('repo.sessionTranscript', async ({ sessionId }: { sessionId: string }) => {
+    const data = readTranscript(sessionId)
+    if (!data) return { turns: [], format: 'unknown', filePath: null }
+    return { turns: data.turns, format: data.format, filePath: data.filePath }
+  })
+
   // ── Requirement CRUD ──
   server.register('requirement.list', async () => reqRepo.findAll())
   server.register('requirement.create', async (params) => reqRepo.create(params))
@@ -72,11 +84,10 @@ export function registerMethods(
 
       const changeId = changeIdFromRequirementTitle(requirement.title)
       const branchName = `feature/${changeId}`
-      const worktreePath = join(repo.local_path, '.worktrees', changeId)
       const openspecPath = `openspec/changes/${changeId}`
 
       try {
-        await createWorktree(repo.local_path, worktreePath, branchName, repo.default_branch)
+        await createBranch(repo.local_path, branchName, repo.default_branch)
       }
       catch {
         // Missing origin or non-git cwd: still persist task for development
@@ -88,7 +99,7 @@ export function registerMethods(
         branch_name: branchName,
         change_id: changeId,
         openspec_path: openspecPath,
-        worktree_path: worktreePath,
+        worktree_path: repo.local_path,
       })
     },
   )
@@ -131,9 +142,23 @@ export function registerMethods(
     }
   })
 
+  // ── Agent runs & transcripts ──
+  server.register('task.agentRuns', async ({ repoTaskId }) => {
+    return runRepo.findByTaskId(repoTaskId)
+  })
+
+  server.register('task.sessionTranscript', async ({ sessionId }: { sessionId: string }) => {
+    const data = readTranscript(sessionId)
+    if (!data) return { turns: [], format: 'unknown', filePath: null }
+    return { turns: data.turns, format: data.format, filePath: data.filePath }
+  })
+
   // ── Conversation ──
   server.register('message.list', async ({ taskId, phaseId }) =>
     msgRepo.findByTaskAndPhase(taskId, phaseId),
+  )
+  server.register('message.listAll', async ({ taskId }) =>
+    msgRepo.findByTask(taskId),
   )
 
   // ── Workflow actions ──

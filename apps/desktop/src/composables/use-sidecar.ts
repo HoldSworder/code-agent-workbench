@@ -88,6 +88,14 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
       return { files: [] } as T
     case 'task.fileDiff':
       return { diff: '' } as T
+    case 'task.agentRuns':
+      return [] as T
+    case 'task.sessionTranscript':
+      return { turns: [], format: 'unknown', filePath: null } as T
+    case 'repo.sessions':
+      return [] as T
+    case 'repo.sessionTranscript':
+      return { turns: [], format: 'unknown', filePath: null } as T
     case 'settings.get':
       return { value: null } as T
     case 'settings.set':

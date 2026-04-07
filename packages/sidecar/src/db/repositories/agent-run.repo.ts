@@ -12,6 +12,7 @@ export interface AgentRun {
   token_usage: number | null
   error: string | null
   session_id: string | null
+  model: string | null
 }
 
 export interface CreateAgentRunInput {
@@ -60,7 +61,7 @@ export class AgentRunRepository {
 
   findByTaskId(repoTaskId: string): AgentRun[] {
     return this.db
-      .prepare('SELECT * FROM agent_runs WHERE repo_task_id = ? ORDER BY started_at ASC')
+      .prepare('SELECT * FROM agent_runs WHERE repo_task_id = ? ORDER BY started_at DESC')
       .all(repoTaskId) as AgentRun[]
   }
 
@@ -70,6 +71,7 @@ export class AgentRunRepository {
     tokenUsage?: number,
     error?: string,
     sessionId?: string,
+    model?: string,
   ): void {
     this.db
       .prepare(
@@ -79,11 +81,12 @@ export class AgentRunRepository {
           finished_at = datetime('now'),
           token_usage = ?,
           error = ?,
-          session_id = ?
+          session_id = ?,
+          model = ?
       WHERE id = ?
     `,
       )
-      .run(status, tokenUsage ?? null, error ?? null, sessionId ?? null, id)
+      .run(status, tokenUsage ?? null, error ?? null, sessionId ?? null, model ?? null, id)
   }
 
   findLastSessionId(repoTaskId: string, phaseId: string): string | null {

@@ -96,6 +96,7 @@ phases:
     requires_confirm: true
     provider: external-cli
     skill: skills/plan.md
+    entry_gate: has_proposal_and_specs_no_tasks
     invoke_commands:
       - openspec continue "{{change_id}}"
       - openspec validate "{{change_id}}"
@@ -111,6 +112,7 @@ phases:
     requires_confirm: false
     provider: external-cli
     skill: skills/t1-dev.md
+    entry_gate: tasks_has_unchecked
     invoke_skills:
       - superpowers:test-driven-development
       - superpowers:verification-before-completion
@@ -122,6 +124,7 @@ phases:
     requires_confirm: true
     provider: external-cli
     skill: skills/review.md
+    entry_gate: tasks_all_checked
     tools:
       - git-diff
       - read-file
@@ -133,6 +136,7 @@ phases:
     requires_confirm: false
     provider: script
     script: scripts/verify.sh
+    entry_gate: tasks_all_checked
     invoke_skills:
       - superpowers:verification-before-completion
 
@@ -141,6 +145,7 @@ phases:
     requires_confirm: true
     provider: script
     script: scripts/gitlab-mr.sh
+    entry_gate: tasks_all_checked
     args:
       - --target
       - develop
@@ -202,6 +207,7 @@ events:
     provider: script
     script: scripts/archive.sh
     precondition: e2e_report_pass
+    is_terminal: true
     triggers:
       - "归档"
       - "archive"

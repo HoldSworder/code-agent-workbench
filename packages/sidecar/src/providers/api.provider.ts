@@ -10,7 +10,7 @@ export interface ApiProviderConfig {
 
 export class ApiProvider implements AgentProvider {
   private client: Anthropic
-  private model: string
+  private _model: string
   private cancelled = false
 
   constructor(config: ApiProviderConfig) {
@@ -18,7 +18,11 @@ export class ApiProvider implements AgentProvider {
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
     })
-    this.model = config.model
+    this._model = config.model
+  }
+
+  get model(): string {
+    return this._model
   }
 
   async run(context: PhaseContext): Promise<PhaseResult> {
@@ -28,7 +32,7 @@ export class ApiProvider implements AgentProvider {
 
     try {
       const response = await this.client.messages.create({
-        model: this.model,
+        model: this._model,
         max_tokens: 4096,
         system: systemPrompt,
         messages: [{ role: 'user', content: userMessage }],

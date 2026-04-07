@@ -56,4 +56,16 @@ export class MessageRepository {
       )
       .all(taskId, phaseId) as Message[]
   }
+
+  findByTask(taskId: string): Message[] {
+    return this.db
+      .prepare(
+        `
+      SELECT * FROM conversation_messages
+      WHERE repo_task_id = ?
+      ORDER BY created_at ASC
+    `,
+      )
+      .all(taskId) as Message[]
+  }
 }

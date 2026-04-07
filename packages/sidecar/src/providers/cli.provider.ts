@@ -36,6 +36,10 @@ export class ExternalCliProvider implements AgentProvider {
     return this.lastSessionId
   }
 
+  get model(): string | null {
+    return this.config.model ?? null
+  }
+
   async run(context: PhaseContext, options?: RunOptions): Promise<PhaseResult> {
     const maxRetries = this.config.maxRetries ?? 1
     let lastError = ''
