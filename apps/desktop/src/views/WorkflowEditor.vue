@@ -41,6 +41,19 @@ interface DependencyConfig {
   skills?: Record<string, string>
 }
 
+interface GateCheck {
+  type: 'exists' | 'not_exists' | 'file_contains' | 'file_not_contains' | 'file_section_matches' | 'file_section_not_matches' | 'command_succeeds'
+  path?: string
+  pattern?: string
+  after?: string
+  command?: string
+}
+
+interface GateDef {
+  description: string
+  checks: GateCheck[]
+}
+
 interface GuardrailDef {
   description: string
   severity: 'hard' | 'soft'
@@ -64,6 +77,7 @@ interface WorkflowConfig {
   name: string
   description: string
   dependencies?: Record<string, DependencyConfig>
+  gate_definitions?: Record<string, GateDef>
   guardrail_definitions?: Record<string, GuardrailDef>
   state_inference?: { rules: StateRule[] }
   requirement_phases?: PhaseConfig[]
@@ -95,21 +109,12 @@ const showYaml = ref(false)
 const rawYaml = ref('')
 const phaseEnabledMap = ref<Record<string, boolean>>({})
 
-// ── Condition description map ──
-
-const builtinConditionDescriptions: Record<string, string> = {
-  no_change_dir: '无变更目录（openspec/changes 下无对应目录）',
-  has_proposal_and_specs_no_tasks: 'proposal.md 和 specs/ 已存在，但 tasks.md 尚未创建',
-  tasks_has_unchecked: 'tasks.md 中存在未勾选的任务项（- [ ]）',
-  tasks_all_checked: 'tasks.md 中所有任务项已勾选完成（无 - [ ]）',
-  e2e_report_pass: 'e2e-report.md 验收结论包含"通过"或"用户同意"',
-  e2e_report_fail_no_consent: 'e2e-report.md 不通过且用户未同意带债上线',
-  has_tasks: 'tasks.md 文件已创建',
-  archive_complete: '归档流程已完成',
-}
+// ── Condition description map (driven by gate_definitions) ──
 
 const conditionDescMap = computed<Record<string, string>>(() => {
-  const map = { ...builtinConditionDescriptions }
+  const map: Record<string, string> = {}
+  for (const [id, def] of Object.entries(config.value?.gate_definitions ?? {}))
+    map[id] = def.description
   for (const rule of config.value?.state_inference?.rules ?? []) {
     if (rule.description && !map[rule.condition])
       map[rule.condition] = rule.description
@@ -119,6 +124,30 @@ const conditionDescMap = computed<Record<string, string>>(() => {
 
 function describeCondition(condition: string): string {
   return conditionDescMap.value[condition] ?? condition
+}
+
+function resolveGateDef(condition: string): GateDef | undefined {
+  return config.value?.gate_definitions?.[condition]
+}
+
+const checkTypeLabels: Record<string, string> = {
+  exists: '文件/目录存在',
+  not_exists: '文件/目录不存在',
+  file_contains: '文件包含',
+  file_not_contains: '文件不包含',
+  file_section_matches: '文件段落匹配',
+  file_section_not_matches: '文件段落不匹配',
+  command_succeeds: '命令执行成功',
+}
+
+const checkTypeIcons: Record<string, string> = {
+  exists: 'i-carbon-document-add',
+  not_exists: 'i-carbon-document-subtract',
+  file_contains: 'i-carbon-text-search',
+  file_not_contains: 'i-carbon-text-clear-format',
+  file_section_matches: 'i-carbon-search-locate',
+  file_section_not_matches: 'i-carbon-search-locate',
+  command_succeeds: 'i-carbon-terminal',
 }
 
 // ── Stage colors ──
@@ -407,7 +436,7 @@ function toggleYaml() {
                       <div class="flex items-center justify-between mb-0.5">
                         <div class="flex items-center gap-1.5">
                           <div class="i-carbon-locked w-3 h-3 text-gray-400" />
-                          <span class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Stage 门禁</span>
+                          <span class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">完成门禁</span>
                         </div>
                         <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600 gate-arrow" />
                       </div>
@@ -471,6 +500,34 @@ function toggleYaml() {
         <!-- ─── Config sections ─── -->
         <div class="border-t border-gray-200 dark:border-white/[0.06] pt-8 space-y-3">
           <h2 class="text-[15px] font-semibold text-gray-800 dark:text-gray-100 mb-4">配置详情</h2>
+
+          <!-- Gate Definitions -->
+          <div class="wf-card">
+            <button class="section-toggle" @click="toggle('gates')">
+              <div class="flex items-center gap-2">
+                <div class="i-carbon-locked w-4 h-4 text-gray-400" />
+                <span>门禁定义</span>
+                <span class="text-[11px] text-gray-400 font-normal">({{ Object.keys(config.gate_definitions ?? {}).length }})</span>
+              </div>
+              <div class="i-carbon-chevron-down w-3.5 h-3.5 text-gray-400 transition-transform duration-200" :class="isExpanded('gates') && 'rotate-180'" />
+            </button>
+            <div v-if="isExpanded('gates')" class="p-4 pt-0 space-y-2">
+              <div
+                v-for="(gate, gateId) in config.gate_definitions"
+                :key="gateId"
+                class="detail-block cursor-pointer hover:border-amber-300 dark:hover:border-amber-500/25 transition-all"
+                @click="selectGate(String(gateId), '', '', -1)"
+              >
+                <div class="flex items-center gap-2 mb-1">
+                  <div class="i-carbon-locked w-3 h-3 text-amber-500 shrink-0" />
+                  <span class="text-[12px] font-mono font-medium text-gray-600 dark:text-gray-300">{{ gateId }}</span>
+                  <span class="text-[10px] text-gray-400 ml-auto">{{ gate.checks.length }} 项检查</span>
+                </div>
+                <p class="text-[12px] text-gray-500 dark:text-gray-400 leading-relaxed">{{ gate.description }}</p>
+              </div>
+              <p v-if="!config.gate_definitions || !Object.keys(config.gate_definitions).length" class="empty-hint">暂无门禁定义</p>
+            </div>
+          </div>
 
           <!-- Dependencies -->
           <div class="wf-card">
@@ -915,8 +972,46 @@ function toggleYaml() {
               </div>
             </section>
 
-            <!-- Belongs to stage -->
-            <section>
+            <!-- Declarative checks -->
+            <section v-if="resolveGateDef(panelTarget.gate)">
+              <h3 class="panel-title">检查规则 ({{ resolveGateDef(panelTarget.gate)!.checks.length }})</h3>
+              <div class="space-y-2">
+                <div
+                  v-for="(check, ci) in resolveGateDef(panelTarget.gate)!.checks"
+                  :key="ci"
+                  class="gate-check-block"
+                >
+                  <div class="flex items-center gap-2 mb-1.5">
+                    <div class="w-5 h-5 rounded-md bg-amber-50 dark:bg-amber-500/10 flex items-center justify-center shrink-0">
+                      <div class="w-3 h-3" :class="checkTypeIcons[check.type] ?? 'i-carbon-help'" />
+                    </div>
+                    <span class="text-[11px] font-semibold text-gray-600 dark:text-gray-300">{{ checkTypeLabels[check.type] ?? check.type }}</span>
+                  </div>
+                  <div class="pl-7 space-y-1">
+                    <div v-if="check.path" class="detail-kv">
+                      <span class="detail-k">路径</span>
+                      <code class="detail-v-code">{{ check.path }}</code>
+                    </div>
+                    <div v-if="check.command" class="detail-kv">
+                      <span class="detail-k">命令</span>
+                      <code class="detail-v-code">{{ check.command }}</code>
+                    </div>
+                    <div v-if="check.pattern" class="detail-kv">
+                      <span class="detail-k">匹配</span>
+                      <code class="detail-v-code">{{ check.pattern }}</code>
+                    </div>
+                    <div v-if="check.after" class="detail-kv">
+                      <span class="detail-k">段落</span>
+                      <code class="detail-v-code">{{ check.after }}</code>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <p class="text-[10px] text-gray-400 mt-2 leading-relaxed">所有检查规则之间为 AND 关系，全部通过则条件满足。</p>
+            </section>
+
+            <!-- Belongs to stage (only when opened from a specific stage) -->
+            <section v-if="panelTarget.stageIdx >= 0">
               <h3 class="panel-title">所属 Stage</h3>
               <div
                 class="p-3 rounded-lg border cursor-pointer transition-all hover:border-indigo-300 dark:hover:border-indigo-500/30"
@@ -957,9 +1052,9 @@ function toggleYaml() {
               </div>
             </section>
 
-            <!-- Other stages using the same gate -->
-            <section v-if="getGateStages(panelTarget.gate).length > 1">
-              <h3 class="panel-title">共用此门禁的 Stage</h3>
+            <!-- Stages using this gate -->
+            <section v-if="getGateStages(panelTarget.gate).length > (panelTarget.stageIdx >= 0 ? 1 : 0)">
+              <h3 class="panel-title">{{ panelTarget.stageIdx >= 0 ? '共用此门禁的 Stage' : '使用此门禁的 Stage' }}</h3>
               <div class="space-y-2">
                 <div
                   v-for="(s, si2) in getGateStages(panelTarget.gate)"
@@ -1030,7 +1125,7 @@ function toggleYaml() {
           <div class="px-6 py-5 space-y-6">
             <!-- Gate (clickable to open gate detail) -->
             <section v-if="panelTarget.stage.gate">
-              <h3 class="panel-title">Stage 门禁</h3>
+              <h3 class="panel-title">完成门禁</h3>
               <div
                 class="condition-block condition-block--clickable"
                 @click="selectGate(panelTarget.stage.gate, panelTarget.stage.id, panelTarget.stage.name, panelTarget.stageIdx)"
@@ -1038,11 +1133,12 @@ function toggleYaml() {
                 <div class="flex items-center justify-between">
                   <div class="condition-label">
                     <div class="i-carbon-locked w-3 h-3" />
-                    门禁条件
+                    完成条件
                   </div>
                   <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600" />
                 </div>
                 <code class="condition-code">{{ panelTarget.stage.gate }}</code>
+                <p class="condition-desc">满足此条件后才能进入下一阶段</p>
                 <p class="condition-desc">{{ describeCondition(panelTarget.stage.gate) }}</p>
               </div>
             </section>
@@ -1206,6 +1302,18 @@ function toggleYaml() {
 :is(.dark) .condition-code { color: #818cf8; }
 .condition-desc { font-size: 12px; color: #6b7280; line-height: 1.6; }
 :is(.dark) .condition-desc { color: #9ca3af; }
+
+/* ── Gate check block ── */
+.gate-check-block {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.03), rgba(217, 119, 6, 0.02));
+  border: 1px solid rgba(245, 158, 11, 0.1);
+}
+:is(.dark) .gate-check-block {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.04), rgba(217, 119, 6, 0.02));
+  border-color: rgba(245, 158, 11, 0.15);
+}
 
 /* ── Guardrail block ── */
 .guardrail-block { padding: 10px 12px; border-radius: 10px; background: #fafafa; border: 1px solid rgba(0, 0, 0, 0.04); }

@@ -14,6 +14,7 @@ export interface Requirement {
 }
 
 export interface CreateRequirementInput {
+  title?: string
   description: string
   source: string
   source_url?: string

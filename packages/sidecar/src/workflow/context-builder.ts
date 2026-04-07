@@ -1,9 +1,10 @@
-import type { GuardrailDefinition, PhaseConfig } from './parser'
+import type { GateDefinition, GuardrailDefinition, PhaseConfig } from './parser'
 import type { ConversationTurn, InvokedSkill, PhaseContext } from '../providers/types'
 
 export interface ContextBuilderDeps {
   resolveSkillContent: (skillPath: string) => string
   guardrailDefinitions?: Record<string, GuardrailDefinition>
+  gateDefinitions?: Record<string, GateDefinition>
 }
 
 function resolveInvokedSkills(
@@ -45,6 +46,29 @@ function resolveGuardrails(
   })
 }
 
+function resolveGates(
+  phase: PhaseConfig,
+  stageGate: string | undefined,
+  definitions?: Record<string, GateDefinition>,
+): string[] | undefined {
+  const lines: string[] = []
+
+  if (phase.entry_gate) {
+    const desc = definitions?.[phase.entry_gate]?.description ?? phase.entry_gate
+    lines.push(`🔒 [入口门禁] ${phase.entry_gate}: ${desc}`)
+  }
+  if (phase.completion_check) {
+    const desc = definitions?.[phase.completion_check]?.description ?? phase.completion_check
+    lines.push(`✅ [完成条件] ${phase.completion_check}: ${desc}`)
+  }
+  if (stageGate) {
+    const desc = definitions?.[stageGate]?.description ?? stageGate
+    lines.push(`🏁 [Stage 完成门禁] ${stageGate}: 满足此条件后才能进入下一阶段 — ${desc}`)
+  }
+
+  return lines.length > 0 ? lines : undefined
+}
+
 export interface RequirementInfo {
   title: string
   description: string
@@ -67,6 +91,7 @@ export function buildPhaseContext(
   conversationHistory?: ConversationTurn[],
   leanMode?: boolean,
   requirement?: RequirementInfo,
+  stageGate?: string,
 ): PhaseContext {
   const templateVars: Record<string, string> = {
     openspec_path: openspecPath,
@@ -93,5 +118,6 @@ export function buildPhaseContext(
     invokeSkills: leanMode ? undefined : resolveInvokedSkills(phase.invoke_skills, deps),
     invokeCommands: leanMode ? undefined : interpolateCommands(phase.invoke_commands, templateVars),
     guardrails: leanMode ? undefined : resolveGuardrails(phase.guardrails, deps.guardrailDefinitions),
+    gates: leanMode ? undefined : resolveGates(phase, stageGate, deps.gateDefinitions),
   }
 }

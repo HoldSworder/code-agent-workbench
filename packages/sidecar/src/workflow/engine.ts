@@ -11,7 +11,7 @@ import type Database from 'better-sqlite3'
 import type { AgentProvider, PhaseResult } from '../providers/types'
 import { buildPromptFromContext } from '../providers/cli.provider'
 import { parseWorkflow, findPhaseById, findPhaseInStages, flattenPhases } from './parser'
-import type { PhaseConfig, StageConfig, WorkflowConfig } from './parser'
+import type { GateCheck, GateDefinition, PhaseConfig, StageConfig, WorkflowConfig } from './parser'
 import { buildPhaseContext } from './context-builder'
 import { RepoTaskRepository } from '../db/repositories/repo-task.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
@@ -132,60 +132,102 @@ export class WorkflowEngine {
     if (!rules?.length)
       return fallback
 
-    const absOpenspec = join(worktreePath, openspecPath)
-    const changeExists = existsSync(absOpenspec)
-
     for (const rule of rules) {
-      if (this.evaluateCondition(rule.condition, absOpenspec, changeExists))
+      if (this.evaluateGate(rule.condition, worktreePath, openspecPath))
         return { stageId: rule.stage, phaseId: rule.phase }
     }
 
     return fallback
   }
 
-  private evaluateCondition(
+  /**
+   * 通用门禁求值器：根据 gate_definitions 中的声明式 checks 判断条件是否满足。
+   * 所有 checks 之间为 AND 关系，全部通过则条件满足。
+   */
+  private evaluateGate(
     condition: string,
-    openspecDir: string,
-    changeExists: boolean,
+    worktreePath: string,
+    openspecPath: string,
   ): boolean {
-    switch (condition) {
-      case 'no_change_dir':
-        return !changeExists
+    const def = this.config.gate_definitions?.[condition]
+    if (!def) {
+      elog(`evaluateGate: condition "${condition}" not found in gate_definitions, returning false`)
+      return false
+    }
 
-      case 'has_proposal_and_specs_no_tasks':
-        return changeExists
-          && existsSync(join(openspecDir, 'proposal.md'))
-          && existsSync(join(openspecDir, 'specs'))
-          && !existsSync(join(openspecDir, 'tasks.md'))
+    const vars: Record<string, string> = {
+      openspec_path: openspecPath,
+      repo_path: worktreePath,
+    }
 
-      case 'has_tasks':
-        return changeExists && existsSync(join(openspecDir, 'tasks.md'))
-
-      case 'tasks_has_unchecked':
-        return changeExists && this.tasksHaveUnchecked(openspecDir)
-
-      case 'tasks_all_checked':
-        return changeExists && this.tasksAllChecked(openspecDir)
-
-      case 'tasks_all_checked_no_e2e':
-        return changeExists
-          && this.tasksAllChecked(openspecDir)
-          && !existsSync(join(openspecDir, 'e2e-report.md'))
-
-      case 'e2e_report_pass':
-        return changeExists && this.e2eReportAllowsArchive(openspecDir)
-
-      case 'e2e_report_fail_no_consent':
-        return changeExists
-          && existsSync(join(openspecDir, 'e2e-report.md'))
-          && !this.e2eReportAllowsArchive(openspecDir)
-
-      case 'archive_complete':
-        return !changeExists
-
-      default:
+    for (const check of def.checks) {
+      if (!this.evaluateCheck(check, worktreePath, vars))
         return false
     }
+    return true
+  }
+
+  private resolveTemplate(template: string, vars: Record<string, string>): string {
+    return template.replace(/\{\{(\w+)\}\}/g, (_, k: string) => vars[k] ?? `{{${k}}}`)
+  }
+
+  private evaluateCheck(check: GateCheck, worktreePath: string, vars: Record<string, string>): boolean {
+    try {
+      if (check.type === 'command_succeeds') {
+        if (!check.command) return false
+        const resolved = this.resolveTemplate(check.command, vars)
+        execSync(resolved, { cwd: worktreePath, stdio: 'pipe', timeout: 10_000 })
+        return true
+      }
+
+      if (!check.path) return false
+      const absPath = join(worktreePath, this.resolveTemplate(check.path, vars))
+
+      switch (check.type) {
+        case 'exists':
+          return existsSync(absPath)
+
+        case 'not_exists':
+          return !existsSync(absPath)
+
+        case 'file_contains':
+          if (!check.pattern || !existsSync(absPath)) return false
+          return readFileSync(absPath, 'utf-8').includes(check.pattern)
+
+        case 'file_not_contains':
+          if (!check.pattern || !existsSync(absPath)) return false
+          return !readFileSync(absPath, 'utf-8').includes(check.pattern)
+
+        case 'file_section_matches': {
+          if (!check.pattern || !check.after || !existsSync(absPath)) return false
+          const content = readFileSync(absPath, 'utf-8')
+          const section = content.split(check.after)[1] ?? ''
+          return new RegExp(check.pattern).test(section)
+        }
+
+        case 'file_section_not_matches': {
+          if (!check.pattern || !check.after || !existsSync(absPath)) return false
+          const content = readFileSync(absPath, 'utf-8')
+          const section = content.split(check.after)[1] ?? ''
+          return !new RegExp(check.pattern).test(section)
+        }
+
+        default:
+          return false
+      }
+    }
+    catch (err) {
+      elog(`evaluateCheck: error checking ${check.type}: ${err}`)
+      return false
+    }
+  }
+
+  resolveGateDescription(condition: string): string | undefined {
+    return this.config.gate_definitions?.[condition]?.description
+  }
+
+  getGateDefinition(condition: string): GateDefinition | undefined {
+    return this.config.gate_definitions?.[condition]
   }
 
   /**
@@ -244,31 +286,6 @@ export class WorkflowEngine {
     }
   }
 
-  private tasksHaveUnchecked(openspecDir: string): boolean {
-    const tasksPath = join(openspecDir, 'tasks.md')
-    if (!existsSync(tasksPath))
-      return false
-    const content = readFileSync(tasksPath, 'utf-8')
-    return content.includes('- [ ]')
-  }
-
-  private tasksAllChecked(openspecDir: string): boolean {
-    const tasksPath = join(openspecDir, 'tasks.md')
-    if (!existsSync(tasksPath))
-      return false
-    const content = readFileSync(tasksPath, 'utf-8')
-    return content.includes('- [x]') && !content.includes('- [ ]')
-  }
-
-  private e2eReportAllowsArchive(openspecDir: string): boolean {
-    const reportPath = join(openspecDir, 'e2e-report.md')
-    if (!existsSync(reportPath))
-      return false
-    const content = readFileSync(reportPath, 'utf-8')
-    const conclusionSection = content.split('## 验收结论')[1] ?? ''
-    return conclusionSection.includes('通过')
-      || conclusionSection.includes('用户同意')
-  }
 
   // ── Optional phase 激活 ──
 
@@ -662,6 +679,7 @@ export class WorkflowEngine {
     const ctxDeps = {
       resolveSkillContent: this.resolveSkillContent,
       guardrailDefinitions: this.config.guardrail_definitions,
+      gateDefinitions: this.config.gate_definitions,
     }
 
     const context = buildPhaseContext(
@@ -677,6 +695,7 @@ export class WorkflowEngine {
       undefined,
       false,
       { title: '<需求标题>', description: '<需求描述>' },
+      (stage as StageConfig).gate,
     )
 
     const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
@@ -714,6 +733,7 @@ export class WorkflowEngine {
     const ctxDeps = {
       resolveSkillContent: this.resolveSkillContent,
       guardrailDefinitions: this.config.guardrail_definitions,
+      gateDefinitions: this.config.gate_definitions,
     }
 
     const context = buildPhaseContext(
@@ -729,6 +749,7 @@ export class WorkflowEngine {
       history.length > 0 ? history : undefined,
       false,
       reqInfo,
+      (stage as StageConfig).gate,
     )
 
     const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
@@ -751,11 +772,10 @@ export class WorkflowEngine {
       const task = this.taskRepo.findById(repoTaskId)!
 
       if (phase.entry_gate && !options?.skipEntryGate) {
-        const absOpenspec = join(task.worktree_path, task.openspec_path)
-        const gatePassed = this.evaluateCondition(
+        const gatePassed = this.evaluateGate(
           phase.entry_gate,
-          absOpenspec,
-          existsSync(absOpenspec),
+          task.worktree_path,
+          task.openspec_path,
         )
         if (!gatePassed) {
           elog(`executePhase: entry_gate "${phase.entry_gate}" BLOCKED for phase ${phase.id}`)
@@ -787,6 +807,7 @@ export class WorkflowEngine {
       const ctxDeps = {
         resolveSkillContent: this.resolveSkillContent,
         guardrailDefinitions: this.config.guardrail_definitions,
+        gateDefinitions: this.config.gate_definitions,
       }
 
       const context = isResume
@@ -803,6 +824,7 @@ export class WorkflowEngine {
             undefined,
             true,
             reqInfo,
+            stage.gate,
           )
         : buildPhaseContext(
             phase,
@@ -817,6 +839,7 @@ export class WorkflowEngine {
             history.length > 0 ? history : undefined,
             false,
             reqInfo,
+            stage.gate,
           )
 
       const agentRun = this.runRepo.create({
@@ -932,11 +955,10 @@ export class WorkflowEngine {
     if (phase.completion_check) {
       const task = this.taskRepo.findById(repoTaskId)
       if (task) {
-        const absOpenspec = join(task.worktree_path, task.openspec_path)
-        const passed = this.evaluateCondition(
+        const passed = this.evaluateGate(
           phase.completion_check,
-          absOpenspec,
-          existsSync(absOpenspec),
+          task.worktree_path,
+          task.openspec_path,
         )
         elog(`handlePhaseResult: completion_check="${phase.completion_check}" passed=${passed}`)
         if (!passed) {
@@ -1033,8 +1055,7 @@ export class WorkflowEngine {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) return false
 
-    const absOpenspec = join(task.worktree_path, task.openspec_path)
-    return this.evaluateCondition(stage.gate, absOpenspec, existsSync(absOpenspec))
+    return this.evaluateGate(stage.gate, task.worktree_path, task.openspec_path)
   }
 
   private hasPhaseCompleted(repoTaskId: string, phaseId: string): boolean {

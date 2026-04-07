@@ -114,6 +114,17 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
           openspec: { type: 'cli', check: 'which openspec', install_hint: 'npm install -g openspec', commands: ['openspec new change', 'openspec instructions', 'openspec validate', 'openspec status', 'openspec archive'] },
           superpowers: { type: 'skill-pack', skills: { 'test-driven-development': 'superpowers:test-driven-development', 'verification-before-completion': 'superpowers:verification-before-completion' } },
         },
+        gate_definitions: {
+          no_change_dir: { description: '无变更目录（openspec/changes 下无对应目录）', checks: [{ type: 'not_exists', path: '{{openspec_path}}' }] },
+          has_proposal_and_specs_no_tasks: { description: 'proposal.md 和 specs/ 已存在，但 tasks.md 尚未创建', checks: [{ type: 'exists', path: '{{openspec_path}}/proposal.md' }, { type: 'exists', path: '{{openspec_path}}/specs' }, { type: 'not_exists', path: '{{openspec_path}}/tasks.md' }] },
+          has_tasks: { description: 'tasks.md 文件已创建', checks: [{ type: 'exists', path: '{{openspec_path}}/tasks.md' }] },
+          tasks_has_unchecked: { description: 'tasks.md 中存在未勾选的任务项', checks: [{ type: 'file_contains', path: '{{openspec_path}}/tasks.md', pattern: '- [ ]' }] },
+          tasks_all_checked: { description: 'tasks.md 中所有任务项已勾选完成', checks: [{ type: 'file_contains', path: '{{openspec_path}}/tasks.md', pattern: '- [x]' }, { type: 'file_not_contains', path: '{{openspec_path}}/tasks.md', pattern: '- [ ]' }] },
+          tasks_all_checked_no_e2e: { description: '任务全部完成但无 E2E 报告', checks: [{ type: 'file_contains', path: '{{openspec_path}}/tasks.md', pattern: '- [x]' }, { type: 'file_not_contains', path: '{{openspec_path}}/tasks.md', pattern: '- [ ]' }, { type: 'not_exists', path: '{{openspec_path}}/e2e-report.md' }] },
+          e2e_report_pass: { description: 'e2e-report.md 验收结论包含"通过"或"用户同意"', checks: [{ type: 'file_section_matches', path: '{{openspec_path}}/e2e-report.md', after: '## 验收结论', pattern: '通过|用户同意' }] },
+          e2e_report_fail_no_consent: { description: 'e2e-report.md 不通过且用户未同意带债上线', checks: [{ type: 'exists', path: '{{openspec_path}}/e2e-report.md' }, { type: 'file_section_not_matches', path: '{{openspec_path}}/e2e-report.md', after: '## 验收结论', pattern: '通过|用户同意' }] },
+          working_tree_clean: { description: 'Git 工作区干净（无未提交的修改和暂存）', checks: [{ type: 'command_succeeds', command: 'git diff --quiet && git diff --cached --quiet' }] },
+        },
         guardrail_definitions: {
           no_openspec_write_before_confirm: { description: '在用户明确同意进入下一阶段之前，禁止创建或修改 openspec 文件', severity: 'hard' },
           no_skip_tdd: { description: '必须严格遵循 TDD 纪律：写测试 → 验证失败 → 最小实现 → 验证通过', severity: 'hard' },
@@ -121,11 +132,13 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         },
         state_inference: {
           rules: [
-            { condition: 'no_change_dir', stage: 'planning', phase: 'spec-create', description: '无变更目录 → 从 Spec 落盘开始' },
+            { condition: 'no_change_dir', stage: 'planning', phase: 'create-branch', description: '无变更目录 → 先创建 feature 分支' },
             { condition: 'has_proposal_and_specs_no_tasks', stage: 'planning', phase: 'task-breakdown', description: '有 proposal + specs 但无 tasks → 任务拆分' },
             { condition: 'tasks_has_unchecked', stage: 'development', phase: 'tdd-dev', description: 'tasks.md 有未勾选项 → 代码开发' },
-            { condition: 'tasks_all_checked', stage: 'development', phase: 'self-test', description: 'tasks.md 全部勾选 → 代码 Review' },
             { condition: 'e2e_report_pass', stage: 'release', phase: 'archive-deploy', description: 'e2e-report 通过 → 可归档发布' },
+            { condition: 'e2e_report_fail_no_consent', stage: 'testing', phase: 'bug-fix', description: 'e2e-report 不通过且未同意带债 → Bug 修复' },
+            { condition: 'tasks_all_checked_no_e2e', stage: 'testing', phase: 'e2e-test', description: '任务全部完成但无 E2E 报告 → 进入测试' },
+            { condition: 'tasks_all_checked', stage: 'development', phase: 'self-test', description: 'tasks.md 全部勾选 → 代码 Review' },
           ],
         },
         requirement_phases: [
@@ -133,28 +146,29 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         ],
         stages: [
           { id: 'planning', name: '任务规划', gate: 'has_tasks', phases: [
+            { id: 'create-branch', name: '创建分支', provider: 'external-cli', skill: 'skills/frontend/create-branch.md', requires_confirm: false, entry_gate: 'working_tree_clean' },
             { id: 'spec-create', name: 'Spec 落盘', provider: 'external-cli', skill: 'skills/frontend/spec-create.md', requires_confirm: true, invoke_commands: ['openspec new change "{{change_id}}"'], guardrails: ['no_openspec_write_before_confirm'], confirm_files: ['{{openspec_path}}/proposal.md', '{{openspec_path}}/specs/*/spec.md'] },
             { id: 'task-breakdown', name: '任务拆分', provider: 'external-cli', skill: 'skills/frontend/task-breakdown.md', requires_confirm: true, invoke_commands: ['openspec instructions tasks --change "{{change_id}}"'] },
-            { id: 'task-validate', name: '任务验证', provider: 'external-cli', skill: 'skills/frontend/task-validate.md', requires_confirm: false, invoke_commands: ['openspec validate "{{change_id}}"'], confirm_files: ['{{openspec_path}}/tasks.md'] },
+            { id: 'task-validate', name: '任务验证', provider: 'external-cli', skill: 'skills/frontend/task-validate.md', requires_confirm: false, invoke_commands: ['openspec validate "{{change_id}}"'] },
             { id: 'codex-cross-review-planning', name: 'Codex 交叉 Review', provider: 'external-cli', skill: 'skills/frontend/codex-cross-review-planning.md', optional: true, requires_confirm: false },
           ] },
           { id: 'development', name: '代码开发', gate: 'tasks_all_checked', phases: [
             { id: 'tdd-dev', name: '开发', provider: 'external-cli', skill: 'skills/frontend/tdd-dev.md', requires_confirm: false, invoke_skills: ['superpowers:test-driven-development', 'superpowers:verification-before-completion'], guardrails: ['no_skip_tdd', 'no_uncommitted_claim'], completion_check: 'tasks_all_checked' },
-            { id: 'integration', name: '联调', provider: 'external-cli', skill: 'skills/frontend/integration.md', optional: true, requires_confirm: false, triggers: ['后端spec到了', '联调', 'API文档到了'] },
+            { id: 'integration', name: '联调', provider: 'external-cli', skill: 'skills/frontend/integration.md', optional: true, requires_confirm: false, triggers: ['后端spec到了', '联调', 'API文档到了', '后端接口文档来了'] },
             { id: 'self-test', name: '代码 Review', provider: 'external-cli', skill: 'skills/frontend/self-test.md', requires_confirm: false, invoke_skills: ['superpowers:verification-before-completion'] },
             { id: 'codex-cross-review-dev', name: 'Codex 交叉 Review', provider: 'external-cli', skill: 'skills/frontend/codex-cross-review-dev.md', optional: true, requires_confirm: false },
           ] },
           { id: 'testing', name: '测试', gate: 'e2e_report_pass', phases: [
-            { id: 'e2e-test', name: 'E2E 浏览器测试', provider: 'external-cli', skill: 'skills/frontend/e2e-test.md', requires_confirm: false, confirm_files: ['{{openspec_path}}/e2e-report.md'] },
+            { id: 'e2e-test', name: 'E2E 浏览器测试', provider: 'external-cli', skill: 'skills/frontend/e2e-test.md', requires_confirm: false, completion_check: 'e2e_report_pass' },
             { id: 'bug-fix', name: 'Bug 修复', provider: 'external-cli', skill: 'skills/frontend/bug-fix.md', optional: true, loopable: true, loop_target: 'e2e-test', requires_confirm: false },
           ] },
-          { id: 'release', name: '上线', gate: 'archive_complete', phases: [
+          { id: 'release', name: '上线', phases: [
             { id: 'archive-deploy', name: '归档与发布', provider: 'external-cli', skill: 'skills/frontend/archive-deploy.md', requires_confirm: true, invoke_commands: ['openspec archive "{{change_id}}" --yes'], is_terminal: true },
             { id: 'post-deploy-fix', name: '测试环境 Bug 修复', provider: 'external-cli', skill: 'skills/frontend/post-deploy-fix.md', optional: true, loopable: true, loop_target: 'archive-deploy', requires_confirm: false },
           ] },
         ],
         trigger_mapping: [
-          { patterns: ['新需求', '新功能', '开始开发', '做个新feature'], target_stage: 'planning', target_phase: 'task-breakdown' },
+          { patterns: ['新需求', '新功能', '开始开发', '做个新feature'], target_stage: 'planning', target_phase: 'spec-create' },
           { patterns: ['继续开发', '接着做', '继续这个需求'], target_stage: 'auto', strategy: 'infer_from_state' },
           { patterns: ['后端spec', '后端接口文档', 'API文档', '联调'], target_stage: 'development', target_phase: 'integration' },
           { patterns: ['跑e2e', '浏览器验证', '自动化验证', '实机测试'], target_stage: 'testing', target_phase: 'e2e-test' },

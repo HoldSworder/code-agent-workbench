@@ -106,6 +106,7 @@ function formatDate(iso: string) {
 const showDialog = ref(false)
 type CreateMode = 'manual' | 'feishu'
 const createMode = ref<CreateMode>('manual')
+const manualTitle = ref('')
 const manualDescription = ref('')
 const feishuUrl = ref('')
 const feishuParsed = ref<{ projectKey: string, workItemType: string, workItemId: string } | null>(null)
@@ -154,6 +155,7 @@ function toggleCreateMcp(serverId: string) {
 
 function resetCreateDialog() {
   createMode.value = 'manual'
+  manualTitle.value = ''
   manualDescription.value = ''
   feishuUrl.value = ''
   feishuParsed.value = null
@@ -172,6 +174,7 @@ async function submitRequirement() {
 
   if (createMode.value === 'manual') {
     await requirementsStore.create({
+      title: manualTitle.value.trim() || undefined,
       description: manualDescription.value.trim(),
       source: 'manual',
     })
@@ -614,7 +617,13 @@ async function retryTask(taskId: string) {
               </div>
 
               <!-- 手动模式 -->
-              <div v-if="createMode === 'manual'" class="space-y-1">
+              <div v-if="createMode === 'manual'" class="space-y-3">
+                <input
+                  v-model="manualTitle"
+                  type="text"
+                  placeholder="需求标题（可选，留空则自动生成）"
+                  class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
+                >
                 <textarea
                   v-model="manualDescription"
                   rows="6"

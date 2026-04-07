@@ -393,6 +393,9 @@ export function buildPromptFromContext(context: PhaseContext, canReadFiles = tru
     sections.push(context.invokeCommands.map(cmd => `\`\`\`bash\n${cmd}\n\`\`\``).join('\n\n'))
   }
 
+  if (context.gates?.length)
+    sections.push(`---\n\n## 门禁规则\n\n以下条件用于判断本阶段的准入与完成，请在执行过程中关注这些条件：\n\n${context.gates.map(g => `- ${g}`).join('\n')}`)
+
   if (context.guardrails?.length)
     sections.push(`---\n\n## 护栏规则\n\n${context.guardrails.map(g => `- ${g}`).join('\n')}`)
 

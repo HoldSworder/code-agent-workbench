@@ -25,6 +25,8 @@ export interface PhaseContext {
   invokeSkills?: InvokedSkill[]
   invokeCommands?: string[]
   guardrails?: string[]
+  /** 门禁规则描述，注入到 prompt 中让 Agent 感知 */
+  gates?: string[]
   changeId?: string
   requirementTitle?: string
   requirementDescription?: string

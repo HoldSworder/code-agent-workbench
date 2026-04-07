@@ -23,6 +23,82 @@ dependencies:
       test-driven-development: superpowers:test-driven-development
       verification-before-completion: superpowers:verification-before-completion
 
+gate_definitions:
+  no_change_dir:
+    description: 无变更目录（openspec/changes 下无对应目录）
+    checks:
+      - type: not_exists
+        path: "{{openspec_path}}"
+
+  has_proposal_and_specs_no_tasks:
+    description: proposal.md 和 specs/ 已存在，但 tasks.md 尚未创建
+    checks:
+      - type: exists
+        path: "{{openspec_path}}/proposal.md"
+      - type: exists
+        path: "{{openspec_path}}/specs"
+      - type: not_exists
+        path: "{{openspec_path}}/tasks.md"
+
+  has_tasks:
+    description: tasks.md 文件已创建
+    checks:
+      - type: exists
+        path: "{{openspec_path}}/tasks.md"
+
+  tasks_has_unchecked:
+    description: tasks.md 中存在未勾选的任务项（- [ ]）
+    checks:
+      - type: file_contains
+        path: "{{openspec_path}}/tasks.md"
+        pattern: "- [ ]"
+
+  tasks_all_checked:
+    description: tasks.md 中所有任务项已勾选完成
+    checks:
+      - type: file_contains
+        path: "{{openspec_path}}/tasks.md"
+        pattern: "- [x]"
+      - type: file_not_contains
+        path: "{{openspec_path}}/tasks.md"
+        pattern: "- [ ]"
+
+  tasks_all_checked_no_e2e:
+    description: 任务全部完成但无 E2E 报告
+    checks:
+      - type: file_contains
+        path: "{{openspec_path}}/tasks.md"
+        pattern: "- [x]"
+      - type: file_not_contains
+        path: "{{openspec_path}}/tasks.md"
+        pattern: "- [ ]"
+      - type: not_exists
+        path: "{{openspec_path}}/e2e-report.md"
+
+  e2e_report_pass:
+    description: e2e-report.md 验收结论包含"通过"或"用户同意"
+    checks:
+      - type: file_section_matches
+        path: "{{openspec_path}}/e2e-report.md"
+        after: "## 验收结论"
+        pattern: "通过|用户同意"
+
+  e2e_report_fail_no_consent:
+    description: e2e-report.md 不通过且用户未同意带债上线
+    checks:
+      - type: exists
+        path: "{{openspec_path}}/e2e-report.md"
+      - type: file_section_not_matches
+        path: "{{openspec_path}}/e2e-report.md"
+        after: "## 验收结论"
+        pattern: "通过|用户同意"
+
+  working_tree_clean:
+    description: Git 工作区干净（无未提交的修改和暂存）
+    checks:
+      - type: command_succeeds
+        command: "git diff --quiet && git diff --cached --quiet"
+
 guardrail_definitions:
   no_openspec_write_before_confirm:
     description: >-
@@ -42,8 +118,8 @@ state_inference:
   rules:
     - condition: no_change_dir
       stage: planning
-      phase: spec-create
-      description: 无变更目录 → 从 Spec 落盘开始（需求已在看板中收集）
+      phase: create-branch
+      description: 无变更目录 → 先创建 feature 分支，再进入 Spec 落盘
 
     - condition: has_proposal_and_specs_no_tasks
       stage: planning
@@ -92,6 +168,12 @@ stages:
     name: 任务规划
     gate: has_tasks
     phases:
+      - id: create-branch
+        name: 创建分支
+        provider: external-cli
+        skill: skills/frontend/create-branch.md
+        entry_gate: working_tree_clean
+
       - id: spec-create
         name: Spec 落盘
         provider: external-cli
@@ -195,7 +277,6 @@ stages:
   # ──────────────────────────────────────────────
   - id: release
     name: 上线
-    gate: archive_complete
     phases:
       - id: archive-deploy
         name: 归档与发布

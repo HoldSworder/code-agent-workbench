@@ -82,6 +82,33 @@ const StageSchema = z.object({
   phases: z.array(PhaseSchema).min(1),
 })
 
+// ── 门禁定义（声明式条件检查） ──
+
+const GateCheckSchema = z.object({
+  type: z.enum([
+    'exists',
+    'not_exists',
+    'file_contains',
+    'file_not_contains',
+    'file_section_matches',
+    'file_section_not_matches',
+    'command_succeeds',
+  ]),
+  /** 文件路径，支持 {{openspec_path}} 等模板变量。command_succeeds 类型不需要 */
+  path: z.string().optional(),
+  /** 用于 file_contains / file_not_contains 的子串匹配 */
+  pattern: z.string().optional(),
+  /** 用于 file_section_* 的分割标记（取标记之后的内容） */
+  after: z.string().optional(),
+  /** 用于 command_succeeds，在 worktree 目录下执行的 shell 命令，exit 0 = 通过 */
+  command: z.string().optional(),
+})
+
+const GateDefinitionSchema = z.object({
+  description: z.string(),
+  checks: z.array(GateCheckSchema).min(1),
+})
+
 // ── 护栏定义 ──
 
 const GuardrailDefinitionSchema = z.object({
@@ -96,6 +123,7 @@ const WorkflowSchema = z.object({
   description: z.string(),
   profile_detection: z.record(z.string(), ProfileSchema).optional(),
   dependencies: z.record(z.string(), DependencySchema).optional(),
+  gate_definitions: z.record(z.string(), GateDefinitionSchema).optional(),
   state_inference: StateInferenceSchema.optional(),
   guardrail_definitions: z.record(z.string(), GuardrailDefinitionSchema).optional(),
   /** 需求收集阶段（独立于工作流 stages，在需求看板中执行） */
@@ -104,6 +132,8 @@ const WorkflowSchema = z.object({
   trigger_mapping: z.array(TriggerMappingEntrySchema).optional(),
 })
 
+export type GateCheck = z.infer<typeof GateCheckSchema>
+export type GateDefinition = z.infer<typeof GateDefinitionSchema>
 export type PhaseConfig = z.infer<typeof PhaseSchema>
 export type StageConfig = z.infer<typeof StageSchema>
 export type WorkflowConfig = z.infer<typeof WorkflowSchema>
