@@ -11,10 +11,19 @@ const DependencySchema = z.object({
   skills: z.record(z.string(), z.string()).optional(),
 })
 
+// ── Profile Detection ──
+
+const ProfileSchema = z.object({
+  markers: z.array(z.string()),
+  indicators: z.array(z.string()).optional(),
+  skill_dir: z.string(),
+})
+
 // ── 状态推断 ──
 
 const StateInferenceRuleSchema = z.object({
   condition: z.string(),
+  stage: z.string(),
   phase: z.string(),
   description: z.string().optional(),
 })
@@ -27,48 +36,57 @@ const StateInferenceSchema = z.object({
 
 const TriggerMappingEntrySchema = z.object({
   patterns: z.array(z.string()),
-  target: z.string(),
+  target_stage: z.string(),
+  target_phase: z.string().optional(),
+  strategy: z.enum(['infer_from_state']).optional(),
 })
 
-// ── 阶段配置 ──
+// ── Phase 配置（Stage 内子阶段） ──
 
 const PhaseSchema = z.object({
   id: z.string(),
   name: z.string(),
-  requires_confirm: z.boolean(),
-  provider: z.enum(['api', 'external-cli', 'script']),
+  provider: z.enum(['api', 'external-cli']),
   skill: z.string().optional(),
   invoke_skills: z.array(z.string()).optional(),
   invoke_commands: z.array(z.string()).optional(),
   tools: z.array(z.string()).optional(),
   mcp_config: z.string().nullable().optional(),
+  guardrails: z.array(z.string()).optional(),
+
+  requires_confirm: z.boolean().optional().default(false),
   confirm_files: z.array(z.string()).optional(),
   completion_check: z.string().optional(),
-  /** 入口门禁：进入本阶段前必须满足的条件（复用 state_inference 条件名） */
   entry_gate: z.string().optional(),
-  script: z.string().optional(),
-  args: z.array(z.string()).optional(),
-  guardrails: z.array(z.string()).optional(),
   is_terminal: z.boolean().optional(),
+
+  /** 默认跳过，需要 trigger 激活才执行 */
+  optional: z.boolean().optional(),
+  /** 默认执行，用户可选择跳过 */
+  skippable: z.boolean().optional(),
+  /** 完成后可跳回 loop_target 重新执行 */
+  loopable: z.boolean().optional(),
+  /** loopable 为 true 时，循环回到的目标 phase id */
+  loop_target: z.string().optional(),
+  /** 激活 optional phase 的触发短语 */
+  triggers: z.array(z.string()).optional(),
 })
 
-// ── 事件配置 ──
+// ── Stage 配置（顶层阶段） ──
 
-const EventSchema = z.object({
+const StageSchema = z.object({
   id: z.string(),
   name: z.string(),
-  after_phase: z.string(),
-  skill: z.string().optional(),
-  invoke_skills: z.array(z.string()).optional(),
-  invoke_commands: z.array(z.string()).optional(),
-  provider: z.enum(['api', 'external-cli', 'script']),
-  tools: z.array(z.string()).optional(),
-  mcp_config: z.string().nullable().optional(),
-  confirm_files: z.array(z.string()).optional(),
-  script: z.string().optional(),
-  triggers: z.array(z.string()).optional(),
-  precondition: z.string().optional(),
-  is_terminal: z.boolean().optional(),
+  /** 进入下一 Stage 前需满足的门禁条件 */
+  gate: z.string().optional(),
+  phases: z.array(PhaseSchema).min(1),
+})
+
+// ── 护栏定义 ──
+
+const GuardrailDefinitionSchema = z.object({
+  description: z.string(),
+  severity: z.enum(['hard', 'soft']).default('soft'),
 })
 
 // ── 完整工作流 ──
@@ -76,21 +94,61 @@ const EventSchema = z.object({
 const WorkflowSchema = z.object({
   name: z.string(),
   description: z.string(),
+  profile_detection: z.record(z.string(), ProfileSchema).optional(),
   dependencies: z.record(z.string(), DependencySchema).optional(),
   state_inference: StateInferenceSchema.optional(),
-  phases: z.array(PhaseSchema).min(1),
-  events: z.array(EventSchema).optional(),
+  guardrail_definitions: z.record(z.string(), GuardrailDefinitionSchema).optional(),
+  /** 需求收集阶段（独立于工作流 stages，在需求看板中执行） */
+  requirement_phases: z.array(PhaseSchema).optional(),
+  stages: z.array(StageSchema).min(1),
   trigger_mapping: z.array(TriggerMappingEntrySchema).optional(),
 })
 
 export type PhaseConfig = z.infer<typeof PhaseSchema>
-export type EventConfig = z.infer<typeof EventSchema>
+export type StageConfig = z.infer<typeof StageSchema>
 export type WorkflowConfig = z.infer<typeof WorkflowSchema>
+export type ProfileConfig = z.infer<typeof ProfileSchema>
 export type StateInferenceRule = z.infer<typeof StateInferenceRuleSchema>
 export type TriggerMappingEntry = z.infer<typeof TriggerMappingEntrySchema>
 export type DependencyConfig = z.infer<typeof DependencySchema>
+export type GuardrailDefinition = z.infer<typeof GuardrailDefinitionSchema>
 
 export function parseWorkflow(yamlContent: string): WorkflowConfig {
   const raw = parse(yamlContent)
   return WorkflowSchema.parse(raw)
+}
+
+// ── 辅助函数：扁平化获取所有 phases ──
+
+export function flattenPhases(config: WorkflowConfig): (PhaseConfig & { stageId: string, stageName: string })[] {
+  return config.stages.flatMap(stage =>
+    stage.phases.map(phase => ({ ...phase, stageId: stage.id, stageName: stage.name })),
+  )
+}
+
+export function findPhaseInStages(
+  stages: StageConfig[],
+  stageId: string,
+  phaseId: string,
+): { stage: StageConfig, phase: PhaseConfig, stageIdx: number, phaseIdx: number } | undefined {
+  const stageIdx = stages.findIndex(s => s.id === stageId)
+  if (stageIdx === -1) return undefined
+  const stage = stages[stageIdx]
+  const phaseIdx = stage.phases.findIndex(p => p.id === phaseId)
+  if (phaseIdx === -1) return undefined
+  return { stage, phase: stage.phases[phaseIdx], stageIdx, phaseIdx }
+}
+
+export function findPhaseById(
+  stages: StageConfig[],
+  phaseId: string,
+): { stage: StageConfig, phase: PhaseConfig, stageIdx: number, phaseIdx: number } | undefined {
+  for (let si = 0; si < stages.length; si++) {
+    const stage = stages[si]
+    for (let pi = 0; pi < stage.phases.length; pi++) {
+      if (stage.phases[pi].id === phaseId)
+        return { stage, phase: stage.phases[pi], stageIdx: si, phaseIdx: pi }
+    }
+  }
+  return undefined
 }

@@ -6,11 +6,29 @@ import { useTasksStore } from '../stores/tasks'
 import { rpc } from '../composables/use-sidecar'
 import type { RepoTask } from '../stores/tasks'
 
+interface ReqPhase { id: string, name: string, optional?: boolean, skippable?: boolean }
+interface WorkflowPhase { id: string, name: string }
+interface WorkflowStage { id: string, name: string, phases: WorkflowPhase[] }
+
 const requirementsStore = useRequirementsStore()
 const reposStore = useReposStore()
 const tasksStore = useTasksStore()
 
 const taskMap = ref<Record<string, (RepoTask & { repoName: string })[]>>({})
+
+const requirementPhases = ref<ReqPhase[]>([])
+const workflowStages = ref<WorkflowStage[]>([])
+const phaseNameMap = computed(() =>
+  Object.fromEntries(requirementPhases.value.map(p => [p.id, p.name])),
+)
+const allPhaseNameMap = computed(() => {
+  const map: Record<string, string> = { ...phaseNameMap.value }
+  for (const s of workflowStages.value) {
+    for (const p of s.phases)
+      map[p.id] = p.name
+  }
+  return map
+})
 
 const repoNameById = computed(() =>
   Object.fromEntries(reposStore.repos.map(r => [r.id, r.name])),
@@ -31,7 +49,15 @@ async function refreshTaskMap() {
 }
 
 onMounted(async () => {
-  await Promise.all([requirementsStore.fetchAll(), reposStore.fetchAll()])
+  rpc<{ phases: ReqPhase[] }>('workflow.requirementPhases').then((res) => {
+    if (res?.phases)
+      requirementPhases.value = res.phases
+  })
+  rpc<{ stages: WorkflowStage[] }>('workflow.phases').then((res) => {
+    if (res?.stages)
+      workflowStages.value = res.stages
+  })
+  await Promise.all([requirementsStore.fetchAll(), reposStore.fetchAll(), loadMcpData()])
   await refreshTaskMap()
 })
 
@@ -46,19 +72,6 @@ const statusBadge: Record<string, { label: string, class: string }> = {
   active: { label: '进行中', class: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400' },
   completed: { label: '已完成', class: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400' },
   archived: { label: '已归档', class: 'bg-gray-100 text-gray-500 dark:bg-gray-500/10 dark:text-gray-400' },
-}
-
-const phaseLabels: Record<string, string> = {
-  'design': '设计探索',
-  'plan': '任务规划',
-  't1-dev': 'T1 开发',
-  'review': '代码审查',
-  'verify': '验证',
-  'mr': '创建 MR',
-  'backend-spec-arrived': '后端联调',
-  'test-spec-arrived': '测试 Spec',
-  'e2e-verify': 'E2E 验证',
-  'archive': '归档',
 }
 
 const phaseStatusLabels: Record<string, string> = {
@@ -91,14 +104,103 @@ function formatDate(iso: string) {
 
 // ── 新建需求弹窗 ──
 const showDialog = ref(false)
-const newReq = ref({ title: '', description: '', source: 'manual' })
+type CreateMode = 'manual' | 'feishu'
+const createMode = ref<CreateMode>('manual')
+const manualDescription = ref('')
+const feishuUrl = ref('')
+const feishuParsed = ref<{ projectKey: string, workItemType: string, workItemId: string } | null>(null)
+const feishuError = ref('')
+
+function parseFeishuUrl(url: string) {
+  feishuError.value = ''
+  feishuParsed.value = null
+  if (!url.trim()) return
+
+  const match = url.match(/project\.feishu\.cn\/([^/]+)\/(story|issue|defect|epic|task|requirement)\/detail\/(\d+)/)
+  if (match) {
+    feishuParsed.value = { projectKey: match[1], workItemType: match[2], workItemId: match[3] }
+    return
+  }
+
+  const altMatch = url.match(/feishu\.cn\/project\/[^/]+\/([^/]+)\/(story|issue|defect|epic|task|requirement)\/detail\/(\d+)/)
+  if (altMatch) {
+    feishuParsed.value = { projectKey: altMatch[1], workItemType: altMatch[2], workItemId: altMatch[3] }
+    return
+  }
+
+  feishuError.value = '无法识别的飞书项目链接格式'
+}
+
+const createMcpSelectedIds = ref<Set<string>>(new Set())
+
+function preselectFeishuMcp() {
+  const ids = mcpServers.value
+    .filter(s => /feishu|飞书/i.test(s.name) || /feishu|飞书/i.test(s.description))
+    .map(s => s.id)
+  createMcpSelectedIds.value = new Set(ids)
+}
+
+function switchToFeishu() {
+  createMode.value = 'feishu'
+  preselectFeishuMcp()
+}
+
+function toggleCreateMcp(serverId: string) {
+  const next = new Set(createMcpSelectedIds.value)
+  if (next.has(serverId)) next.delete(serverId)
+  else next.add(serverId)
+  createMcpSelectedIds.value = next
+}
+
+function resetCreateDialog() {
+  createMode.value = 'manual'
+  manualDescription.value = ''
+  feishuUrl.value = ''
+  feishuParsed.value = null
+  feishuError.value = ''
+  createMcpSelectedIds.value = new Set()
+}
+
+const canSubmit = computed(() => {
+  if (createMode.value === 'manual')
+    return manualDescription.value.trim().length > 0
+  return feishuParsed.value !== null
+})
 
 async function submitRequirement() {
-  if (!newReq.value.title)
-    return
-  await requirementsStore.create(newReq.value)
+  if (!canSubmit.value) return
+
+  if (createMode.value === 'manual') {
+    await requirementsStore.create({
+      description: manualDescription.value.trim(),
+      source: 'manual',
+    })
+  }
+  else {
+    await requirementsStore.create({
+      description: feishuParsed.value
+        ? `飞书项目 ${feishuParsed.value.projectKey} #${feishuParsed.value.workItemId} (${feishuParsed.value.workItemType})`
+        : '',
+      source: 'feishu',
+      source_url: feishuUrl.value.trim(),
+    })
+
+    if (createMcpSelectedIds.value.size > 0) {
+      const firstPhase = requirementPhases.value.find(p => !p.optional)
+      if (firstPhase) {
+        await rpc('mcp.setBindings', {
+          stageId: '_requirements',
+          phaseId: firstPhase.id,
+          mcpServerIds: [...createMcpSelectedIds.value],
+        })
+        await loadMcpData()
+      }
+    }
+  }
+
   showDialog.value = false
-  newReq.value = { title: '', description: '', source: 'manual' }
+  resetCreateDialog()
+  await refreshTaskMap()
 }
 
 // ── 分发到仓库弹窗 ──
@@ -149,6 +251,133 @@ async function dispatchAndStart() {
   }
 }
 
+async function startReqCollection(reqId: string) {
+  const tasks = taskMap.value[reqId] ?? []
+  if (!tasks.length)
+    return
+  const firstPhase = requirementPhases.value.find(p => !p.optional)
+  if (!firstPhase)
+    return
+  for (const task of tasks) {
+    await rpc('workflow.executeRequirementPhase', {
+      repoTaskId: task.id,
+      phaseId: firstPhase.id,
+    })
+  }
+  await refreshTaskMap()
+}
+
+// ── 需求收集 MCP 选择弹窗 ──
+
+interface McpServer {
+  id: string
+  name: string
+  description: string
+  transport: 'stdio' | 'http' | 'sse'
+  enabled: number
+}
+
+interface McpBinding {
+  id: string
+  stage_id: string
+  phase_id: string
+  mcp_server_id: string
+}
+
+const mcpServers = ref<McpServer[]>([])
+const mcpBindings = ref<McpBinding[]>([])
+const showMcpPicker = ref(false)
+const mcpPickerReqId = ref('')
+const selectedMcpIds = ref<Set<string>>(new Set())
+const startingCollection = ref(false)
+
+async function loadMcpData() {
+  try {
+    const [srvRes, bindRes] = await Promise.all([
+      rpc<McpServer[]>('mcp.list'),
+      rpc<McpBinding[]>('mcp.getAllBindings'),
+    ])
+    mcpServers.value = (srvRes ?? []).filter(s => s.enabled)
+    mcpBindings.value = bindRes ?? []
+  } catch {
+    mcpServers.value = []
+    mcpBindings.value = []
+  }
+}
+
+function openMcpPicker(reqId: string) {
+  mcpPickerReqId.value = reqId
+  const firstPhase = requirementPhases.value.find(p => !p.optional)
+  if (!firstPhase) return
+
+  const existing = mcpBindings.value
+    .filter(b => b.stage_id === '_requirements' && b.phase_id === firstPhase.id)
+    .map(b => b.mcp_server_id)
+  selectedMcpIds.value = new Set(existing)
+  showMcpPicker.value = true
+}
+
+function toggleMcpSelection(serverId: string) {
+  const next = new Set(selectedMcpIds.value)
+  if (next.has(serverId)) next.delete(serverId)
+  else next.add(serverId)
+  selectedMcpIds.value = next
+}
+
+async function confirmStartCollection() {
+  const reqId = mcpPickerReqId.value
+  const tasks = taskMap.value[reqId] ?? []
+  if (!tasks.length) return
+
+  const firstPhase = requirementPhases.value.find(p => !p.optional)
+  if (!firstPhase) return
+
+  startingCollection.value = true
+  try {
+    await rpc('mcp.setBindings', {
+      stageId: '_requirements',
+      phaseId: firstPhase.id,
+      mcpServerIds: [...selectedMcpIds.value],
+    })
+
+    for (const task of tasks) {
+      await rpc('workflow.executeRequirementPhase', {
+        repoTaskId: task.id,
+        phaseId: firstPhase.id,
+      })
+    }
+    showMcpPicker.value = false
+    await refreshTaskMap()
+    await loadMcpData()
+  } catch (err) {
+    console.error('Failed to start requirement collection:', err)
+  } finally {
+    startingCollection.value = false
+  }
+}
+
+// ── 删除需求 ──
+const pendingDeleteId = ref<string | null>(null)
+const deleting = ref(false)
+
+async function confirmDelete(reqId: string) {
+  pendingDeleteId.value = reqId
+}
+
+async function executeDelete() {
+  const id = pendingDeleteId.value
+  if (!id) return
+  deleting.value = true
+  try {
+    await requirementsStore.remove(id)
+    delete taskMap.value[id]
+  }
+  finally {
+    deleting.value = false
+    pendingDeleteId.value = null
+  }
+}
+
 // ── 重试失败的任务 ──
 
 async function retryTask(taskId: string) {
@@ -179,8 +408,8 @@ async function retryTask(taskId: string) {
   <div class="p-8 max-w-5xl mx-auto">
     <div class="flex items-center justify-between mb-8">
       <div>
-        <h1 class="text-xl font-semibold tracking-tight">总看板</h1>
-        <p class="text-[13px] text-gray-400 mt-1">所有需求及其关联任务的进度概览</p>
+        <h1 class="text-xl font-semibold tracking-tight">需求看板</h1>
+        <p class="text-[13px] text-gray-400 mt-1">管理需求并通过 AI 辅助收集与完善需求内容</p>
       </div>
       <button
         class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97]"
@@ -215,9 +444,51 @@ async function retryTask(taskId: string) {
                   {{ statusBadge[req.status]?.label }}
                 </span>
               </div>
-              <p class="text-[13px] text-gray-400 line-clamp-1">{{ req.description }}</p>
+              <p v-if="req.description && req.description !== req.title" class="text-[13px] text-gray-400 line-clamp-1">{{ req.description }}</p>
+              <!-- 飞书关联链接 -->
+              <div v-if="req.source === 'feishu'" class="flex items-center gap-3 mt-1.5">
+                <a
+                  v-if="req.source_url"
+                  :href="req.source_url"
+                  target="_blank"
+                  class="inline-flex items-center gap-1 text-[11px] text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300 transition-colors"
+                  @click.stop
+                >
+                  <div class="i-carbon-launch w-3 h-3" />
+                  飞书项目
+                </a>
+                <a
+                  v-if="req.doc_url"
+                  :href="req.doc_url"
+                  target="_blank"
+                  class="inline-flex items-center gap-1 text-[11px] text-blue-500 hover:text-blue-600 dark:text-blue-400 dark:hover:text-blue-300 transition-colors"
+                  @click.stop
+                >
+                  <div class="i-carbon-document w-3 h-3" />
+                  需求文档
+                </a>
+              </div>
             </div>
-            <span class="text-[11px] text-gray-400 shrink-0 ml-4 tabular-nums">{{ formatDate(req.created_at) }}</span>
+            <div class="shrink-0 ml-4 flex flex-col items-end gap-2">
+              <div class="flex items-center gap-2">
+                <span class="text-[11px] text-gray-400 tabular-nums">{{ formatDate(req.created_at) }}</span>
+                <button
+                  class="p-1 rounded-md text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
+                  title="删除需求"
+                  @click.stop="confirmDelete(req.id)"
+                >
+                  <div class="i-carbon-trash-can w-3.5 h-3.5" />
+                </button>
+              </div>
+              <button
+                v-if="req.source === 'feishu' && req.status === 'draft' && (taskMap[req.id] ?? []).length > 0"
+                class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 text-white text-[12px] font-medium hover:bg-violet-500 shadow-sm shadow-violet-600/20 transition-all duration-150 active:scale-[0.97]"
+                @click="mcpServers.length > 0 ? openMcpPicker(req.id) : startReqCollection(req.id)"
+              >
+                <div class="i-carbon-ai-status w-3.5 h-3.5" />
+                获取飞书需求
+              </button>
+            </div>
           </div>
 
           <!-- 关联任务列表 -->
@@ -239,7 +510,7 @@ async function retryTask(taskId: string) {
                   <span class="text-gray-600 dark:text-gray-300">{{ task.repoName }}</span>
                   <span class="text-gray-300 dark:text-gray-600">·</span>
                   <span :class="phaseStatusClass(task.phase_status)">
-                    {{ phaseLabels[task.current_phase] || task.current_phase }}
+                    {{ allPhaseNameMap[task.current_phase] ?? task.current_phase }}
                     ({{ phaseStatusLabels[task.phase_status] || task.phase_status }})
                   </span>
                   <div
@@ -311,54 +582,145 @@ async function retryTask(taskId: string) {
         enter-from-class="opacity-0"
         leave-to-class="opacity-0"
       >
-        <div v-if="showDialog" class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" @click.self="showDialog = false">
+        <div v-if="showDialog" class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" @click.self="showDialog = false; resetCreateDialog()">
           <Transition
             appear
             enter-active-class="transition-all duration-200 ease-out"
             enter-from-class="opacity-0 scale-95 translate-y-2"
           >
             <div class="bg-white dark:bg-[#2c2c30] rounded-2xl shadow-2xl shadow-black/10 w-full max-w-md p-6">
-              <h2 class="text-base font-semibold mb-5">新建需求</h2>
-              <div class="space-y-4">
+              <!-- 模式切换 -->
+              <div class="flex items-center gap-1 p-1 rounded-lg bg-gray-100 dark:bg-white/5 mb-5">
+                <button
+                  class="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium transition-all duration-150"
+                  :class="createMode === 'manual'
+                    ? 'bg-white dark:bg-[#3a3a3e] text-gray-800 dark:text-gray-100 shadow-sm'
+                    : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'"
+                  @click="createMode = 'manual'"
+                >
+                  <div class="i-carbon-edit w-3.5 h-3.5" />
+                  手动输入
+                </button>
+                <button
+                  class="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium transition-all duration-150"
+                  :class="createMode === 'feishu'
+                    ? 'bg-white dark:bg-[#3a3a3e] text-gray-800 dark:text-gray-100 shadow-sm'
+                    : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'"
+                  @click="switchToFeishu"
+                >
+                  <div class="i-carbon-link w-3.5 h-3.5" />
+                  飞书项目
+                </button>
+              </div>
+
+              <!-- 手动模式 -->
+              <div v-if="createMode === 'manual'" class="space-y-1">
+                <textarea
+                  v-model="manualDescription"
+                  rows="6"
+                  placeholder="输入需求内容..."
+                  class="w-full px-3 py-2.5 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] leading-relaxed border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors resize-none"
+                />
+              </div>
+
+              <!-- 飞书项目模式 -->
+              <div v-else class="space-y-4">
                 <div>
-                  <label class="block text-[13px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">标题</label>
+                  <label class="block text-[12px] font-medium text-gray-400 dark:text-gray-500 mb-1.5">飞书项目链接</label>
                   <input
-                    v-model="newReq.title"
+                    v-model="feishuUrl"
                     type="text"
-                    placeholder="输入需求标题"
-                    class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
+                    placeholder="粘贴飞书项目工作项链接..."
+                    class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors font-mono"
+                    @input="parseFeishuUrl(feishuUrl)"
                   >
                 </div>
-                <div>
-                  <label class="block text-[13px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">描述</label>
-                  <textarea
-                    v-model="newReq.description"
-                    rows="3"
-                    placeholder="输入需求描述"
-                    class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors resize-none"
-                  />
+
+                <!-- 解析结果 -->
+                <div
+                  v-if="feishuParsed"
+                  class="px-3 py-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-500/5 border border-emerald-200 dark:border-emerald-500/15"
+                >
+                  <div class="flex items-center gap-2 mb-1.5">
+                    <div class="i-carbon-checkmark-filled w-3.5 h-3.5 text-emerald-500" />
+                    <span class="text-[12px] font-medium text-emerald-600 dark:text-emerald-400">链接解析成功</span>
+                  </div>
+                  <div class="grid grid-cols-3 gap-2 text-[11px]">
+                    <div>
+                      <span class="text-gray-400">项目</span>
+                      <p class="font-medium text-gray-700 dark:text-gray-200 font-mono">{{ feishuParsed.projectKey }}</p>
+                    </div>
+                    <div>
+                      <span class="text-gray-400">类型</span>
+                      <p class="font-medium text-gray-700 dark:text-gray-200">{{ feishuParsed.workItemType }}</p>
+                    </div>
+                    <div>
+                      <span class="text-gray-400">ID</span>
+                      <p class="font-medium text-gray-700 dark:text-gray-200 font-mono">#{{ feishuParsed.workItemId }}</p>
+                    </div>
+                  </div>
+                  <p class="text-[11px] text-gray-400 dark:text-gray-500 mt-2">
+                    创建后可通过工作流获取需求SPEC文档 / 需求文档 / 描述内容
+                  </p>
                 </div>
-                <div>
-                  <label class="block text-[13px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">来源</label>
-                  <select
-                    v-model="newReq.source"
-                    class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors appearance-auto"
-                  >
-                    <option value="manual">手动</option>
-                    <option value="feishu">飞书</option>
-                    <option value="gitlab">GitLab</option>
-                  </select>
+
+                <!-- 解析错误 -->
+                <div
+                  v-if="feishuError"
+                  class="px-3 py-2.5 rounded-lg bg-red-50 dark:bg-red-500/5 border border-red-200 dark:border-red-500/15"
+                >
+                  <div class="flex items-center gap-2">
+                    <div class="i-carbon-warning-alt w-3.5 h-3.5 text-red-500" />
+                    <span class="text-[12px] text-red-600 dark:text-red-400">{{ feishuError }}</span>
+                  </div>
+                  <p class="text-[11px] text-gray-400 dark:text-gray-500 mt-1">
+                    支持格式：https://project.feishu.cn/{project}/story/detail/{id}
+                  </p>
+                </div>
+
+                <!-- 按需 MCP 选择器 -->
+                <div v-if="mcpServers.length > 0">
+                  <label class="block text-[12px] font-medium text-gray-400 dark:text-gray-500 mb-1.5">
+                    按需加载 MCP
+                    <span class="font-normal text-gray-300 dark:text-gray-600 ml-1">（可选）</span>
+                  </label>
+                  <div class="space-y-1 max-h-36 overflow-y-auto">
+                    <label
+                      v-for="srv in mcpServers"
+                      :key="srv.id"
+                      class="flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer transition-colors"
+                      :class="createMcpSelectedIds.has(srv.id)
+                        ? 'bg-violet-50 dark:bg-violet-500/10 border border-violet-200 dark:border-violet-500/20'
+                        : 'bg-gray-50 dark:bg-white/3 border border-gray-100 dark:border-white/5 hover:border-violet-200 dark:hover:border-violet-500/20'"
+                      @click.prevent="toggleCreateMcp(srv.id)"
+                    >
+                      <input
+                        type="checkbox"
+                        :checked="createMcpSelectedIds.has(srv.id)"
+                        class="w-3.5 h-3.5 rounded border-gray-300 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
+                      >
+                      <div class="flex-1 min-w-0">
+                        <div class="text-[12px] font-medium text-gray-700 dark:text-gray-200">{{ srv.name }}</div>
+                        <div v-if="srv.description" class="text-[10px] text-gray-400 truncate">{{ srv.description }}</div>
+                      </div>
+                    </label>
+                  </div>
+                  <p class="text-[10px] text-gray-300 dark:text-gray-600 mt-1.5">
+                    选中的 MCP 将在需求收集阶段自动注入到 Agent 运行环境
+                  </p>
                 </div>
               </div>
+
               <div class="flex justify-end gap-2 mt-6">
                 <button
                   class="px-4 py-2 rounded-lg text-[13px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-                  @click="showDialog = false"
+                  @click="showDialog = false; resetCreateDialog()"
                 >
                   取消
                 </button>
                 <button
-                  class="px-4 py-2 rounded-lg bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97]"
+                  class="px-4 py-2 rounded-lg bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
+                  :disabled="!canSubmit"
                   @click="submitRequirement"
                 >
                   创建
@@ -442,6 +804,132 @@ async function retryTask(taskId: string) {
                   <div v-if="dispatching" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
                   <div v-else class="i-carbon-play-filled w-4 h-4" />
                   {{ dispatching ? '分发中...' : `分发并启动 (${selectedRepoIds.length})` }}
+                </button>
+              </div>
+            </div>
+          </Transition>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- ── 删除确认弹窗 ── -->
+    <Teleport to="body">
+      <Transition
+        enter-active-class="transition-all duration-200 ease-out"
+        leave-active-class="transition-all duration-150 ease-in"
+        enter-from-class="opacity-0"
+        leave-to-class="opacity-0"
+      >
+        <div v-if="pendingDeleteId" class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" @click.self="pendingDeleteId = null">
+          <Transition
+            appear
+            enter-active-class="transition-all duration-200 ease-out"
+            enter-from-class="opacity-0 scale-95 translate-y-2"
+          >
+            <div class="bg-white dark:bg-[#2c2c30] rounded-2xl shadow-2xl shadow-black/10 w-full max-w-sm p-6">
+              <div class="flex items-center gap-3 mb-4">
+                <div class="w-10 h-10 rounded-full bg-red-50 dark:bg-red-500/10 flex items-center justify-center shrink-0">
+                  <div class="i-carbon-warning-alt w-5 h-5 text-red-500" />
+                </div>
+                <div>
+                  <h2 class="text-base font-semibold">删除需求</h2>
+                  <p class="text-[13px] text-gray-400 mt-0.5">此操作不可撤销</p>
+                </div>
+              </div>
+              <p class="text-[13px] text-gray-500 dark:text-gray-400 mb-1">
+                确定要删除该需求吗？关联的所有流水线任务（包括 agent 运行记录、对话消息、提交快照）都将被一并删除。
+              </p>
+              <div
+                v-if="(taskMap[pendingDeleteId] ?? []).length > 0"
+                class="mt-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-500/5 border border-amber-200/60 dark:border-amber-500/10 text-[12px] text-amber-600 dark:text-amber-400"
+              >
+                该需求下有 {{ (taskMap[pendingDeleteId] ?? []).length }} 个关联任务将被删除
+              </div>
+              <div class="flex justify-end gap-2 mt-6">
+                <button
+                  class="px-4 py-2 rounded-lg text-[13px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                  :disabled="deleting"
+                  @click="pendingDeleteId = null"
+                >
+                  取消
+                </button>
+                <button
+                  class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-red-600 text-white text-[13px] font-medium hover:bg-red-500 shadow-sm shadow-red-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50"
+                  :disabled="deleting"
+                  @click="executeDelete"
+                >
+                  <div v-if="deleting" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+                  <div v-else class="i-carbon-trash-can w-4 h-4" />
+                  {{ deleting ? '删除中...' : '确认删除' }}
+                </button>
+              </div>
+            </div>
+          </Transition>
+        </div>
+      </Transition>
+    </Teleport>
+    <!-- ── MCP 选择弹窗（需求收集前） ── -->
+    <Teleport to="body">
+      <Transition
+        enter-active-class="transition-all duration-200 ease-out"
+        leave-active-class="transition-all duration-150 ease-in"
+        enter-from-class="opacity-0"
+        leave-to-class="opacity-0"
+      >
+        <div v-if="showMcpPicker" class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" @click.self="showMcpPicker = false">
+          <Transition
+            appear
+            enter-active-class="transition-all duration-200 ease-out"
+            enter-from-class="opacity-0 scale-95 translate-y-2"
+          >
+            <div class="bg-white dark:bg-[#2c2c30] rounded-2xl shadow-2xl shadow-black/10 w-full max-w-sm p-6">
+              <div class="flex items-center gap-3 mb-4">
+                <div class="w-9 h-9 rounded-full bg-violet-50 dark:bg-violet-500/10 flex items-center justify-center shrink-0">
+                  <div class="i-carbon-plug w-4 h-4 text-violet-500" />
+                </div>
+                <div>
+                  <h2 class="text-[15px] font-semibold">选择按需 MCP</h2>
+                  <p class="text-[12px] text-gray-400 mt-0.5">勾选需求收集阶段要启用的 MCP Server</p>
+                </div>
+              </div>
+
+              <div class="space-y-1.5 mb-5">
+                <label
+                  v-for="srv in mcpServers"
+                  :key="srv.id"
+                  class="flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer transition-colors"
+                  :class="selectedMcpIds.has(srv.id)
+                    ? 'bg-violet-50 dark:bg-violet-500/10 border border-violet-200 dark:border-violet-500/20'
+                    : 'bg-gray-50 dark:bg-white/3 border border-gray-100 dark:border-white/5 hover:border-violet-200 dark:hover:border-violet-500/20'"
+                  @click.prevent="toggleMcpSelection(srv.id)"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="selectedMcpIds.has(srv.id)"
+                    class="w-4 h-4 rounded border-gray-300 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
+                  >
+                  <div class="flex-1 min-w-0">
+                    <div class="text-[13px] font-medium text-gray-800 dark:text-gray-100">{{ srv.name }}</div>
+                    <div v-if="srv.description" class="text-[11px] text-gray-400 truncate">{{ srv.description }}</div>
+                  </div>
+                </label>
+              </div>
+
+              <div class="flex justify-end gap-2">
+                <button
+                  class="px-4 py-2 rounded-lg text-[13px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                  @click="showMcpPicker = false"
+                >
+                  取消
+                </button>
+                <button
+                  class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-violet-600 text-white text-[13px] font-medium hover:bg-violet-500 shadow-sm shadow-violet-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50"
+                  :disabled="startingCollection"
+                  @click="confirmStartCollection"
+                >
+                  <div v-if="startingCollection" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+                  <div v-else class="i-carbon-ai-status w-4 h-4" />
+                  {{ startingCollection ? '启动中…' : '开始需求收集' }}
                 </button>
               </div>
             </div>

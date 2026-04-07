@@ -8,6 +8,7 @@ export interface RepoTask {
   repo_id: string
   branch_name: string
   change_id: string
+  current_stage: string
   current_phase: string
   phase_status: string
   openspec_path: string

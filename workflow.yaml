@@ -1,13 +1,10 @@
-name: fe-dev-workflow
+name: dev-workflow
 description: >-
-  前端 Spec-Driven 研发工作流。
-  对齐 fe-sdd / fe-specflow：设计探索 → 任务规划 → T1 开发 → 审查 → 验证 → MR，
-  T1 后事件驱动（后端 Spec / 测试 Spec / E2E / 归档）。
-  OpenSpec CLI 命令由 Agent 直接执行，Superpowers 技能由 Agent 直接调用。
+  通用 Spec-Driven 研发工作流（五阶段层级模型）。
+  需求收集 → 任务规划 → 代码开发 → 测试 → 上线。
+  每个 Stage 内含若干步骤，由 skill 文件驱动执行，
+  通过 spec/plan 文档串联阶段上下文。
 
-# ──────────────────────────────────────────────
-# 外部依赖声明
-# ──────────────────────────────────────────────
 dependencies:
   openspec:
     type: cli
@@ -15,222 +12,229 @@ dependencies:
     install_hint: "npm install -g openspec"
     commands:
       - openspec new change
-      - openspec continue
+      - openspec instructions
       - openspec validate
+      - openspec status
       - openspec archive
 
   superpowers:
     type: skill-pack
     skills:
-      brainstorming: superpowers:brainstorming
       test-driven-development: superpowers:test-driven-development
       verification-before-completion: superpowers:verification-before-completion
-      writing-plans: superpowers:writing-plans
 
-  fe-specflow:
-    type: skill-pack
-    skills:
-      design-to-opsx: fe-specflow:design-to-opsx
-      pull-spec: fe-specflow:pull-spec
-      e2e-verify: fe-specflow:e2e-verify
+guardrail_definitions:
+  no_openspec_write_before_confirm:
+    description: >-
+      【用户放行前禁止写 OpenSpec】在用户明确同意进入下一阶段之前，
+      禁止创建或修改 openspec/changes/** 下任何文件。
+    severity: hard
+  no_skip_tdd:
+    description: >-
+      【不跳过 TDD 循环】必须严格遵循 TDD 纪律：写测试 → 验证失败 → 最小实现 → 验证通过。
+    severity: hard
+  no_uncommitted_claim:
+    description: >-
+      【不在未验证时声称完成】不得在没有运行验证命令的情况下声称任务完成。
+    severity: soft
 
-# ──────────────────────────────────────────────
-# 状态推断（基于 openspec 变更目录中的文件产物）
-# ──────────────────────────────────────────────
 state_inference:
   rules:
     - condition: no_change_dir
-      phase: design
-      description: 无变更目录 → 设计探索
+      stage: planning
+      phase: spec-create
+      description: 无变更目录 → 从 Spec 落盘开始（需求已在看板中收集）
 
     - condition: has_proposal_and_specs_no_tasks
-      phase: plan
+      stage: planning
+      phase: task-breakdown
       description: 有 proposal.md + specs/ 但无 tasks.md → 任务规划
 
     - condition: tasks_has_unchecked
-      phase: t1-dev
-      description: tasks.md 有未勾选项 → T1 前端开发
-
-    - condition: tasks_all_checked
-      phase: waiting_event
-      description: tasks.md 全部勾选 → 进入事件驱动阶段
+      stage: development
+      phase: tdd-dev
+      description: tasks.md 有未勾选项 → 代码开发
 
     - condition: e2e_report_pass
-      phase: archive
-      description: e2e-report.md 且验收结论允许归档 → 可归档
+      stage: release
+      phase: archive-deploy
+      description: e2e-report.md 验收通过 → 可归档发布
 
     - condition: e2e_report_fail_no_consent
-      phase: e2e-verify
-      description: e2e-report.md 结论不通过且未同意带债 → 须继续修/重跑
+      stage: testing
+      phase: bug-fix
+      description: e2e-report.md 不通过且未同意带债 → Bug 修复
 
-# ──────────────────────────────────────────────
-# 线性阶段定义（按顺序执行）
-# ──────────────────────────────────────────────
-phases:
-  - id: design
-    name: 设计探索
-    requires_confirm: true
+    - condition: tasks_all_checked_no_e2e
+      stage: testing
+      phase: e2e-test
+      description: 任务全部完成但无 E2E 报告 → 进入测试
+
+    - condition: tasks_all_checked
+      stage: development
+      phase: self-test
+      description: tasks.md 全部勾选且无法匹配更具体状态 → 回退到代码 review
+
+# ── 需求收集（独立于工作流，在需求看板中执行） ──
+# 手动需求：直接保存内容，无需执行阶段，分发后进入任务规划
+# 飞书需求：通过 feishu-requirement skill 获取需求内容后进入任务规划
+requirement_phases:
+  - id: feishu-requirement
+    name: 飞书需求获取
     provider: external-cli
-    skill: skills/design.md
-    invoke_skills:
-      - superpowers:brainstorming
-      - fe-specflow:design-to-opsx
-    invoke_commands:
-      - openspec new change "{{change_id}}"
-    tools:
-      - feishu-read-doc
-      - figma-get-node
-      - read-file
-      - list-directory
-      - gitlab-read-file
-      - shell-execute
-    confirm_files:
-      - "{{openspec_path}}/proposal.md"
-      - "{{openspec_path}}/specs/*/spec.md"
-    guardrails:
-      - must_brainstorm_before_code
-      - no_openspec_write_before_confirm
+    skill: skills/feishu-requirement.md
 
-  - id: plan
+stages:
+  # ──────────────────────────────────────────────
+  # Stage 1: 任务规划
+  # ──────────────────────────────────────────────
+  - id: planning
     name: 任务规划
-    requires_confirm: true
-    provider: external-cli
-    skill: skills/plan.md
-    entry_gate: has_proposal_and_specs_no_tasks
-    invoke_commands:
-      - openspec continue "{{change_id}}"
-      - openspec validate "{{change_id}}"
-    tools:
-      - read-file
-      - write-file
-      - shell-execute
-    confirm_files:
-      - "{{openspec_path}}/tasks.md"
+    gate: has_tasks
+    phases:
+      - id: spec-create
+        name: Spec 落盘
+        provider: external-cli
+        skill: skills/frontend/spec-create.md
+        requires_confirm: true
+        invoke_commands:
+          - openspec new change "{{change_id}}"
+        guardrails:
+          - no_openspec_write_before_confirm
+        confirm_files:
+          - "{{openspec_path}}/proposal.md"
+          - "{{openspec_path}}/specs/*/spec.md"
 
-  - id: t1-dev
-    name: T1 前端开发
-    requires_confirm: false
-    provider: external-cli
-    skill: skills/t1-dev.md
-    entry_gate: tasks_has_unchecked
-    invoke_skills:
-      - superpowers:test-driven-development
-      - superpowers:verification-before-completion
-    mcp_config: mcp-configs/dev.json
-    completion_check: tasks-all-checked
+      - id: task-breakdown
+        name: 任务拆分
+        provider: external-cli
+        skill: skills/frontend/task-breakdown.md
+        requires_confirm: true
+        invoke_commands:
+          - openspec instructions tasks --change "{{change_id}}"
 
-  - id: review
-    name: 代码审查
-    requires_confirm: true
-    provider: external-cli
-    skill: skills/review.md
-    entry_gate: tasks_all_checked
-    tools:
-      - git-diff
-      - read-file
-    confirm_files:
-      - __agent_output__
+      - id: task-validate
+        name: 任务验证
+        provider: external-cli
+        skill: skills/frontend/task-validate.md
+        invoke_commands:
+          - openspec validate "{{change_id}}"
 
-  - id: verify
-    name: 验证
-    requires_confirm: false
-    provider: script
-    script: scripts/verify.sh
-    entry_gate: tasks_all_checked
-    invoke_skills:
-      - superpowers:verification-before-completion
+      - id: codex-cross-review-planning
+        name: Codex 交叉 Review
+        provider: external-cli
+        skill: skills/frontend/codex-cross-review-planning.md
+        optional: true
 
-  - id: mr
-    name: 创建 MR
-    requires_confirm: true
-    provider: script
-    script: scripts/gitlab-mr.sh
-    entry_gate: tasks_all_checked
-    args:
-      - --target
-      - develop
-      - --auto-merge
+  # ──────────────────────────────────────────────
+  # Stage 3: 代码开发
+  # ──────────────────────────────────────────────
+  - id: development
+    name: 代码开发
+    gate: tasks_all_checked
+    phases:
+      - id: tdd-dev
+        name: 开发
+        provider: external-cli
+        skill: skills/frontend/tdd-dev.md
+        invoke_skills:
+          - superpowers:test-driven-development
+          - superpowers:verification-before-completion
+        guardrails:
+          - no_skip_tdd
+          - no_uncommitted_claim
+        completion_check: tasks_all_checked
 
-# ──────────────────────────────────────────────
-# 事件驱动阶段（T1 完成后，等待外部事件触发）
-# ──────────────────────────────────────────────
-events:
-  - id: backend-spec-arrived
-    name: 后端 Spec 到达
-    after_phase: t1-dev
-    provider: external-cli
-    skill: skills/integration.md
-    invoke_skills:
-      - fe-specflow:pull-spec
-    mcp_config: mcp-configs/integration.json
-    triggers:
-      - "后端spec到了"
-      - "后端接口文档来了"
-      - "API文档到了"
-      - "后端给了spec"
+      - id: integration
+        name: 联调
+        provider: external-cli
+        skill: skills/frontend/integration.md
+        optional: true
+        triggers:
+          - "后端spec到了"
+          - "联调"
+          - "API文档到了"
+          - "后端接口文档来了"
 
-  - id: test-spec-arrived
-    name: 测试 Spec 到达
-    after_phase: t1-dev
-    provider: external-cli
-    skill: skills/test-spec.md
-    invoke_skills:
-      - fe-specflow:pull-spec
-    triggers:
-      - "测试spec到了"
-      - "测试用例来了"
-      - "QA文档到了"
-      - "测试给了spec"
+      - id: self-test
+        name: 代码 Review
+        provider: external-cli
+        skill: skills/frontend/self-test.md
+        invoke_skills:
+          - superpowers:verification-before-completion
 
-  - id: e2e-verify
-    name: E2E Browser 交叉验证
-    after_phase: t1-dev
-    provider: external-cli
-    skill: skills/e2e.md
-    invoke_skills:
-      - fe-specflow:e2e-verify
-      - superpowers:verification-before-completion
-    mcp_config: mcp-configs/e2e.json
-    confirm_files:
-      - "{{openspec_path}}/e2e-report.md"
-    triggers:
-      - "跑自动化验证"
-      - "跑e2e"
-      - "浏览器验证"
-      - "用这个spec跑e2e"
+      - id: codex-cross-review-dev
+        name: Codex 交叉 Review
+        provider: external-cli
+        skill: skills/frontend/codex-cross-review-dev.md
+        optional: true
 
-  - id: archive
-    name: 归档
-    after_phase: e2e-verify
-    invoke_commands:
-      - openspec archive "{{change_id}}" --yes
-    provider: script
-    script: scripts/archive.sh
-    precondition: e2e_report_pass
-    is_terminal: true
-    triggers:
-      - "归档"
-      - "archive"
-      - "可以归档了"
+  # ──────────────────────────────────────────────
+  # Stage 4: 测试
+  # ──────────────────────────────────────────────
+  - id: testing
+    name: 测试
+    gate: e2e_report_pass
+    phases:
+      - id: e2e-test
+        name: E2E 浏览器测试
+        provider: external-cli
+        skill: skills/frontend/e2e-test.md
+        completion_check: e2e_report_pass
 
-# ──────────────────────────────────────────────
-# 触发语 → 阶段映射（自然语言路由）
-# ──────────────────────────────────────────────
+      - id: bug-fix
+        name: Bug 修复
+        provider: external-cli
+        skill: skills/frontend/bug-fix.md
+        optional: true
+        loopable: true
+        loop_target: e2e-test
+
+  # ──────────────────────────────────────────────
+  # Stage 5: 上线
+  # ──────────────────────────────────────────────
+  - id: release
+    name: 上线
+    gate: archive_complete
+    phases:
+      - id: archive-deploy
+        name: 归档与发布
+        provider: external-cli
+        skill: skills/frontend/archive-deploy.md
+        requires_confirm: true
+        invoke_commands:
+          - openspec archive "{{change_id}}" --yes
+        is_terminal: true
+
+      - id: post-deploy-fix
+        name: 测试环境 Bug 修复
+        provider: external-cli
+        skill: skills/frontend/post-deploy-fix.md
+        optional: true
+        loopable: true
+        loop_target: archive-deploy
+
+# trigger_mapping 为触发短语的唯一权威来源。
+# phase 级 triggers 字段引用同一短语集合，引擎匹配时合并两处。
+# 匹配规则：子串包含（userInput.includes(pattern)）
 trigger_mapping:
   - patterns: ["新需求", "新功能", "开始开发", "做个新feature"]
-    target: design
+    target_stage: planning
+    target_phase: spec-create
 
   - patterns: ["继续开发", "接着做", "继续这个需求"]
-    target: infer_from_state
+    target_stage: auto
+    target_phase: auto
+    strategy: infer_from_state
 
-  - patterns: ["后端spec", "后端接口文档", "API文档"]
-    target: backend-spec-arrived
+  - patterns: ["后端spec", "后端接口文档", "API文档", "联调"]
+    target_stage: development
+    target_phase: integration
 
-  - patterns: ["测试spec", "测试用例", "QA文档"]
-    target: test-spec-arrived
+  - patterns: ["跑e2e", "浏览器验证", "自动化验证", "实机测试"]
+    target_stage: testing
+    target_phase: e2e-test
 
-  - patterns: ["跑e2e", "浏览器验证", "自动化验证"]
-    target: e2e-verify
-
-  - patterns: ["归档", "archive"]
-    target: archive
+  - patterns: ["归档", "archive", "发布测试"]
+    target_stage: release
+    target_phase: archive-deploy

@@ -8,16 +8,22 @@ function elog(msg: string) {
   try { appendFileSync(LOG_FILE, `${new Date().toISOString()} [engine] ${msg}\n`) } catch {}
 }
 import type Database from 'better-sqlite3'
-import type { AgentProvider, PhaseContext, PhaseResult } from '../providers/types'
-import { parseWorkflow } from './parser'
-import type { EventConfig, PhaseConfig, WorkflowConfig } from './parser'
+import type { AgentProvider, PhaseResult } from '../providers/types'
+import { buildPromptFromContext } from '../providers/cli.provider'
+import { parseWorkflow, findPhaseById, findPhaseInStages, flattenPhases } from './parser'
+import type { PhaseConfig, StageConfig, WorkflowConfig } from './parser'
 import { buildPhaseContext } from './context-builder'
 import { RepoTaskRepository } from '../db/repositories/repo-task.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { MessageRepository } from '../db/repositories/message.repo'
 import { RequirementRepository } from '../db/repositories/requirement.repo'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
+import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
+import { RepoRepository } from '../db/repositories/repo.repo'
+import { SettingsRepository } from '../db/repositories/settings.repo'
 import { getHead, getMergeBase, resetHard } from '../git/operations'
+import { getConfigWriter } from '../mcp/config-writer'
+import type { McpServerConfig } from '../mcp/config-writer'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
@@ -28,6 +34,7 @@ export interface WorkflowEngineOptions {
   workflowYaml: string
   resolveProvider: (provider: string, options?: ResolveProviderOptions) => AgentProvider
   resolveSkillContent: (skillPath: string) => string
+  cliType?: string
 }
 
 export class WorkflowEngine {
@@ -40,19 +47,47 @@ export class WorkflowEngine {
   private msgRepo: MessageRepository
   private reqRepo: RequirementRepository
   private commitRepo: PhaseCommitRepository
+  private mcpBindingRepo: McpBindingRepository
+  private repoRepo: RepoRepository
+  private settingsRepo: SettingsRepository
+  private cliType: string
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
+  private activatedPhases = new Map<string, Set<string>>()
+
+  private rawYaml: string
 
   constructor(opts: WorkflowEngineOptions) {
     this.db = opts.db
     this.config = parseWorkflow(opts.workflowYaml)
+    this.rawYaml = opts.workflowYaml
     this.resolveProvider = opts.resolveProvider
     this.resolveSkillContent = opts.resolveSkillContent
+    this.cliType = opts.cliType ?? 'cursor-cli'
     this.taskRepo = new RepoTaskRepository(this.db)
     this.runRepo = new AgentRunRepository(this.db)
     this.msgRepo = new MessageRepository(this.db)
     this.reqRepo = new RequirementRepository(this.db)
     this.commitRepo = new PhaseCommitRepository(this.db)
+    this.mcpBindingRepo = new McpBindingRepository(this.db)
+    this.repoRepo = new RepoRepository(this.db)
+    this.settingsRepo = new SettingsRepository(this.db)
+  }
+
+  recoverMcpBackups(): void {
+    const writer = getConfigWriter(this.cliType)
+    for (const repo of this.repoRepo.findAll()) {
+      if (writer.hasBackup(repo.local_path)) {
+        elog(`recoverMcpBackups: restoring backup for ${repo.local_path}`)
+        writer.restore(repo.local_path)
+      }
+    }
+    const stuckTasks = this.db.prepare(
+      "SELECT id, current_stage, current_phase FROM repo_tasks WHERE phase_status = 'running'",
+    ).all() as { id: string, current_stage: string, current_phase: string }[]
+    for (const t of stuckTasks) {
+      this.taskRepo.updatePhase(t.id, t.current_stage, t.current_phase, 'error')
+    }
   }
 
   // ── 实时输出 ──
@@ -70,7 +105,7 @@ export class WorkflowEngine {
       return { ok: true, missing }
 
     for (const [name, dep] of Object.entries(deps)) {
-      if (dep.type === 'cli') {
+      if (dep.type === 'cli' && dep.check) {
         try {
           execSync(dep.check, { stdio: 'pipe' })
         }
@@ -84,21 +119,28 @@ export class WorkflowEngine {
 
   // ── 状态推断 ──
 
-  inferPhase(worktreePath: string, openspecPath: string): string {
+  inferStageAndPhase(
+    worktreePath: string,
+    openspecPath: string,
+  ): { stageId: string, phaseId: string } {
     const rules = this.config.state_inference?.rules
+    const fallback = {
+      stageId: this.config.stages[0].id,
+      phaseId: this.config.stages[0].phases[0].id,
+    }
+
     if (!rules?.length)
-      return this.config.phases[0].id
+      return fallback
 
     const absOpenspec = join(worktreePath, openspecPath)
     const changeExists = existsSync(absOpenspec)
 
     for (const rule of rules) {
-      const matched = this.evaluateCondition(rule.condition, absOpenspec, changeExists)
-      if (matched)
-        return rule.phase
+      if (this.evaluateCondition(rule.condition, absOpenspec, changeExists))
+        return { stageId: rule.stage, phaseId: rule.phase }
     }
 
-    return this.config.phases[0].id
+    return fallback
   }
 
   private evaluateCondition(
@@ -116,11 +158,19 @@ export class WorkflowEngine {
           && existsSync(join(openspecDir, 'specs'))
           && !existsSync(join(openspecDir, 'tasks.md'))
 
+      case 'has_tasks':
+        return changeExists && existsSync(join(openspecDir, 'tasks.md'))
+
       case 'tasks_has_unchecked':
         return changeExists && this.tasksHaveUnchecked(openspecDir)
 
       case 'tasks_all_checked':
         return changeExists && this.tasksAllChecked(openspecDir)
+
+      case 'tasks_all_checked_no_e2e':
+        return changeExists
+          && this.tasksAllChecked(openspecDir)
+          && !existsSync(join(openspecDir, 'e2e-report.md'))
 
       case 'e2e_report_pass':
         return changeExists && this.e2eReportAllowsArchive(openspecDir)
@@ -129,6 +179,9 @@ export class WorkflowEngine {
         return changeExists
           && existsSync(join(openspecDir, 'e2e-report.md'))
           && !this.e2eReportAllowsArchive(openspecDir)
+
+      case 'archive_complete':
+        return !changeExists
 
       default:
         return false
@@ -170,10 +223,6 @@ export class WorkflowEngine {
     return missing
   }
 
-  /**
-   * 简单通配符匹配：仅支持路径中的单个 `*` 段（如 `dir/* /file.md`）。
-   * 返回是否有至少一个匹配。
-   */
   private matchSimpleGlob(pattern: string): boolean {
     const starIdx = pattern.indexOf('*')
     if (starIdx === -1) return existsSync(pattern)
@@ -221,19 +270,58 @@ export class WorkflowEngine {
       || conclusionSection.includes('用户同意')
   }
 
+  // ── Optional phase 激活 ──
+
+  private activatePhase(repoTaskId: string, phaseId: string): void {
+    let set = this.activatedPhases.get(repoTaskId)
+    if (!set) {
+      set = new Set()
+      this.activatedPhases.set(repoTaskId, set)
+    }
+    set.add(phaseId)
+  }
+
+  private isPhaseActivated(repoTaskId: string, phaseId: string): boolean {
+    if (this.activatedPhases.get(repoTaskId)?.has(phaseId))
+      return true
+    return this.settingsRepo.get(`phase.${phaseId}.enabled`) === 'true'
+  }
+
+  setPhaseEnabled(phaseId: string, enabled: boolean): void {
+    this.settingsRepo.set(`phase.${phaseId}.enabled`, enabled ? 'true' : 'false')
+  }
+
+  getPhaseEnabledMap(): Record<string, boolean> {
+    const result: Record<string, boolean> = {}
+    for (const stage of this.config.stages) {
+      for (const phase of stage.phases) {
+        if (phase.optional && !phase.triggers?.length && !phase.loopable) {
+          const val = this.settingsRepo.get(`phase.${phase.id}.enabled`)
+          result[phase.id] = val === 'true'
+        }
+      }
+    }
+    return result
+  }
+
   // ── 触发语路由 ──
 
-  routeTrigger(userInput: string): string | null {
-    // 先检查事件级 triggers
-    for (const event of this.config.events ?? []) {
-      if (event.triggers?.some(t => userInput.includes(t)))
-        return event.id
+  routeTrigger(
+    userInput: string,
+  ): { targetStage: string, targetPhase?: string, strategy?: 'infer_from_state' } | null {
+    for (const stage of this.config.stages) {
+      for (const phase of stage.phases) {
+        if (phase.triggers?.some(t => userInput.includes(t)))
+          return { targetStage: stage.id, targetPhase: phase.id }
+      }
     }
 
-    // 再检查全局 trigger_mapping
     for (const mapping of this.config.trigger_mapping ?? []) {
-      if (mapping.patterns.some(p => userInput.includes(p)))
-        return mapping.target
+      if (mapping.patterns.some(p => userInput.includes(p))) {
+        if (mapping.strategy === 'infer_from_state')
+          return { targetStage: mapping.target_stage, strategy: 'infer_from_state' }
+        return { targetStage: mapping.target_stage, targetPhase: mapping.target_phase }
+      }
     }
 
     return null
@@ -254,28 +342,33 @@ export class WorkflowEngine {
       catch { /* non-git worktree, skip */ }
     }
 
-    const inferredPhaseId = this.inferPhase(task.worktree_path, task.openspec_path)
-    const phase = this.config.phases.find(p => p.id === inferredPhaseId)
-      ?? this.config.phases[0]
+    const { stageId, phaseId } = this.inferStageAndPhase(task.worktree_path, task.openspec_path)
+    const found = findPhaseInStages(this.config.stages, stageId, phaseId)
+    const stage = found?.stage ?? this.config.stages[0]
+    const phase = found?.phase ?? this.config.stages[0].phases[0]
 
-    this.taskRepo.updatePhase(repoTaskId, phase.id, 'running')
-    await this.executePhase(repoTaskId, phase)
+    this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+    await this.executePhase(repoTaskId, phase, stage)
   }
 
   async confirmPhase(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
-    elog(`confirmPhase: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
+    elog(`confirmPhase: task=${repoTaskId} stage=${task?.current_stage} phase=${task?.current_phase} status=${task?.phase_status}`)
     if (!task || task.phase_status !== 'waiting_confirm')
       throw new Error(`Task ${repoTaskId} is not in waiting_confirm state`)
 
-    const phase = this.config.phases.find(p => p.id === task.current_phase)
-      ?? (this.config.events?.find(e => e.id === task.current_phase)
-        ? this.eventToPhaseConfig(this.config.events.find(e => e.id === task.current_phase)!)
-        : null)
+    const found = findPhaseById(this.config.stages, task.current_phase)
+    if (!found)
+      throw new Error(`Phase ${task.current_phase} not found in workflow config`)
+    const { stage, phase } = found
 
-    // confirm_files 存在性校验（跳过 __agent_output__ 等特殊标记）
-    if (phase?.confirm_files?.length) {
-      const missing = this.validateConfirmFiles(phase.confirm_files, task.worktree_path, task.openspec_path, task.change_id)
+    if (phase.confirm_files?.length) {
+      const missing = this.validateConfirmFiles(
+        phase.confirm_files,
+        task.worktree_path,
+        task.openspec_path,
+        task.change_id,
+      )
       if (missing.length) {
         elog(`confirmPhase: blocked — missing files: ${missing.join(', ')}`)
         const reason = `确认被阻止：以下预期产出文件缺失\n${missing.map(f => `- ${f}`).join('\n')}`
@@ -289,21 +382,29 @@ export class WorkflowEngine {
       }
     }
 
-    // 终态事件确认 → completed
-    if (phase?.is_terminal) {
-      this.taskRepo.updatePhase(repoTaskId, task.current_phase, 'completed')
+    if (phase.is_terminal) {
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
       return
     }
 
-    const nextPhase = this.getNextPhase(task.current_phase)
-    elog(`confirmPhase: nextPhase=${nextPhase?.id ?? 'none'}`)
-    if (!nextPhase) {
-      this.taskRepo.updatePhase(repoTaskId, task.current_phase, 'waiting_event')
+    if (phase.loopable && phase.loop_target) {
+      const loopTarget = findPhaseById(this.config.stages, phase.loop_target)
+      if (loopTarget) {
+        this.taskRepo.updatePhase(repoTaskId, loopTarget.stage.id, loopTarget.phase.id, 'running')
+        await this.executePhase(repoTaskId, loopTarget.phase, loopTarget.stage)
+        return
+      }
+    }
+
+    const next = this.getNextPhase(repoTaskId, stage.id, phase.id)
+    elog(`confirmPhase: next=${next ? `${next.stage.id}/${next.phase.id}` : 'none'}`)
+    if (!next) {
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_event')
       return
     }
 
-    this.taskRepo.updatePhase(repoTaskId, nextPhase.id, 'running')
-    await this.executePhase(repoTaskId, nextPhase)
+    this.taskRepo.updatePhase(repoTaskId, next.stage.id, next.phase.id, 'running')
+    await this.executePhase(repoTaskId, next.phase, next.stage)
   }
 
   async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
@@ -313,12 +414,10 @@ export class WorkflowEngine {
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
 
-    const phase = this.config.phases.find(p => p.id === task.current_phase)
-      ?? (this.config.events?.find(e => e.id === task.current_phase)
-        ? this.eventToPhaseConfig(this.config.events.find(e => e.id === task.current_phase)!)
-        : null)
-    if (!phase)
+    const found = findPhaseById(this.config.stages, task.current_phase)
+    if (!found)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
+    const { stage, phase } = found
 
     this.msgRepo.create({
       repo_task_id: repoTaskId,
@@ -327,65 +426,36 @@ export class WorkflowEngine {
       content: feedback,
     })
 
-    this.taskRepo.updatePhase(repoTaskId, phase.id, 'running')
-    await this.executePhase(repoTaskId, phase, feedback)
+    this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+    await this.executePhase(repoTaskId, phase, stage, feedback)
   }
 
-  async triggerEvent(repoTaskId: string, eventId: string, payload?: string): Promise<void> {
-    const task = this.taskRepo.findById(repoTaskId)
-    if (!task || task.phase_status !== 'waiting_event')
-      throw new Error(`Task ${repoTaskId} is not in waiting_event state`)
-
-    const event = this.config.events?.find(e => e.id === eventId)
-    if (!event)
-      throw new Error(`Event ${eventId} not found in workflow config`)
-
-    // after_phase 门禁：事件只能在指定阶段走完之后触发
-    if (event.after_phase) {
-      const passed = this.hasPhaseCompleted(repoTaskId, event.after_phase)
-      if (!passed) {
-        throw new Error(
-          `Event "${eventId}" requires phase "${event.after_phase}" to be completed first, `
-          + `but current phase is "${task.current_phase}"`,
-        )
-      }
-    }
-
-    if (event.precondition) {
-      const absOpenspec = join(task.worktree_path, task.openspec_path)
-      const met = this.evaluateCondition(event.precondition, absOpenspec, existsSync(absOpenspec))
-      if (!met)
-        throw new Error(`Precondition "${event.precondition}" not met for event ${eventId}`)
-    }
-
-    const syntheticPhase = this.eventToPhaseConfig(event)
-    this.taskRepo.updatePhase(repoTaskId, event.id, 'running')
-    await this.executePhase(repoTaskId, syntheticPhase, payload)
-  }
-
-  /**
-   * 自动路由：根据用户输入判断应触发的阶段/事件，并执行。
-   */
   async routeAndExecute(repoTaskId: string, userInput: string): Promise<string | null> {
-    const target = this.routeTrigger(userInput)
-    if (!target)
+    const match = this.routeTrigger(userInput)
+    if (!match)
       return null
 
-    if (target === 'infer_from_state') {
+    if (match.strategy === 'infer_from_state') {
       await this.startWorkflow(repoTaskId)
       return 'infer_from_state'
     }
 
-    const event = this.config.events?.find(e => e.id === target)
-    if (event) {
-      await this.triggerEvent(repoTaskId, event.id, userInput)
-      return event.id
+    if (match.targetPhase) {
+      const found = findPhaseInStages(this.config.stages, match.targetStage, match.targetPhase)
+      if (found) {
+        if (found.phase.optional)
+          this.activatePhase(repoTaskId, found.phase.id)
+        this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'running')
+        await this.executePhase(repoTaskId, found.phase, found.stage, userInput)
+        return found.phase.id
+      }
     }
 
-    const phase = this.config.phases.find(p => p.id === target)
-    if (phase) {
-      this.taskRepo.updatePhase(repoTaskId, phase.id, 'running')
-      await this.executePhase(repoTaskId, phase, userInput)
+    const stage = this.config.stages.find(s => s.id === match.targetStage)
+    if (stage) {
+      const phase = stage.phases[0]
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+      await this.executePhase(repoTaskId, phase, stage, userInput)
       return phase.id
     }
 
@@ -400,20 +470,18 @@ export class WorkflowEngine {
     if (task.phase_status !== 'failed' && task.phase_status !== 'cancelled')
       throw new Error(`Task ${repoTaskId} is not in a retryable state (current: ${task.phase_status})`)
 
-    const phase = this.config.phases.find(p => p.id === task.current_phase)
-    const event = this.config.events?.find(e => e.id === task.current_phase)
+    const found = findPhaseById(this.config.stages, task.current_phase)
+    if (!found)
+      throw new Error(`Phase ${task.current_phase} not found in workflow config`)
 
-    const phaseConfig = phase ?? (event ? this.eventToPhaseConfig(event) : null)
-    if (!phaseConfig)
-      throw new Error(`Phase/event ${task.current_phase} not found in workflow config`)
-
-    this.taskRepo.updatePhase(repoTaskId, task.current_phase, 'running')
-    await this.executePhase(repoTaskId, phaseConfig)
+    this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'running')
+    await this.executePhase(repoTaskId, found.phase, found.stage, undefined, { skipEntryGate: true })
   }
 
   async resetTask(repoTaskId: string): Promise<void> {
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
+    this.activatedPhases.delete(repoTaskId)
 
     const task = this.taskRepo.findById(repoTaskId)
     if (task) {
@@ -430,43 +498,57 @@ export class WorkflowEngine {
     this.msgRepo.deleteByTask(repoTaskId)
     this.runRepo.deleteByTask(repoTaskId)
     this.commitRepo.deleteByTask(repoTaskId)
-    const firstPhase = this.config.phases[0]
-    this.taskRepo.updatePhase(repoTaskId, firstPhase.id, 'pending')
+    const firstStage = this.config.stages[0]
+    const firstPhase = firstStage.phases[0]
+    this.taskRepo.updatePhase(repoTaskId, firstStage.id, firstPhase.id, 'pending')
   }
 
   async resetCurrentPhase(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) throw new Error(`Task not found: ${repoTaskId}`)
-    elog(`resetCurrentPhase: task=${repoTaskId} current_phase=${task.current_phase} status=${task.phase_status}`)
+    elog(`resetCurrentPhase: task=${repoTaskId} current_stage=${task.current_stage} current_phase=${task.current_phase} status=${task.phase_status}`)
 
-    await this.rollbackToPhase(repoTaskId, task.current_phase)
+    await this.rollbackToPhase(repoTaskId, task.current_stage, task.current_phase)
   }
 
-  async rollbackToPhase(repoTaskId: string, targetPhaseId: string): Promise<void> {
-    elog(`rollbackToPhase: task=${repoTaskId} target=${targetPhaseId}`)
+  async rollbackToPhase(
+    repoTaskId: string,
+    targetStageId: string,
+    targetPhaseId: string,
+  ): Promise<void> {
+    elog(`rollbackToPhase: task=${repoTaskId} targetStage=${targetStageId} targetPhase=${targetPhaseId}`)
     const task = this.taskRepo.findById(repoTaskId)
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
 
-    const targetIdx = this.config.phases.findIndex(p => p.id === targetPhaseId)
-    elog(`rollbackToPhase: targetIdx=${targetIdx} currentPhase=${task.current_phase} currentStatus=${task.phase_status}`)
-    if (targetIdx === -1)
-      throw new Error(`Phase "${targetPhaseId}" not found in workflow config`)
+    const target = findPhaseInStages(this.config.stages, targetStageId, targetPhaseId)
+    if (!target)
+      throw new Error(`Phase "${targetPhaseId}" not found in stage "${targetStageId}"`)
 
-    const currentIdx = this.config.phases.findIndex(p => p.id === task.current_phase)
-    if (currentIdx !== -1 && targetIdx > currentIdx)
-      throw new Error(`Cannot roll forward: target "${targetPhaseId}" is after current "${task.current_phase}"`)
+    const current = findPhaseById(this.config.stages, task.current_phase)
+    if (current) {
+      const targetFlat = target.stageIdx * 10000 + target.phaseIdx
+      const currentFlat = current.stageIdx * 10000 + current.phaseIdx
+      if (targetFlat > currentFlat)
+        throw new Error(`Cannot roll forward: target "${targetStageId}/${targetPhaseId}" is after current "${task.current_stage}/${task.current_phase}"`)
+    }
 
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
 
     let resetSha: string | null = null
-    if (targetIdx === 0) {
+    if (target.stageIdx === 0 && target.phaseIdx === 0) {
       resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
     }
     else {
-      const prevPhaseId = this.config.phases[targetIdx - 1].id
-      resetSha = this.commitRepo.get(repoTaskId, prevPhaseId)
+      const allPhases = flattenPhases(this.config)
+      const flatIdx = allPhases.findIndex(
+        p => p.id === targetPhaseId && p.stageId === targetStageId,
+      )
+      if (flatIdx > 0)
+        resetSha = this.commitRepo.get(repoTaskId, allPhases[flatIdx - 1].id)
+      if (!resetSha)
+        resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
     }
 
     if (!resetSha) {
@@ -479,20 +561,68 @@ export class WorkflowEngine {
       catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
     }
 
-    const phasesToClear = this.config.phases
-      .slice(targetIdx)
-      .map(p => p.id)
+    const phasesToClear = this.collectPhaseIdsAfter(target.stageIdx, target.phaseIdx)
     this.msgRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.runRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
 
-    const phase = this.config.phases[targetIdx]
-    this.taskRepo.updatePhase(repoTaskId, targetPhaseId, 'running')
-    await this.executePhase(repoTaskId, phase)
+    this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'running')
+    await this.executePhase(repoTaskId, target.phase, target.stage, undefined, { skipEntryGate: true })
   }
 
-  getPhases(): { id: string, name: string }[] {
-    return this.config.phases.map(p => ({ id: p.id, name: p.name }))
+  async rollbackToStage(repoTaskId: string, targetStageId: string): Promise<void> {
+    const stage = this.config.stages.find(s => s.id === targetStageId)
+    if (!stage)
+      throw new Error(`Stage "${targetStageId}" not found`)
+    await this.rollbackToPhase(repoTaskId, targetStageId, stage.phases[0].id)
+  }
+
+  getFullConfig(): WorkflowConfig {
+    return this.config
+  }
+
+  getRawYaml(): string {
+    return this.rawYaml
+  }
+
+  reloadConfig(yamlContent: string): void {
+    this.config = parseWorkflow(yamlContent)
+    this.rawYaml = yamlContent
+  }
+
+  resolveSkill(skillPath: string): string {
+    return this.resolveSkillContent(skillPath)
+  }
+
+  getStagesAndPhases(): { id: string, name: string, phases: { id: string, name: string }[] }[] {
+    return this.config.stages.map(s => ({
+      id: s.id,
+      name: s.name,
+      phases: s.phases.map(p => ({ id: p.id, name: p.name })),
+    }))
+  }
+
+  getRequirementPhases(): { id: string, name: string, optional?: boolean, skippable?: boolean }[] {
+    return (this.config.requirement_phases ?? []).map(p => ({
+      id: p.id,
+      name: p.name,
+      optional: p.optional,
+      skippable: p.skippable,
+    }))
+  }
+
+  async executeRequirementPhase(
+    repoTaskId: string,
+    phaseId: string,
+    userMessage?: string,
+  ): Promise<void> {
+    const phase = (this.config.requirement_phases ?? []).find(p => p.id === phaseId)
+    if (!phase)
+      throw new Error(`Requirement phase "${phaseId}" not found`)
+
+    const virtualStage: StageConfig = { id: '_requirements', name: '需求收集', phases: this.config.requirement_phases ?? [] }
+    this.taskRepo.updatePhase(repoTaskId, '_requirements', phaseId, 'running')
+    await this.executePhase(repoTaskId, phase, virtualStage, userMessage)
   }
 
   async cancelCurrentAgent(repoTaskId: string): Promise<void> {
@@ -504,7 +634,105 @@ export class WorkflowEngine {
 
     const task = this.taskRepo.findById(repoTaskId)
     if (task)
-      this.taskRepo.updatePhase(repoTaskId, task.current_phase, 'cancelled')
+      this.taskRepo.updatePhase(repoTaskId, task.current_stage, task.current_phase, 'cancelled')
+  }
+
+  /**
+   * 无需 taskId，用占位变量生成某个 phase 的提示词模板。
+   * 用于工作流编辑器中预览 "Agent 大概会收到什么 prompt"。
+   */
+  previewPhasePromptTemplate(phaseId: string): string {
+    const found = findPhaseById(this.config.stages, phaseId)
+      ?? (this.config.requirement_phases ?? []).map((p) => {
+        if (p.id !== phaseId) return null
+        const virtualStage = { id: '_requirements', name: '需求收集', phases: this.config.requirement_phases ?? [] }
+        return { stage: virtualStage, phase: p, stageIdx: -1, phaseIdx: 0 }
+      }).find(Boolean)
+
+    if (!found) throw new Error(`Phase ${phaseId} not found in workflow config`)
+    const { stage, phase } = found
+
+    const placeholders = {
+      repoPath: '/path/to/repo',
+      openspecPath: 'openspec/changes/<change-id>',
+      branchName: 'feature/<change-id>',
+      changeId: '<change-id>',
+    }
+
+    const ctxDeps = {
+      resolveSkillContent: this.resolveSkillContent,
+      guardrailDefinitions: this.config.guardrail_definitions,
+    }
+
+    const context = buildPhaseContext(
+      phase,
+      stage.id,
+      stage.name,
+      placeholders.repoPath,
+      placeholders.openspecPath,
+      placeholders.branchName,
+      placeholders.changeId,
+      ctxDeps,
+      undefined,
+      undefined,
+      false,
+      { title: '<需求标题>', description: '<需求描述>' },
+    )
+
+    const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
+    return buildPromptFromContext(context, canReadFiles)
+  }
+
+  /**
+   * 预览某个 phase 被调用时发送给 CLI 的完整提示词（不执行）。
+   * 用于在前端 UI 中展示 "Agent 会收到什么 prompt"。
+   */
+  previewPhasePrompt(repoTaskId: string, phaseId: string): string {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
+
+    const found = findPhaseById(this.config.stages, phaseId)
+      ?? (this.config.requirement_phases ?? []).map((p, i) => {
+        if (p.id !== phaseId) return null
+        const virtualStage = { id: '_requirements', name: '需求收集', phases: this.config.requirement_phases ?? [] }
+        return { stage: virtualStage, phase: p, stageIdx: -1, phaseIdx: i }
+      }).find(Boolean)
+
+    if (!found) throw new Error(`Phase ${phaseId} not found in workflow config`)
+    const { stage, phase } = found
+
+    const requirement = this.reqRepo.findById(task.requirement_id)
+
+    const history = this.msgRepo
+      .findByTaskAndPhase(repoTaskId, phase.id)
+      .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+
+    const reqInfo = requirement
+      ? { title: requirement.title, description: requirement.description }
+      : undefined
+
+    const ctxDeps = {
+      resolveSkillContent: this.resolveSkillContent,
+      guardrailDefinitions: this.config.guardrail_definitions,
+    }
+
+    const context = buildPhaseContext(
+      phase,
+      stage.id,
+      stage.name,
+      task.worktree_path,
+      task.openspec_path,
+      task.branch_name,
+      task.change_id,
+      ctxDeps,
+      undefined,
+      history.length > 0 ? history : undefined,
+      false,
+      reqInfo,
+    )
+
+    const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
+    return buildPromptFromContext(context, canReadFiles)
   }
 
   // ── 内部执行 ──
@@ -512,16 +740,17 @@ export class WorkflowEngine {
   private async executePhase(
     repoTaskId: string,
     phase: PhaseConfig,
+    stage: StageConfig,
     userMessage?: string,
+    options?: { skipEntryGate?: boolean },
   ): Promise<void> {
-    elog(`executePhase: task=${repoTaskId} phase=${phase.id} provider=${phase.provider} hasUserMsg=${!!userMessage}`)
+    elog(`executePhase: task=${repoTaskId} stage=${stage.id} phase=${phase.id} provider=${phase.provider} hasUserMsg=${!!userMessage} skipEntryGate=${options?.skipEntryGate ?? false}`)
     let agentRunId: string | null = null
 
     try {
       const task = this.taskRepo.findById(repoTaskId)!
 
-      // entry_gate: 进入本阶段前的前置条件校验
-      if (phase.entry_gate) {
+      if (phase.entry_gate && !options?.skipEntryGate) {
         const absOpenspec = join(task.worktree_path, task.openspec_path)
         const gatePassed = this.evaluateCondition(
           phase.entry_gate,
@@ -537,14 +766,13 @@ export class WorkflowEngine {
             role: 'assistant',
             content: reason,
           })
-          this.taskRepo.updatePhase(repoTaskId, phase.id, 'failed')
+          this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'failed')
           return
         }
       }
 
       const requirement = this.reqRepo.findById(task.requirement_id)
 
-      // Check if we can resume a previous session for faster startup
       const previousSessionId = this.runRepo.findLastSessionId(repoTaskId, phase.id)
       const isResume = !!previousSessionId && !!userMessage
 
@@ -556,14 +784,21 @@ export class WorkflowEngine {
         ? { title: requirement.title, description: requirement.description }
         : undefined
 
+      const ctxDeps = {
+        resolveSkillContent: this.resolveSkillContent,
+        guardrailDefinitions: this.config.guardrail_definitions,
+      }
+
       const context = isResume
         ? buildPhaseContext(
             phase,
+            stage.id,
+            stage.name,
             task.worktree_path,
             task.openspec_path,
             task.branch_name,
             task.change_id,
-            { resolveSkillContent: this.resolveSkillContent },
+            ctxDeps,
             userMessage,
             undefined,
             true,
@@ -571,11 +806,13 @@ export class WorkflowEngine {
           )
         : buildPhaseContext(
             phase,
+            stage.id,
+            stage.name,
             task.worktree_path,
             task.openspec_path,
             task.branch_name,
             task.change_id,
-            { resolveSkillContent: this.resolveSkillContent },
+            ctxDeps,
             userMessage,
             history.length > 0 ? history : undefined,
             false,
@@ -595,12 +832,50 @@ export class WorkflowEngine {
       this.activeProviders.set(repoTaskId, provider)
       this.liveOutputs.set(repoTaskId, '')
 
-      const result = await provider.run(context, {
-        onChunk: (chunk) => {
-          const current = this.liveOutputs.get(repoTaskId) ?? ''
-          this.liveOutputs.set(repoTaskId, current + chunk)
-        },
+      const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
+      const promptText = isResume && context.userMessage
+        ? context.userMessage
+        : buildPromptFromContext(context, canReadFiles)
+      this.msgRepo.create({
+        repo_task_id: repoTaskId,
+        phase_id: phase.id,
+        role: 'prompt',
+        content: promptText,
       })
+
+      const mcpServers = this.mcpBindingRepo.resolveServersForPhase(stage.id, phase.id)
+      const configWriter = getConfigWriter(this.cliType)
+      const cwd = task.worktree_path
+
+      if (mcpServers.length > 0) {
+        const serverConfigs: McpServerConfig[] = mcpServers.map(s => ({
+          name: s.name,
+          transport: s.transport,
+          command: s.command,
+          args: JSON.parse(s.args),
+          env: JSON.parse(s.env),
+          url: s.url,
+          headers: JSON.parse(s.headers),
+        }))
+        configWriter.backup(cwd)
+        configWriter.write(cwd, serverConfigs)
+        elog(`executePhase: injected ${mcpServers.length} MCP server(s) for ${stage.id}/${phase.id}`)
+      }
+
+      let result: PhaseResult
+      try {
+        result = await provider.run(context, {
+          onChunk: (chunk) => {
+            const current = this.liveOutputs.get(repoTaskId) ?? ''
+            this.liveOutputs.set(repoTaskId, current + chunk)
+          },
+        })
+      } finally {
+        if (mcpServers.length > 0) {
+          configWriter.restore(cwd)
+          elog(`executePhase: restored MCP config for ${stage.id}/${phase.id}`)
+        }
+      }
       this.activeProviders.delete(repoTaskId)
 
       const sessionId = (provider as any).sessionId ?? undefined
@@ -618,7 +893,7 @@ export class WorkflowEngine {
 
       setTimeout(() => this.liveOutputs.delete(repoTaskId), 2000)
 
-      await this.handlePhaseResult(repoTaskId, phase, result)
+      await this.handlePhaseResult(repoTaskId, phase, stage, result)
     }
     catch (err: unknown) {
       this.activeProviders.delete(repoTaskId)
@@ -628,19 +903,20 @@ export class WorkflowEngine {
       if (agentRunId)
         this.runRepo.finish(agentRunId, 'failed', undefined, errMsg)
 
-      this.taskRepo.updatePhase(repoTaskId, phase.id, 'failed')
-      process.stderr.write(`[workflow] executePhase crashed for ${repoTaskId}/${phase.id}: ${errMsg}\n`)
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'failed')
+      process.stderr.write(`[workflow] executePhase crashed for ${repoTaskId}/${stage.id}/${phase.id}: ${errMsg}\n`)
     }
   }
 
   private async handlePhaseResult(
     repoTaskId: string,
     phase: PhaseConfig,
+    stage: StageConfig,
     result: PhaseResult,
   ): Promise<void> {
-    elog(`handlePhaseResult: phase=${phase.id} status=${result.status} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} error=${result.error?.slice(0, 200) ?? 'none'}`)
+    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} error=${result.error?.slice(0, 200) ?? 'none'}`)
     if (result.status === 'failed' || result.status === 'cancelled') {
-      this.taskRepo.updatePhase(repoTaskId, phase.id, result.status)
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, result.status)
       return
     }
 
@@ -653,7 +929,6 @@ export class WorkflowEngine {
     }
     catch { /* non-git worktree */ }
 
-    // completion_check: 校验阶段产出是否达标
     if (phase.completion_check) {
       const task = this.taskRepo.findById(repoTaskId)
       if (task) {
@@ -672,44 +947,96 @@ export class WorkflowEngine {
             role: 'assistant',
             content: reason,
           })
-          this.taskRepo.updatePhase(repoTaskId, phase.id, 'waiting_confirm')
+          this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_confirm')
           return
         }
       }
     }
 
     if (phase.requires_confirm) {
-      this.taskRepo.updatePhase(repoTaskId, phase.id, 'waiting_confirm')
+      this.msgRepo.create({
+        repo_task_id: repoTaskId,
+        phase_id: phase.id,
+        role: 'system',
+        content: `阶段「${phase.name}」已完成，等待确认后继续推进。`,
+      })
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_confirm')
       return
     }
 
-    // 终态事件完成 → completed
     if (phase.is_terminal) {
-      this.taskRepo.updatePhase(repoTaskId, phase.id, 'completed')
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
       return
     }
 
-    const nextPhase = this.getNextPhase(phase.id)
-    if (!nextPhase) {
-      this.taskRepo.updatePhase(repoTaskId, phase.id, 'waiting_event')
+    if (phase.loopable && phase.loop_target) {
+      const loopTarget = findPhaseById(this.config.stages, phase.loop_target)
+      if (loopTarget) {
+        this.taskRepo.updatePhase(repoTaskId, loopTarget.stage.id, loopTarget.phase.id, 'running')
+        await this.executePhase(repoTaskId, loopTarget.phase, loopTarget.stage)
+        return
+      }
+    }
+
+    const next = this.getNextPhase(repoTaskId, stage.id, phase.id)
+    if (!next) {
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_event')
       return
     }
 
-    this.taskRepo.updatePhase(repoTaskId, nextPhase.id, 'running')
-    await this.executePhase(repoTaskId, nextPhase)
+    this.taskRepo.updatePhase(repoTaskId, next.stage.id, next.phase.id, 'running')
+    await this.executePhase(repoTaskId, next.phase, next.stage)
   }
 
-  private getNextPhase(currentPhaseId: string): PhaseConfig | undefined {
-    const idx = this.config.phases.findIndex(p => p.id === currentPhaseId)
-    if (idx === -1 || idx >= this.config.phases.length - 1)
+  // ── 阶段导航 ──
+
+  private getNextPhase(
+    repoTaskId: string,
+    currentStageId: string,
+    currentPhaseId: string,
+  ): { stage: StageConfig, phase: PhaseConfig } | undefined {
+    const loc = findPhaseInStages(this.config.stages, currentStageId, currentPhaseId)
+    if (!loc) return undefined
+
+    const { stageIdx, phaseIdx } = loc
+    const stages = this.config.stages
+    const currentStage = stages[stageIdx]
+
+    for (let pi = phaseIdx + 1; pi < currentStage.phases.length; pi++) {
+      const candidate = currentStage.phases[pi]
+      if (candidate.optional && !this.isPhaseActivated(repoTaskId, candidate.id))
+        continue
+      return { stage: currentStage, phase: candidate }
+    }
+
+    if (stageIdx >= stages.length - 1)
       return undefined
-    return this.config.phases[idx + 1]
+
+    if (!this.checkStageGate(repoTaskId, currentStageId))
+      return undefined
+
+    const nextStage = stages[stageIdx + 1]
+    for (const candidate of nextStage.phases) {
+      if (candidate.optional && !this.isPhaseActivated(repoTaskId, candidate.id))
+        continue
+      return { stage: nextStage, phase: candidate }
+    }
+
+    return undefined
   }
 
-  /**
-   * 判断指定阶段是否已经完成。
-   * 依据：存在该阶段的 commit 记录，或当前阶段索引已超过目标阶段。
-   */
+  private checkStageGate(repoTaskId: string, stageId: string): boolean {
+    const stage = this.config.stages.find(s => s.id === stageId)
+    if (!stage?.gate)
+      return true
+
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return false
+
+    const absOpenspec = join(task.worktree_path, task.openspec_path)
+    return this.evaluateCondition(stage.gate, absOpenspec, existsSync(absOpenspec))
+  }
+
   private hasPhaseCompleted(repoTaskId: string, phaseId: string): boolean {
     if (this.commitRepo.get(repoTaskId, phaseId))
       return true
@@ -717,29 +1044,27 @@ export class WorkflowEngine {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) return false
 
-    const targetIdx = this.config.phases.findIndex(p => p.id === phaseId)
-    const currentIdx = this.config.phases.findIndex(p => p.id === task.current_phase)
+    const target = findPhaseById(this.config.stages, phaseId)
+    const current = findPhaseById(this.config.stages, task.current_phase)
 
-    if (targetIdx === -1) return false
-    if (currentIdx === -1) return true
+    if (!target) return false
+    if (!current) return true
 
-    return currentIdx > targetIdx
+    return (current.stageIdx * 10000 + current.phaseIdx)
+      > (target.stageIdx * 10000 + target.phaseIdx)
   }
 
-  private eventToPhaseConfig(event: EventConfig): PhaseConfig {
-    return {
-      id: event.id,
-      name: event.name,
-      requires_confirm: !!event.confirm_files?.length,
-      provider: event.provider,
-      skill: event.skill,
-      invoke_skills: event.invoke_skills,
-      invoke_commands: event.invoke_commands,
-      tools: event.tools,
-      mcp_config: event.mcp_config,
-      confirm_files: event.confirm_files,
-      script: event.script,
-      is_terminal: event.is_terminal,
+  private collectPhaseIdsAfter(stageIdx: number, phaseIdx: number): string[] {
+    const result: string[] = []
+    const stages = this.config.stages
+    for (let pi = phaseIdx; pi < stages[stageIdx].phases.length; pi++) {
+      result.push(stages[stageIdx].phases[pi].id)
     }
+    for (let si = stageIdx + 1; si < stages.length; si++) {
+      for (const phase of stages[si].phases) {
+        result.push(phase.id)
+      }
+    }
+    return result
   }
 }

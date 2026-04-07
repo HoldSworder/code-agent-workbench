@@ -1,14 +1,11 @@
-import type { PhaseConfig } from './parser'
+import type { GuardrailDefinition, PhaseConfig } from './parser'
 import type { ConversationTurn, InvokedSkill, PhaseContext } from '../providers/types'
 
 export interface ContextBuilderDeps {
   resolveSkillContent: (skillPath: string) => string
+  guardrailDefinitions?: Record<string, GuardrailDefinition>
 }
 
-/**
- * 将 invoke_skills 标识（如 "superpowers:brainstorming"）解析为完整内容。
- * 约定：标识格式为 "pack:skillName"，对应文件路径由 resolveSkillContent 负责。
- */
 function resolveInvokedSkills(
   skillIds: string[] | undefined,
   deps: ContextBuilderDeps,
@@ -22,9 +19,6 @@ function resolveInvokedSkills(
   }))
 }
 
-/**
- * 替换命令模板中的 {{var}} 占位符。
- */
 function interpolateCommands(
   commands: string[] | undefined,
   vars: Record<string, string>,
@@ -35,6 +29,20 @@ function interpolateCommands(
   return commands.map(cmd =>
     cmd.replace(/\{\{(\w+)\}\}/g, (_, key: string) => vars[key] ?? `{{${key}}}`),
   )
+}
+
+function resolveGuardrails(
+  ids: string[] | undefined,
+  definitions?: Record<string, GuardrailDefinition>,
+): string[] | undefined {
+  if (!ids?.length) return undefined
+
+  return ids.map((id) => {
+    const def = definitions?.[id]
+    if (!def) return id
+    const prefix = def.severity === 'hard' ? '🚫 [强制]' : '⚠️ [建议]'
+    return `${prefix} ${def.description}`
+  })
 }
 
 export interface RequirementInfo {
@@ -48,6 +56,8 @@ export interface RequirementInfo {
  */
 export function buildPhaseContext(
   phase: PhaseConfig,
+  stageId: string,
+  stageName: string,
   repoPath: string,
   openspecPath: string,
   branchName: string,
@@ -66,6 +76,8 @@ export function buildPhaseContext(
   }
 
   return {
+    stageId,
+    stageName,
     phaseId: phase.id,
     repoPath,
     openspecPath,
@@ -80,6 +92,6 @@ export function buildPhaseContext(
     conversationHistory,
     invokeSkills: leanMode ? undefined : resolveInvokedSkills(phase.invoke_skills, deps),
     invokeCommands: leanMode ? undefined : interpolateCommands(phase.invoke_commands, templateVars),
-    guardrails: leanMode ? undefined : phase.guardrails,
+    guardrails: leanMode ? undefined : resolveGuardrails(phase.guardrails, deps.guardrailDefinitions),
   }
 }

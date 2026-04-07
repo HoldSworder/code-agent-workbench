@@ -52,7 +52,8 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         repo_id: params.repoId,
         branch_name: 'feature/mock',
         change_id: 'mock',
-        current_phase: 'design',
+        current_stage: 'planning',
+        current_phase: 'task-breakdown',
         phase_status: 'pending',
         openspec_path: '',
         worktree_path: '',
@@ -64,20 +65,108 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'workflow.reset':
     case 'workflow.resetPhase':
     case 'workflow.rollback':
+    case 'workflow.rollbackToStage':
     case 'repo.delete':
+    case 'requirement.delete':
     case 'workflow.confirm':
     case 'workflow.feedback':
     case 'workflow.cancel':
+    case 'workflow.executeRequirementPhase':
+    case 'workflow.setPhaseEnabled':
       return { ok: true } as T
+    case 'workflow.getPhaseEnabledMap':
+      return {} as T
     case 'workflow.phases':
-      return { phases: [
-        { id: 'design', name: '设计探索' },
-        { id: 'plan', name: '任务规划' },
-        { id: 't1-dev', name: 'T1 开发' },
-        { id: 'review', name: '代码审查' },
-        { id: 'verify', name: '验证' },
-        { id: 'mr', name: '创建 MR' },
+      return { stages: [
+        { id: 'planning', name: '任务规划', phases: [
+          { id: 'task-breakdown', name: '任务拆分' },
+          { id: 'task-validate', name: '任务验证' },
+          { id: 'codex-cross-review-planning', name: 'Codex 交叉 Review' },
+        ] },
+        { id: 'development', name: '代码开发', phases: [
+          { id: 'tdd-dev', name: '开发' },
+          { id: 'integration', name: '联调' },
+          { id: 'self-test', name: '代码 Review' },
+          { id: 'codex-cross-review-dev', name: 'Codex 交叉 Review' },
+        ] },
+        { id: 'testing', name: '测试', phases: [
+          { id: 'e2e-test', name: 'E2E 浏览器测试' },
+          { id: 'bug-fix', name: 'Bug 修复' },
+        ] },
+        { id: 'release', name: '上线', phases: [
+          { id: 'archive-deploy', name: '归档与发布' },
+        ] },
       ] } as T
+    case 'workflow.requirementPhases':
+      return { phases: [
+        { id: 'repo-scan', name: '仓库扫描' },
+        { id: 'req-collect', name: '需求采集' },
+        { id: 'design-draft', name: '设计稿获取', optional: true },
+        { id: 'brainstorming', name: '需求对齐' },
+        { id: 'gray-area', name: '灰区讨论', skippable: true },
+        { id: 'spec-create', name: 'Spec 落盘' },
+      ] } as T
+    case 'workflow.getFullConfig':
+      return {
+        name: 'dev-workflow',
+        description: '通用 Spec-Driven 研发工作流（五阶段层级模型）',
+        dependencies: {
+          openspec: { type: 'cli', check: 'which openspec', install_hint: 'npm install -g openspec', commands: ['openspec new change', 'openspec instructions', 'openspec validate', 'openspec status', 'openspec archive'] },
+          superpowers: { type: 'skill-pack', skills: { 'test-driven-development': 'superpowers:test-driven-development', 'verification-before-completion': 'superpowers:verification-before-completion' } },
+        },
+        guardrail_definitions: {
+          no_openspec_write_before_confirm: { description: '在用户明确同意进入下一阶段之前，禁止创建或修改 openspec 文件', severity: 'hard' },
+          no_skip_tdd: { description: '必须严格遵循 TDD 纪律：写测试 → 验证失败 → 最小实现 → 验证通过', severity: 'hard' },
+          no_uncommitted_claim: { description: '不得在没有运行验证命令的情况下声称任务完成', severity: 'soft' },
+        },
+        state_inference: {
+          rules: [
+            { condition: 'no_change_dir', stage: 'planning', phase: 'spec-create', description: '无变更目录 → 从 Spec 落盘开始' },
+            { condition: 'has_proposal_and_specs_no_tasks', stage: 'planning', phase: 'task-breakdown', description: '有 proposal + specs 但无 tasks → 任务拆分' },
+            { condition: 'tasks_has_unchecked', stage: 'development', phase: 'tdd-dev', description: 'tasks.md 有未勾选项 → 代码开发' },
+            { condition: 'tasks_all_checked', stage: 'development', phase: 'self-test', description: 'tasks.md 全部勾选 → 代码 Review' },
+            { condition: 'e2e_report_pass', stage: 'release', phase: 'archive-deploy', description: 'e2e-report 通过 → 可归档发布' },
+          ],
+        },
+        requirement_phases: [
+          { id: 'feishu-requirement', name: '飞书需求获取', provider: 'external-cli', skill: 'skills/feishu-requirement.md', requires_confirm: false },
+        ],
+        stages: [
+          { id: 'planning', name: '任务规划', gate: 'has_tasks', phases: [
+            { id: 'spec-create', name: 'Spec 落盘', provider: 'external-cli', skill: 'skills/frontend/spec-create.md', requires_confirm: true, invoke_commands: ['openspec new change "{{change_id}}"'], guardrails: ['no_openspec_write_before_confirm'], confirm_files: ['{{openspec_path}}/proposal.md', '{{openspec_path}}/specs/*/spec.md'] },
+            { id: 'task-breakdown', name: '任务拆分', provider: 'external-cli', skill: 'skills/frontend/task-breakdown.md', requires_confirm: true, invoke_commands: ['openspec instructions tasks --change "{{change_id}}"'] },
+            { id: 'task-validate', name: '任务验证', provider: 'external-cli', skill: 'skills/frontend/task-validate.md', requires_confirm: false, invoke_commands: ['openspec validate "{{change_id}}"'], confirm_files: ['{{openspec_path}}/tasks.md'] },
+            { id: 'codex-cross-review-planning', name: 'Codex 交叉 Review', provider: 'external-cli', skill: 'skills/frontend/codex-cross-review-planning.md', optional: true, requires_confirm: false },
+          ] },
+          { id: 'development', name: '代码开发', gate: 'tasks_all_checked', phases: [
+            { id: 'tdd-dev', name: '开发', provider: 'external-cli', skill: 'skills/frontend/tdd-dev.md', requires_confirm: false, invoke_skills: ['superpowers:test-driven-development', 'superpowers:verification-before-completion'], guardrails: ['no_skip_tdd', 'no_uncommitted_claim'], completion_check: 'tasks_all_checked' },
+            { id: 'integration', name: '联调', provider: 'external-cli', skill: 'skills/frontend/integration.md', optional: true, requires_confirm: false, triggers: ['后端spec到了', '联调', 'API文档到了'] },
+            { id: 'self-test', name: '代码 Review', provider: 'external-cli', skill: 'skills/frontend/self-test.md', requires_confirm: false, invoke_skills: ['superpowers:verification-before-completion'] },
+            { id: 'codex-cross-review-dev', name: 'Codex 交叉 Review', provider: 'external-cli', skill: 'skills/frontend/codex-cross-review-dev.md', optional: true, requires_confirm: false },
+          ] },
+          { id: 'testing', name: '测试', gate: 'e2e_report_pass', phases: [
+            { id: 'e2e-test', name: 'E2E 浏览器测试', provider: 'external-cli', skill: 'skills/frontend/e2e-test.md', requires_confirm: false, confirm_files: ['{{openspec_path}}/e2e-report.md'] },
+            { id: 'bug-fix', name: 'Bug 修复', provider: 'external-cli', skill: 'skills/frontend/bug-fix.md', optional: true, loopable: true, loop_target: 'e2e-test', requires_confirm: false },
+          ] },
+          { id: 'release', name: '上线', gate: 'archive_complete', phases: [
+            { id: 'archive-deploy', name: '归档与发布', provider: 'external-cli', skill: 'skills/frontend/archive-deploy.md', requires_confirm: true, invoke_commands: ['openspec archive "{{change_id}}" --yes'], is_terminal: true },
+            { id: 'post-deploy-fix', name: '测试环境 Bug 修复', provider: 'external-cli', skill: 'skills/frontend/post-deploy-fix.md', optional: true, loopable: true, loop_target: 'archive-deploy', requires_confirm: false },
+          ] },
+        ],
+        trigger_mapping: [
+          { patterns: ['新需求', '新功能', '开始开发', '做个新feature'], target_stage: 'planning', target_phase: 'task-breakdown' },
+          { patterns: ['继续开发', '接着做', '继续这个需求'], target_stage: 'auto', strategy: 'infer_from_state' },
+          { patterns: ['后端spec', '后端接口文档', 'API文档', '联调'], target_stage: 'development', target_phase: 'integration' },
+          { patterns: ['跑e2e', '浏览器验证', '自动化验证', '实机测试'], target_stage: 'testing', target_phase: 'e2e-test' },
+          { patterns: ['归档', 'archive', '发布测试'], target_stage: 'release', target_phase: 'archive-deploy' },
+        ],
+      } as T
+    case 'workflow.getRawYaml':
+      return { yaml: '# Mock YAML content\nname: dev-workflow\ndescription: 通用 Spec-Driven 研发工作流' } as T
+    case 'workflow.resolveSkill':
+      return { content: `---\nname: ${(params as any).skillPath}\n---\n\n# ${(params as any).skillPath}\n\n这是 Skill 文件的示例内容。在 Tauri 环境下将加载实际的 Skill 文件。\n\n## 执行步骤\n\n1. 分析上下文\n2. 收集信息\n3. 执行任务\n4. 生成产出\n\n## 注意事项\n\n- 遵循护栏规则\n- 确认前置条件\n- 验证产出文件` } as T
+    case 'workflow.saveConfig':
+      return { ok: true } as T
     case 'workflow.checkDependencies':
       return { ok: true, missing: [] } as T
     case 'task.getLiveOutput':
@@ -93,7 +182,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'task.sessionTranscript':
       return { turns: [], format: 'unknown', filePath: null } as T
     case 'repo.sessions':
-      return [] as T
+      return { items: [], total: 0 } as T
     case 'repo.sessionTranscript':
       return { turns: [], format: 'unknown', filePath: null } as T
     case 'settings.get':
@@ -108,6 +197,33 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         { id: 'sonnet-4-thinking', label: 'Sonnet 4 Thinking' },
         { id: 'gpt-5', label: 'GPT-5' },
       ] } as T
+    case 'mcp.list':
+      return [
+        { id: 'mock-2', name: 'feishu-project', description: '飞书项目管理 MCP（体积大）', transport: 'stdio', command: 'npx', args: '["@anthropic/feishu-mcp"]', env: '{}', url: null, headers: '{}', enabled: 1, created_at: '2026-04-01', updated_at: '2026-04-01' },
+      ] as T
+    case 'mcp.getAllBindings':
+      return [
+        { id: 'b1', stage_id: '_requirements', phase_id: 'req-collect', mcp_server_id: 'mock-2' },
+      ] as T
+    case 'mcp.create':
+    case 'mcp.update':
+    case 'mcp.toggle':
+      return { id: `mock-${Date.now()}`, ...params } as T
+    case 'mcp.delete':
+    case 'mcp.setBindings':
+      return { ok: true } as T
+    case 'skill.scan':
+      return { skills: [
+        { id: '/mock/vue', name: 'vue', description: 'Vue.js progressive JavaScript framework.', type: 'skill', dirName: 'vue', realDir: '/mock/vue', skillMdPath: '/mock/vue/SKILL.md', envs: { claude: { installed: true }, codex: { installed: true }, cursor: { installed: true } } },
+        { id: '/mock/antfu', name: 'antfu', description: 'Anthony Fu\'s {Opinionated} preferences and best practices.', type: 'skill', dirName: 'antfu', realDir: '/mock/antfu', skillMdPath: '/mock/antfu/SKILL.md', envs: { claude: { installed: true, isSymlink: true }, codex: { installed: false }, cursor: { installed: false } } },
+        { id: '/mock/dev-workflow', name: 'dev-workflow', description: '前端需求研发工作流编排。', type: 'skill', dirName: 'dev-workflow', realDir: '/mock/dev-workflow', skillMdPath: '/mock/SKILL.md', plugin: { name: 'fe-specflow', displayName: '前端 Specflow 研发工作流', version: '0.0.1', author: 'wenli' }, envs: { claude: { installed: false }, codex: { installed: false }, cursor: { installed: false } } },
+        { id: '/mock/fe-sdd', name: 'fe-sdd', description: 'Spec-Driven 门禁：先澄清再落盘。', type: 'command', dirName: 'fe-sdd', realDir: '/mock/fe-sdd.md', skillMdPath: '/mock/fe-sdd.md', plugin: { name: 'fe-specflow', displayName: '前端 Specflow 研发工作流', version: '0.0.1', author: 'wenli' }, envs: { claude: { installed: false }, codex: { installed: false }, cursor: { installed: false } } },
+      ], envLabels: { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor' } } as T
+    case 'skill.readContent':
+      return { content: '---\nname: mock-skill\ndescription: Mock skill content\n---\n\n# Mock Skill\n\nThis is mock content for development.' } as T
+    case 'skill.enable':
+    case 'skill.disable':
+      return { ok: true } as T
     case 'task.get':
       return {
         id: params.id,
@@ -115,6 +231,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         repo_id: '',
         branch_name: '',
         change_id: '',
+        current_stage: '',
         current_phase: '',
         phase_status: '',
         openspec_path: '',

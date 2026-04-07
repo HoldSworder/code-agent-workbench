@@ -7,7 +7,6 @@ import { getDb } from './db/connection'
 import { RpcServer } from './rpc/server'
 import { registerMethods } from './rpc/methods'
 import { WorkflowEngine } from './workflow/engine'
-import { ScriptProvider } from './providers/script.provider'
 import { ExternalCliProvider } from './providers/cli.provider'
 import { ApiProvider } from './providers/api.provider'
 import { SettingsRepository } from './db/repositories/settings.repo'
@@ -101,23 +100,59 @@ function readdirSafe(dir: string): string[] {
 
 const settingsRepo = new SettingsRepository(db)
 
+const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
+
+function parseSocks5Config(proxyUrl: string): { host: string, port: number } | null {
+  try {
+    const url = new URL(proxyUrl)
+    return { host: url.hostname || '127.0.0.1', port: Number(url.port) || 7890 }
+  }
+  catch {
+    const match = proxyUrl.match(/:(\d+)\s*$/)
+    return match ? { host: '127.0.0.1', port: Number(match[1]) } : null
+  }
+}
+
+const currentCliType = () => settingsRepo.get('agent.provider') ?? 'cursor-cli'
+
 const engine = new WorkflowEngine({
   db,
   workflowYaml,
+  cliType: currentCliType(),
   resolveProvider: (providerType, options) => {
     const provider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
     const model = settingsRepo.get('agent.model') ?? undefined
     const binaryPath = settingsRepo.get('agent.binaryPath') ?? undefined
+    const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
+    const proxyUrl = proxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
+
+    if (proxyUrl) {
+      process.env.HTTP_PROXY = proxyUrl
+      process.env.HTTPS_PROXY = proxyUrl
+      process.env.ALL_PROXY = proxyUrl
+    }
+    else {
+      delete process.env.HTTP_PROXY
+      delete process.env.HTTPS_PROXY
+      delete process.env.ALL_PROXY
+    }
+
+    const sniProxyPatch = (() => {
+      if (!proxyUrl || !existsSync(sniPatchPath)) return undefined
+      const socks5 = parseSocks5Config(proxyUrl)
+      if (!socks5) return undefined
+      return { scriptPath: sniPatchPath, socks5Host: socks5.host, socks5Port: socks5.port }
+    })()
 
     switch (providerType) {
-      case 'script':
-        return new ScriptProvider('echo "placeholder"')
       case 'external-cli':
         return new ExternalCliProvider({
           type: provider as 'cursor-cli' | 'claude-code' | 'codex',
           model,
           binaryPath,
           resumeSessionId: options?.resumeSessionId,
+          proxyUrl,
+          sniProxyPatch,
         })
       case 'api':
         return new ApiProvider({
@@ -132,8 +167,10 @@ const engine = new WorkflowEngine({
   resolveSkillContent,
 })
 
+engine.recoverMcpBackups()
+
 const rpcServer = new RpcServer()
-registerMethods(rpcServer, db, engine)
+registerMethods(rpcServer, db, engine, workflowPath)
 
 const rl = createInterface({ input: process.stdin })
 rl.on('line', async (line) => {

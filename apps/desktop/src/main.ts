@@ -10,6 +10,9 @@ const router = createRouter({
     { path: '/', component: () => import('./views/Dashboard.vue') },
     { path: '/repo/:id', component: () => import('./views/RepoView.vue') },
     { path: '/repo/:repoId/task/:taskId', component: () => import('./views/TaskDetail.vue') },
+    { path: '/workflow', component: () => import('./views/WorkflowEditor.vue') },
+    { path: '/skills', component: () => import('./views/SkillsView.vue') },
+    { path: '/mcp', component: () => import('./views/McpView.vue') },
     { path: '/settings', component: () => import('./views/Settings.vue') },
   ],
 })

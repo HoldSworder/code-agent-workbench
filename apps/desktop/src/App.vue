@@ -28,7 +28,7 @@ onMounted(async () => {
             : 'text-gray-600 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5'"
         >
           <div class="i-carbon-dashboard w-4 h-4 opacity-60" />
-          总看板
+          需求看板
         </router-link>
 
         <div class="px-3 mt-5 mb-1.5 text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-widest">
@@ -46,7 +46,31 @@ onMounted(async () => {
         </router-link>
       </div>
 
-      <div class="px-2 pb-3">
+      <div class="px-2 pb-3 space-y-0.5">
+        <router-link
+          to="/workflow"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"
+          active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"
+        >
+          <div class="i-carbon-flow w-4 h-4 opacity-60" />
+          工作流
+        </router-link>
+        <router-link
+          to="/skills"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"
+          active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"
+        >
+          <div class="i-carbon-skill-level-advanced w-4 h-4 opacity-60" />
+          Skills
+        </router-link>
+        <router-link
+          to="/mcp"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"
+          active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"
+        >
+          <div class="i-carbon-plug w-4 h-4 opacity-60" />
+          MCP
+        </router-link>
         <router-link
           to="/settings"
           class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"

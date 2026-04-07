@@ -1,4 +1,12 @@
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import {
+  readFileSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -533,6 +541,99 @@ export interface SessionSummary {
   provider: string
   modifiedAt: string
   sizeBytes: number
+  /** 首轮用户消息摘要，便于列表中识别会话主题 */
+  firstTurnPreview: string | null
+}
+
+const PREVIEW_HEAD_BYTES = 96 * 1024
+
+function readFileHeadSync(filePath: string, maxBytes: number): string {
+  let fd: number
+  try {
+    fd = openSync(filePath, 'r')
+  }
+  catch {
+    return ''
+  }
+  try {
+    const buf = Buffer.alloc(Math.min(maxBytes, 512 * 1024))
+    const n = readSync(fd, buf, 0, buf.length, 0)
+    return buf.subarray(0, n).toString('utf-8')
+  }
+  catch {
+    return ''
+  }
+  finally {
+    try {
+      closeSync(fd)
+    }
+    catch { /* ignore */ }
+  }
+}
+
+function tryExtractFirstUserTextFromLine(obj: Record<string, any>): string | null {
+  // Codex (new): item.completed + user message
+  if (obj.type === 'item.completed' && obj.item?.type === 'message' && obj.item?.role === 'user') {
+    const content = obj.item.content ?? []
+    if (Array.isArray(content)) {
+      const textParts = content
+        .filter((b: any) => b.type === 'input_text')
+        .map((b: any) => b.text ?? '')
+      const userText = textParts.join('\n').trim()
+      if (userText) return userText
+    }
+  }
+
+  // Codex (legacy): event_msg user_message
+  if (obj.type === 'event_msg' && obj.payload?.type === 'user_message') {
+    const text = String(obj.payload.message ?? '').trim()
+    if (text) return text
+  }
+
+  // Claude Code
+  if (obj.type === 'user') {
+    const content = obj.message?.content ?? obj.content
+    if (isToolResultOnly(content)) return null
+    const text = extractText(content).trim()
+    if (text) return text
+  }
+
+  // Cursor (no top-level type)
+  if (!obj.type && (obj.role === 'user' || obj.message?.role === 'user')) {
+    const content = obj.message?.content ?? obj.content
+    if (isToolResultOnly(content)) return null
+    const text = extractText(content).trim()
+    if (text) return text
+  }
+
+  return null
+}
+
+/** 从 transcript 文件头部解析首轮用户消息，避免整文件读取 */
+export function extractFirstTurnPreview(filePath: string, maxChars = 240): string | null {
+  try {
+    const head = readFileHeadSync(filePath, PREVIEW_HEAD_BYTES)
+    if (!head.trim()) return null
+    for (const line of head.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      let obj: Record<string, any>
+      try {
+        obj = JSON.parse(trimmed)
+      }
+      catch {
+        continue
+      }
+      const text = tryExtractFirstUserTextFromLine(obj)
+      if (text) {
+        const oneLine = text.replace(/\s+/g, ' ').trim()
+        if (oneLine.length <= maxChars) return oneLine
+        return `${oneLine.slice(0, Math.max(0, maxChars - 1))}…`
+      }
+    }
+  }
+  catch { /* ignore */ }
+  return null
 }
 
 function pathToProjectKey(localPath: string): string {
@@ -586,6 +687,7 @@ export function listSessionsForRepo(localPath: string): SessionSummary[] {
               provider: 'cursor',
               modifiedAt: st.mtime.toISOString(),
               sizeBytes: st.size,
+              firstTurnPreview: extractFirstTurnPreview(filePath),
             })
           }
           catch { /* skip */ }
@@ -613,6 +715,7 @@ export function listSessionsForRepo(localPath: string): SessionSummary[] {
             provider: 'claude-code',
             modifiedAt: st.mtime.toISOString(),
             sizeBytes: st.size,
+            firstTurnPreview: extractFirstTurnPreview(filePath),
           })
         }
         catch { /* skip */ }

@@ -16,6 +16,12 @@ export interface CliProviderConfig {
   timeoutMs?: number
   resumeSessionId?: string
   maxRetries?: number
+  proxyUrl?: string
+  sniProxyPatch?: {
+    scriptPath: string
+    socks5Host: string
+    socks5Port: number
+  }
 }
 
 const DEFAULT_ACTIVITY_TIMEOUT_MS = 3 * 60 * 1000 // no stdout at all for 3 min → kill
@@ -258,7 +264,7 @@ export class ExternalCliProvider implements AgentProvider {
   private buildSpawnArgs(cwd: string, prompt: string): { args: string[], stdinData: string | null } {
     switch (this.config.type) {
       case 'cursor-cli': {
-        const args = ['agent', '-p', '--output-format', 'stream-json', '--stream-partial-output', '--yolo', '--trust', '--workspace', cwd]
+        const args = ['-p', '--output-format', 'stream-json', '--stream-partial-output', '--yolo', '--trust', '--workspace', cwd]
         if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         if (this.config.resumeSessionId)
@@ -284,13 +290,46 @@ export class ExternalCliProvider implements AgentProvider {
 
   private buildCleanEnv(): Record<string, string> {
     const env: Record<string, string> = {}
+    const parentNodeOptions = process.env.NODE_OPTIONS ?? ''
+    const hasSniPatchInParent = parentNodeOptions.includes('agent-socks5-patch')
+
     for (const [k, v] of Object.entries(process.env)) {
       if (v == null) continue
-      if (k === 'NODE_OPTIONS') continue
+      if (k === 'NODE_OPTIONS' && !hasSniPatchInParent) continue
       if (k.startsWith('npm_')) continue
       if (k.startsWith('ELECTRON_')) continue
       env[k] = v
     }
+
+    const patch = this.config.sniProxyPatch
+    if (patch) {
+      env.NODE_OPTIONS = `--require "${patch.scriptPath}"`
+      env.AGENT_SOCKS5_HOST = patch.socks5Host
+      env.AGENT_SOCKS5_PORT = String(patch.socks5Port)
+      delete env.HTTP_PROXY
+      delete env.HTTPS_PROXY
+      delete env.ALL_PROXY
+      delete env.http_proxy
+      delete env.https_proxy
+      delete env.all_proxy
+    }
+    else if (hasSniPatchInParent) {
+      delete env.HTTP_PROXY
+      delete env.HTTPS_PROXY
+      delete env.ALL_PROXY
+      delete env.http_proxy
+      delete env.https_proxy
+      delete env.all_proxy
+    }
+    else if (this.config.proxyUrl) {
+      env.HTTP_PROXY = this.config.proxyUrl
+      env.HTTPS_PROXY = this.config.proxyUrl
+      env.ALL_PROXY = this.config.proxyUrl
+      env.http_proxy = this.config.proxyUrl
+      env.https_proxy = this.config.proxyUrl
+      env.all_proxy = this.config.proxyUrl
+    }
+
     return env
   }
 
@@ -308,63 +347,69 @@ export class ExternalCliProvider implements AgentProvider {
     if (this.config.resumeSessionId && context.userMessage)
       return context.userMessage
 
-    const sections: string[] = []
     const canReadFiles = this.config.type === 'cursor-cli' || this.config.type === 'claude-code'
-
-    if (context.requirementTitle) {
-      let reqSection = `## 需求\n\n**${context.requirementTitle}**`
-      if (context.requirementDescription)
-        reqSection += `\n\n${context.requirementDescription}`
-      sections.push(reqSection)
-    }
-
-    if (context.skillContent)
-      sections.push(context.skillContent)
-
-    if (context.invokeSkills?.length) {
-      if (canReadFiles) {
-        sections.push('---\n\n## 必须调用的外部技能\n\n请先读取以下技能文件，然后按其中的指令执行：')
-        for (const skill of context.invokeSkills)
-          sections.push(`- \`${skill.id}\`: 请用工具读取此技能的完整内容后执行`)
-      }
-      else {
-        sections.push('---\n\n## 必须调用的外部技能')
-        for (const skill of context.invokeSkills)
-          sections.push(`### INVOKE SKILL: \`${skill.id}\`\n\n${skill.content}`)
-      }
-    }
-
-    if (context.invokeCommands?.length) {
-      sections.push('---\n\n## 必须执行的 CLI 命令\n\n以下命令由你直接在终端执行：')
-      sections.push(context.invokeCommands.map(cmd => `\`\`\`bash\n${cmd}\n\`\`\``).join('\n\n'))
-    }
-
-    if (context.guardrails?.length)
-      sections.push(`---\n\n## 护栏规则\n\n${context.guardrails.map(g => `- ${g}`).join('\n')}`)
-
-    if (context.conversationHistory?.length) {
-      sections.push('---\n\n## 历史对话')
-      for (const turn of context.conversationHistory) {
-        const prefix = turn.role === 'user' ? '**用户**' : '**助手**'
-        sections.push(`${prefix}:\n${turn.content}`)
-      }
-    }
-
-    if (context.userMessage)
-      sections.push(`---\n\n## 用户最新反馈\n${context.userMessage}`)
-
-    sections.push(`---\n\n## 上下文\n- 工作目录: ${context.repoPath}\n- OpenSpec: ${context.openspecPath}\n- 分支: ${context.branchName}\n- change-id: ${context.changeId ?? 'N/A'}`)
-
-    return sections.join('\n\n')
+    return buildPromptFromContext(context, canReadFiles)
   }
 
   private defaultBinary(): string {
     return {
       'claude-code': 'claude',
-      'cursor-cli': 'cursor',
+      'cursor-cli': 'agent',
       'codex': 'codex',
     }[this.config.type]
   }
+}
+
+// ── Prompt builder (exported for preview) ──
+
+export function buildPromptFromContext(context: PhaseContext, canReadFiles = true): string {
+  const sections: string[] = []
+
+  if (context.requirementTitle) {
+    let reqSection = `## 需求\n\n**${context.requirementTitle}**`
+    if (context.requirementDescription)
+      reqSection += `\n\n${context.requirementDescription}`
+    sections.push(reqSection)
+  }
+
+  if (context.skillContent)
+    sections.push(context.skillContent)
+
+  if (context.invokeSkills?.length) {
+    if (canReadFiles) {
+      sections.push('---\n\n## 必须调用的外部技能\n\n请先读取以下技能文件，然后按其中的指令执行：')
+      for (const skill of context.invokeSkills)
+        sections.push(`- \`${skill.id}\`: 请用工具读取此技能的完整内容后执行`)
+    }
+    else {
+      sections.push('---\n\n## 必须调用的外部技能')
+      for (const skill of context.invokeSkills)
+        sections.push(`### INVOKE SKILL: \`${skill.id}\`\n\n${skill.content}`)
+    }
+  }
+
+  if (context.invokeCommands?.length) {
+    sections.push('---\n\n## 必须执行的 CLI 命令\n\n以下命令由你直接在终端执行：')
+    sections.push(context.invokeCommands.map(cmd => `\`\`\`bash\n${cmd}\n\`\`\``).join('\n\n'))
+  }
+
+  if (context.guardrails?.length)
+    sections.push(`---\n\n## 护栏规则\n\n${context.guardrails.map(g => `- ${g}`).join('\n')}`)
+
+  if (context.conversationHistory?.length) {
+    sections.push('---\n\n## 历史对话')
+    for (const turn of context.conversationHistory) {
+      const prefix = turn.role === 'user' ? '**用户**' : '**助手**'
+      sections.push(`${prefix}:\n${turn.content}`)
+    }
+  }
+
+  if (context.userMessage)
+    sections.push(`---\n\n## 用户最新反馈\n${context.userMessage}`)
+
+  sections.push(`---\n\n## 上下文\n- 工作目录: ${context.repoPath}\n- OpenSpec: ${context.openspecPath}\n- 分支: ${context.branchName}\n- change-id: ${context.changeId ?? 'N/A'}`)
+
+  return sections.join('\n\n')
 }
 
 // ── Pure parsing helpers ──

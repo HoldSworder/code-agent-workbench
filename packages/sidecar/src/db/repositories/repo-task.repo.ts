@@ -7,6 +7,7 @@ export interface RepoTask {
   repo_id: string
   branch_name: string
   change_id: string
+  current_stage: string
   current_phase: string
   phase_status: string
   openspec_path: string
@@ -75,15 +76,30 @@ export class RepoTaskRepository {
       .all(requirementId) as RepoTask[]
   }
 
-  updatePhase(id: string, currentPhase: string, phaseStatus: string): void {
+  updatePhase(id: string, currentStage: string, currentPhase: string, phaseStatus: string): void {
     this.db
       .prepare(
         `
       UPDATE repo_tasks
-      SET current_phase = ?, phase_status = ?, updated_at = datetime('now')
+      SET current_stage = ?, current_phase = ?, phase_status = ?, updated_at = datetime('now')
       WHERE id = ?
     `,
       )
-      .run(currentPhase, phaseStatus, id)
+      .run(currentStage, currentPhase, phaseStatus, id)
+  }
+
+  delete(id: string): void {
+    const deleteRelated = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM phase_commits WHERE repo_task_id = ?').run(id)
+      this.db.prepare('DELETE FROM conversation_messages WHERE repo_task_id = ?').run(id)
+      this.db.prepare('DELETE FROM agent_runs WHERE repo_task_id = ?').run(id)
+      this.db.prepare('DELETE FROM repo_tasks WHERE id = ?').run(id)
+    })
+    deleteRelated()
+  }
+
+  deleteByRequirementId(requirementId: string): void {
+    const taskIds = this.findByRequirementId(requirementId).map(t => t.id)
+    for (const id of taskIds) this.delete(id)
   }
 }

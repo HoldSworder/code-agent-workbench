@@ -1,34 +1,55 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTasksStore } from '../stores/tasks'
 import { useRequirementsStore } from '../stores/requirements'
 import { useReposStore } from '../stores/repos'
 import { rpc } from '../composables/use-sidecar'
+import CursorTerminal from '../components/CursorTerminal.vue'
 import MarkdownIt from 'markdown-it'
+
+const SESSION_PAGE = 30
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
 
 const route = useRoute()
 const router = useRouter()
 
-const repoId = route.params.id as string
+const repoId = computed(() => route.params.id as string)
 const tasksStore = useTasksStore()
 const requirementsStore = useRequirementsStore()
 const reposStore = useReposStore()
 
-const phaseLabel: Record<string, string> = {
-  'design': '设计探索',
-  'plan': '任务规划',
-  't1-dev': 'T1 开发',
-  'review': '代码审查',
-  'verify': '验证',
-  'mr': '创建 MR',
-  'backend-spec-arrived': '后端联调',
-  'test-spec-arrived': '测试 Spec',
-  'e2e-verify': 'E2E 验证',
-  'archive': '归档',
+interface WorkflowPhase {
+  id: string
+  name: string
 }
+interface WorkflowStage {
+  id: string
+  name: string
+  phases: WorkflowPhase[]
+}
+const workflowStages = ref<WorkflowStage[]>([])
+
+const phaseNameMap = computed(() => {
+  const map: Record<string, string> = {}
+  for (const stage of workflowStages.value) {
+    for (const phase of stage.phases) {
+      map[phase.id] = phase.name
+    }
+  }
+  return map
+})
+
+const stageNameMap = computed(() => {
+  const map: Record<string, string> = {}
+  for (const stage of workflowStages.value) {
+    for (const phase of stage.phases) {
+      map[phase.id] = stage.name
+    }
+  }
+  return map
+})
 
 const statusConfig: Record<string, { label: string, dotClass: string, badgeClass: string }> = {
   running: {
@@ -64,7 +85,7 @@ const statusConfig: Record<string, { label: string, dotClass: string, badgeClass
 }
 
 const repoName = computed(() =>
-  reposStore.repos.find(r => r.id === repoId)?.name ?? repoId,
+  reposStore.repos.find(r => r.id === repoId.value)?.name ?? repoId.value,
 )
 
 const requirementById = computed(() =>
@@ -111,7 +132,7 @@ function requirementTitle(reqId: string) {
 }
 
 function openTask(taskId: string) {
-  router.push(`/repo/${repoId}/task/${taskId}`)
+  router.push(`/repo/${repoId.value}/task/${taskId}`)
 }
 
 // ── Sessions ──
@@ -122,6 +143,7 @@ interface SessionSummary {
   provider: string
   modifiedAt: string
   sizeBytes: number
+  firstTurnPreview?: string | null
 }
 
 interface ToolCall {
@@ -148,7 +170,9 @@ interface TranscriptTurn {
 }
 
 const sessions = ref<SessionSummary[]>([])
+const sessionsTotal = ref(0)
 const loadingSessions = ref(false)
+const loadingMoreSessions = ref(false)
 const showSessionDetail = ref(false)
 const selectedSession = ref<SessionSummary | null>(null)
 const transcriptTurns = ref<TranscriptTurn[]>([])
@@ -157,14 +181,53 @@ const transcriptFilePath = ref<string | null>(null)
 const loadingTranscript = ref(false)
 const expandedBlocks = ref<Set<string>>(new Set())
 
-async function loadSessions() {
-  loadingSessions.value = true
-  try {
-    const res = await rpc<SessionSummary[]>('repo.sessions', { repoId })
-    sessions.value = res ?? []
+async function loadSessions(reset = true) {
+  if (reset) {
+    loadingSessions.value = true
   }
-  catch { sessions.value = [] }
-  finally { loadingSessions.value = false }
+  else {
+    if (loadingMoreSessions.value || loadingSessions.value) return
+    if (sessions.value.length >= sessionsTotal.value) return
+    loadingMoreSessions.value = true
+  }
+  try {
+    const offset = reset ? 0 : sessions.value.length
+    const res = await rpc<{ items: SessionSummary[], total: number }>('repo.sessions', {
+      repoId: repoId.value,
+      limit: SESSION_PAGE,
+      offset,
+    })
+    const items = res?.items ?? []
+    const total = res?.total ?? 0
+    sessionsTotal.value = total
+    if (reset)
+      sessions.value = items
+    else
+      sessions.value = [...sessions.value, ...items]
+  }
+  catch {
+    if (reset) {
+      sessions.value = []
+      sessionsTotal.value = 0
+    }
+  }
+  finally {
+    loadingSessions.value = false
+    loadingMoreSessions.value = false
+  }
+}
+
+async function loadMoreSessions() {
+  await loadSessions(false)
+}
+
+function onSessionsScroll(e: Event) {
+  const el = e.target as HTMLElement
+  if (loadingMoreSessions.value || loadingSessions.value) return
+  if (sessions.value.length >= sessionsTotal.value) return
+  const threshold = 120
+  if (el.scrollHeight - el.scrollTop - el.clientHeight < threshold)
+    void loadMoreSessions()
 }
 
 async function openSession(session: SessionSummary) {
@@ -229,18 +292,82 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+const providerLabel: Record<string, string> = {
+  cursor: 'Cursor',
+  'claude-code': 'Claude',
+  codex: 'Codex',
+}
+
+function sessionProviderLabel(provider: string): string {
+  return providerLabel[provider] ?? provider
+}
+
+// ── Terminal panel ──
+
+const showTerminal = ref(false)
+const terminalHeight = ref(320)
+const isDraggingResize = ref(false)
+const terminalRef = ref<InstanceType<typeof CursorTerminal>>()
+
+const repoLocalPath = computed(() =>
+  reposStore.repos.find(r => r.id === repoId.value)?.local_path ?? '',
+)
+
+function toggleTerminal() {
+  showTerminal.value = !showTerminal.value
+}
+
+function onResizeStart(e: MouseEvent) {
+  e.preventDefault()
+  isDraggingResize.value = true
+  const startY = e.clientY
+  const startH = terminalHeight.value
+
+  const onMove = (ev: MouseEvent) => {
+    const delta = startY - ev.clientY
+    terminalHeight.value = Math.max(150, Math.min(startH + delta, window.innerHeight - 200))
+  }
+  const onUp = () => {
+    isDraggingResize.value = false
+    document.removeEventListener('mousemove', onMove)
+    document.removeEventListener('mouseup', onUp)
+  }
+  document.addEventListener('mousemove', onMove)
+  document.addEventListener('mouseup', onUp)
+}
+
 // ── Lifecycle ──
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer)
+  pollTimer = setInterval(() => tasksStore.fetchByRepo(repoId.value), 5000)
+}
+
+async function loadRepoData() {
+  closeSessionDetail()
+  await Promise.all([
+    tasksStore.fetchByRepo(repoId.value),
+    loadSessions(true),
+  ])
+  startPolling()
+}
 
 onMounted(async () => {
   await Promise.all([
     requirementsStore.fetchAll(),
     reposStore.fetchAll(),
-    tasksStore.fetchByRepo(repoId),
-    loadSessions(),
+    rpc<{ stages: WorkflowStage[] }>('workflow.phases').then((res) => {
+      if (res?.stages)
+        workflowStages.value = res.stages
+    }),
   ])
-  pollTimer = setInterval(() => tasksStore.fetchByRepo(repoId), 5000)
+  await loadRepoData()
+})
+
+watch(() => repoId.value, () => {
+  loadRepoData()
 })
 
 onUnmounted(() => {
@@ -250,11 +377,11 @@ onUnmounted(() => {
 async function retryTask(taskId: string) {
   try {
     await tasksStore.retry(taskId)
-    await tasksStore.fetchByRepo(repoId)
+    await tasksStore.fetchByRepo(repoId.value)
 
     for (let i = 0; i < 8; i++) {
       await new Promise(r => setTimeout(r, 2000))
-      await tasksStore.fetchByRepo(repoId)
+      await tasksStore.fetchByRepo(repoId.value)
       const task = tasksStore.tasks.find(t => t.id === taskId)
       if (!task || task.phase_status !== 'running')
         break
@@ -265,7 +392,7 @@ async function retryTask(taskId: string) {
   }
   finally {
     tasksStore.finishRetry(taskId)
-    await tasksStore.fetchByRepo(repoId)
+    await tasksStore.fetchByRepo(repoId.value)
   }
 }
 </script>
@@ -280,15 +407,27 @@ async function retryTask(taskId: string) {
       >
         <div class="i-carbon-arrow-left w-4 h-4 text-gray-400" />
       </button>
-      <div>
+      <div class="flex-1 min-w-0">
         <h1 class="text-[15px] font-semibold tracking-tight">{{ repoName }}</h1>
         <p class="text-[12px] text-gray-400 mt-0.5">
           {{ activeTasks.length }} 个运行中 · {{ historyTasks.length }} 个已结束
         </p>
       </div>
+
+      <button
+        class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-150"
+        :class="showTerminal
+          ? 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400'
+          : 'text-gray-400 hover:text-gray-600 hover:bg-gray-100 dark:hover:text-gray-300 dark:hover:bg-white/5'"
+        @click="toggleTerminal"
+      >
+        <div class="i-carbon-terminal w-3.5 h-3.5" />
+        Cursor Agent
+      </button>
     </div>
 
-    <div class="flex-1 overflow-hidden flex gap-0">
+    <div class="flex-1 overflow-hidden flex flex-col">
+      <div class="flex-1 min-h-0 flex gap-0">
       <!-- Left column: Pipeline (进行中 + 历史任务) -->
       <div class="flex-1 min-w-0 overflow-y-auto px-5 py-5 border-r border-gray-100 dark:border-white/[0.04]">
         <div class="flex items-center gap-2 mb-4">
@@ -330,7 +469,7 @@ async function retryTask(taskId: string) {
                         class="shrink-0 px-2 py-0.5 rounded-md text-[10px] font-medium"
                         :class="statusConfig[task.phase_status]?.badgeClass"
                       >
-                        {{ phaseLabel[task.current_phase] ?? task.current_phase }} · {{ statusConfig[task.phase_status]?.label ?? task.phase_status }}
+                        {{ stageNameMap[task.current_phase] ? `${stageNameMap[task.current_phase]} · ` : '' }}{{ phaseNameMap[task.current_phase] ?? task.current_phase }} · {{ statusConfig[task.phase_status]?.label ?? task.phase_status }}
                       </span>
                     </div>
                     <div class="flex items-center gap-3 text-[11px] text-gray-400">
@@ -415,17 +554,20 @@ async function retryTask(taskId: string) {
       </div>
 
       <!-- Right column: Agent Sessions -->
-      <div class="flex-1 min-w-0 overflow-y-auto px-5 py-5">
+      <div
+        class="flex-1 min-w-0 overflow-y-auto px-5 py-5"
+        @scroll.passive="onSessionsScroll"
+      >
         <div class="flex items-center gap-2 mb-4">
           <div class="i-carbon-data-base w-3.5 h-3.5 text-gray-400 opacity-60" />
           <h2 class="text-[13px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Agent 会话</h2>
           <span class="text-[11px] text-gray-400 bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 rounded-md tabular-nums">
-            {{ sessions.length }}
+            {{ sessionsTotal > 0 ? `${sessions.length} / ${sessionsTotal}` : sessions.length }}
           </span>
           <button
             class="ml-auto p-1 rounded hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
             title="刷新"
-            @click="loadSessions"
+            @click="loadSessions(true)"
           >
             <div class="i-carbon-renew w-3.5 h-3.5 text-gray-400" :class="loadingSessions && 'animate-spin'" />
           </button>
@@ -436,32 +578,65 @@ async function retryTask(taskId: string) {
           扫描会话文件...
         </div>
 
-        <div v-else-if="sessions.length > 0" class="space-y-1.5">
+        <div v-else-if="sessions.length > 0" class="space-y-3">
           <div
             v-for="session in sessions"
             :key="session.sessionId"
-            class="group flex items-center gap-3 px-3.5 py-2.5 bg-white dark:bg-[#28282c] rounded-lg border border-gray-100 dark:border-white/[0.04] transition-all cursor-pointer hover:shadow-sm hover:border-gray-200 dark:hover:border-white/[0.08]"
+            class="group flex gap-3 p-4 bg-white dark:bg-[#28282c] rounded-xl border border-gray-100 dark:border-white/[0.04] transition-all cursor-pointer hover:shadow-md hover:shadow-black/[0.06] dark:hover:shadow-none hover:border-gray-200 dark:hover:border-white/[0.1]"
             @click="openSession(session)"
           >
-            <div class="i-carbon-chat w-3.5 h-3.5 text-gray-400 shrink-0" />
+            <div class="shrink-0 w-9 h-9 rounded-lg bg-indigo-50 dark:bg-indigo-500/10 flex items-center justify-center">
+              <div class="i-carbon-chat w-4 h-4 text-indigo-500 dark:text-indigo-400" />
+            </div>
             <div class="flex-1 min-w-0">
-              <p class="text-[12px] font-mono text-gray-700 dark:text-gray-200 truncate">
-                {{ session.sessionId }}
-              </p>
-              <div class="flex items-center gap-2 mt-0.5">
-                <span class="px-1.5 py-0.5 rounded text-[9px] font-medium bg-gray-100 dark:bg-white/5 text-gray-500 dark:text-gray-400">
-                  {{ session.provider }}
+              <div class="flex items-start gap-2">
+                <p class="text-[13px] font-mono text-gray-800 dark:text-gray-100 truncate flex-1 min-w-0 leading-snug">
+                  {{ session.sessionId }}
+                </p>
+                <div class="i-carbon-chevron-right w-4 h-4 text-gray-300 dark:text-gray-600 shrink-0 mt-0.5 opacity-40 group-hover:opacity-100 transition-opacity" />
+              </div>
+              <div class="mt-2.5">
+                <p class="text-[10px] font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wide mb-1">
+                  首轮对话
+                </p>
+                <p
+                  v-if="session.firstTurnPreview"
+                  class="text-[12px] text-gray-700 dark:text-gray-300 leading-relaxed line-clamp-3"
+                >
+                  {{ session.firstTurnPreview }}
+                </p>
+                <p
+                  v-else
+                  class="text-[12px] text-gray-400 dark:text-gray-600 italic"
+                >
+                  （无法从文件头解析首轮内容）
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mt-3 text-[11px] text-gray-500 dark:text-gray-500">
+                <span class="px-2 py-0.5 rounded-md font-medium bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400">
+                  {{ sessionProviderLabel(session.provider) }}
                 </span>
-                <span class="text-[10px] text-gray-400 tabular-nums">
-                  {{ formatFileSize(session.sizeBytes) }}
-                </span>
-                <span class="text-[10px] text-gray-400 tabular-nums">
-                  {{ formatDate(session.modifiedAt) }}
-                </span>
+                <span class="tabular-nums">{{ formatFileSize(session.sizeBytes) }}</span>
+                <span class="text-gray-400 dark:text-gray-600">·</span>
+                <span class="tabular-nums text-gray-400 dark:text-gray-500">{{ formatDate(session.modifiedAt) }}</span>
+                <span class="text-gray-400 dark:text-gray-600">·</span>
+                <span class="tabular-nums text-gray-400 dark:text-gray-500">{{ timeAgo(session.modifiedAt) }}</span>
               </div>
             </div>
-            <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
           </div>
+
+          <div v-if="loadingMoreSessions" class="flex items-center justify-center py-3 text-[12px] text-gray-400">
+            <div class="i-carbon-circle-dash w-4 h-4 animate-spin mr-2" />
+            加载更多会话...
+          </div>
+          <button
+            v-else-if="sessions.length < sessionsTotal"
+            type="button"
+            class="w-full py-2.5 rounded-lg text-[12px] text-gray-500 dark:text-gray-400 border border-dashed border-gray-200 dark:border-white/10 hover:bg-gray-50 dark:hover:bg-white/[0.03] transition-colors"
+            @click="loadMoreSessions"
+          >
+            加载更多（{{ sessions.length }} / {{ sessionsTotal }}）
+          </button>
         </div>
 
         <div
@@ -470,6 +645,31 @@ async function retryTask(taskId: string) {
         >
           <div class="i-carbon-data-base w-8 h-8 mb-2 opacity-30" />
           <p class="text-[13px]">未找到该仓库的 Agent 会话文件</p>
+        </div>
+      </div>
+      </div>
+
+      <!-- Terminal panel -->
+      <div
+        v-if="showTerminal && repoLocalPath"
+        class="shrink-0 border-t border-gray-200 dark:border-white/[0.06]"
+        :style="{ height: `${terminalHeight}px` }"
+      >
+        <!-- Resize handle -->
+        <div
+          class="h-1 cursor-row-resize group flex items-center justify-center hover:bg-indigo-500/20 transition-colors"
+          :class="isDraggingResize && 'bg-indigo-500/30'"
+          @mousedown="onResizeStart"
+        >
+          <div class="w-8 h-0.5 rounded-full bg-gray-300 dark:bg-white/10 group-hover:bg-indigo-400 transition-colors" />
+        </div>
+
+        <div class="h-[calc(100%-4px)]">
+          <CursorTerminal
+            ref="terminalRef"
+            :repo-path="repoLocalPath"
+            :visible="showTerminal"
+          />
         </div>
       </div>
     </div>

@@ -8,8 +8,16 @@ export interface Requirement {
   description: string
   source: string
   source_url: string | null
+  doc_url: string | null
   status: string
   created_at: string
+}
+
+export interface CreateRequirementInput {
+  description: string
+  source: string
+  source_url?: string
+  doc_url?: string
 }
 
 export const useRequirementsStore = defineStore('requirements', () => {
@@ -22,11 +30,16 @@ export const useRequirementsStore = defineStore('requirements', () => {
     finally { loading.value = false }
   }
 
-  async function create(input: { title: string, description: string, source: string, source_url?: string }) {
+  async function create(input: CreateRequirementInput) {
     const req = await rpc<Requirement>('requirement.create', input)
     requirements.value.unshift(req)
     return req
   }
 
-  return { requirements, loading, fetchAll, create }
+  async function remove(id: string) {
+    await rpc<{ ok: boolean }>('requirement.delete', { id })
+    requirements.value = requirements.value.filter(r => r.id !== id)
+  }
+
+  return { requirements, loading, fetchAll, create, remove }
 })
