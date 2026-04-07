@@ -922,12 +922,45 @@ async function handleCancel() {
                   </div>
                 </div>
 
-                <!-- System notification bubble -->
-                <div v-else-if="msg.role === 'system'" class="flex justify-center">
-                  <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-50 dark:bg-amber-500/[0.06] border border-amber-200/50 dark:border-amber-500/15">
-                    <div class="i-carbon-warning-alt w-3.5 h-3.5 text-amber-500 shrink-0" />
-                    <span class="text-[12px] text-amber-700 dark:text-amber-400">{{ msg.content }}</span>
-                    <span class="text-[10px] text-amber-400/60 dark:text-amber-500/40 tabular-nums shrink-0">{{ formatTime(msg.created_at) }}</span>
+                <!-- System notification bubble + inline confirm card -->
+                <div v-else-if="msg.role === 'system'" class="max-w-[85%] space-y-2">
+                  <div class="flex justify-center">
+                    <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-50 dark:bg-amber-500/[0.06] border border-amber-200/50 dark:border-amber-500/15">
+                      <div class="i-carbon-warning-alt w-3.5 h-3.5 text-amber-500 shrink-0" />
+                      <span class="text-[12px] text-amber-700 dark:text-amber-400">{{ msg.content }}</span>
+                      <span class="text-[10px] text-amber-400/60 dark:text-amber-500/40 tabular-nums shrink-0">{{ formatTime(msg.created_at) }}</span>
+                    </div>
+                  </div>
+                  <div
+                    v-if="task?.phase_status === 'waiting_confirm' && task.current_phase === group.phaseId"
+                    class="rounded-xl border border-amber-200/60 dark:border-amber-500/15 bg-amber-50/50 dark:bg-amber-500/[0.04] px-4 py-3"
+                  >
+                    <div class="flex items-center gap-2 mb-3">
+                      <div class="i-carbon-task-complete w-4 h-4 text-amber-500" />
+                      <span class="text-[13px] text-amber-700 dark:text-amber-400 font-medium">
+                        {{ displayPhase }} 阶段已完成，请确认是否继续推进
+                      </span>
+                    </div>
+                    <div class="flex items-center gap-2 justify-end">
+                      <button
+                        class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                        @click="handleCancel"
+                      >
+                        取消任务
+                      </button>
+                      <button
+                        class="px-3 py-1.5 rounded-lg text-[12px] text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 hover:bg-amber-100/50 dark:hover:bg-amber-500/10 transition-colors"
+                        @click="handleFeedback"
+                      >
+                        反馈修改
+                      </button>
+                      <button
+                        class="px-4 py-1.5 rounded-lg bg-amber-500 text-white text-[12px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
+                        @click="handleConfirm"
+                      >
+                        确认通过
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -1408,35 +1441,6 @@ async function handleCancel() {
           </div>
         </div>
       </div>
-    </div>
-
-    <!-- Confirm bar -->
-    <div
-      v-if="task?.phase_status === 'waiting_confirm'"
-      class="flex items-center gap-3 px-6 py-3 border-t border-amber-200/50 dark:border-amber-500/10 bg-amber-50/50 dark:bg-amber-500/5"
-    >
-      <div class="i-carbon-warning-alt w-4 h-4 text-amber-500" />
-      <span class="text-[13px] text-amber-700 dark:text-amber-400 font-medium flex-1">
-        {{ displayPhase }} 阶段已完成，请确认是否继续推进
-      </span>
-      <button
-        class="px-3 py-1.5 rounded-lg text-[13px] text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
-        @click="handleCancel"
-      >
-        取消任务
-      </button>
-      <button
-        class="px-3 py-1.5 rounded-lg text-[13px] text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-colors"
-        @click="handleFeedback"
-      >
-        反馈修改
-      </button>
-      <button
-        class="px-4 py-1.5 rounded-lg bg-amber-500 text-white text-[13px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
-        @click="handleConfirm"
-      >
-        确认通过
-      </button>
     </div>
 
     <!-- Reset / Rollback confirm dialog -->

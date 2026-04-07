@@ -83,6 +83,7 @@ const config = ref<WorkflowConfig | null>(null)
 type PanelTarget =
   | { type: 'phase', phase: PhaseConfig, stageId: string, stageName: string, isRequirement: boolean }
   | { type: 'stage', stage: StageConfig, stageIdx: number }
+  | { type: 'gate', gate: string, stageId: string, stageName: string, stageIdx: number }
 
 const panelTarget = ref<PanelTarget | null>(null)
 const skillContent = ref('')
@@ -179,6 +180,34 @@ function selectPhase(phase: PhaseConfig, stageId: string, stageName: string, isR
 function selectStage(stage: StageConfig, stageIdx: number) {
   panelTarget.value = { type: 'stage', stage, stageIdx }
   skillContent.value = ''
+}
+
+function selectGate(gate: string, stageId: string, stageName: string, stageIdx: number) {
+  panelTarget.value = { type: 'gate', gate, stageId, stageName, stageIdx }
+  skillContent.value = ''
+}
+
+function getRelatedRules(condition: string): StateRule[] {
+  return (config.value?.state_inference?.rules ?? []).filter(r => r.condition === condition)
+}
+
+function getGateStages(gate: string): StageConfig[] {
+  return (config.value?.stages ?? []).filter(s => s.gate === gate)
+}
+
+function stageIdxById(id: string): number {
+  return (config.value?.stages ?? []).findIndex(s => s.id === id)
+}
+
+function getGatePhases(gate: string): { phase: PhaseConfig, stageId: string, stageName: string }[] {
+  const result: { phase: PhaseConfig, stageId: string, stageName: string }[] = []
+  for (const stage of config.value?.stages ?? []) {
+    for (const phase of stage.phases) {
+      if (phase.entry_gate === gate || phase.completion_check === gate)
+        result.push({ phase, stageId: stage.id, stageName: stage.name })
+    }
+  }
+  return result
 }
 
 function closePanel() {
@@ -368,11 +397,19 @@ function toggleYaml() {
                       <span class="text-[13px] font-semibold" :class="theme(si).header">{{ stage.name }}</span>
                     </div>
                     <div class="text-[11px] font-mono text-gray-400 mb-1">{{ stage.id }}</div>
-                    <!-- Gate with description -->
-                    <div v-if="stage.gate" class="mt-1.5 p-2 rounded-lg bg-white/60 dark:bg-white/[0.03] border border-gray-100 dark:border-white/5">
-                      <div class="flex items-center gap-1.5 mb-0.5">
-                        <div class="i-carbon-locked w-3 h-3 text-gray-400" />
-                        <span class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Stage 门禁</span>
+                    <!-- Gate with description (independently clickable) -->
+                    <div
+                      v-if="stage.gate"
+                      class="gate-block mt-1.5"
+                      :class="panelTarget?.type === 'gate' && (panelTarget as any).gate === stage.gate && (panelTarget as any).stageId === stage.id && 'ring-2 ring-indigo-500/40'"
+                      @click.stop="selectGate(stage.gate, stage.id, stage.name, si)"
+                    >
+                      <div class="flex items-center justify-between mb-0.5">
+                        <div class="flex items-center gap-1.5">
+                          <div class="i-carbon-locked w-3 h-3 text-gray-400" />
+                          <span class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Stage 门禁</span>
+                        </div>
+                        <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600 gate-arrow" />
                       </div>
                       <div class="text-[11px] font-mono" :class="theme(si).badge.replace('bg-', 'text-').split(' ')[1]">{{ stage.gate }}</div>
                       <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 leading-relaxed">{{ describeCondition(stage.gate) }}</p>
@@ -647,18 +684,32 @@ function toggleYaml() {
             <section v-if="panelTarget.phase.entry_gate || panelTarget.phase.completion_check || panelTarget.phase.loop_target">
               <h3 class="panel-title">门禁与条件</h3>
               <div class="space-y-2">
-                <div v-if="panelTarget.phase.entry_gate" class="condition-block">
-                  <div class="condition-label">
-                    <div class="i-carbon-locked w-3 h-3" />
-                    入口门禁
+                <div
+                  v-if="panelTarget.phase.entry_gate"
+                  class="condition-block condition-block--clickable"
+                  @click="selectGate(panelTarget.phase.entry_gate, panelTarget.stageId, panelTarget.stageName, stageIdxById(panelTarget.stageId))"
+                >
+                  <div class="flex items-center justify-between">
+                    <div class="condition-label">
+                      <div class="i-carbon-locked w-3 h-3" />
+                      入口门禁
+                    </div>
+                    <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600" />
                   </div>
                   <code class="condition-code">{{ panelTarget.phase.entry_gate }}</code>
                   <p class="condition-desc">{{ describeCondition(panelTarget.phase.entry_gate) }}</p>
                 </div>
-                <div v-if="panelTarget.phase.completion_check" class="condition-block">
-                  <div class="condition-label">
-                    <div class="i-carbon-task-complete w-3 h-3" />
-                    完成条件
+                <div
+                  v-if="panelTarget.phase.completion_check"
+                  class="condition-block condition-block--clickable"
+                  @click="selectGate(panelTarget.phase.completion_check, panelTarget.stageId, panelTarget.stageName, stageIdxById(panelTarget.stageId))"
+                >
+                  <div class="flex items-center justify-between">
+                    <div class="condition-label">
+                      <div class="i-carbon-task-complete w-3 h-3" />
+                      完成条件
+                    </div>
+                    <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600" />
                   </div>
                   <code class="condition-code">{{ panelTarget.phase.completion_check }}</code>
                   <p class="condition-desc">{{ describeCondition(panelTarget.phase.completion_check) }}</p>
@@ -828,6 +879,135 @@ function toggleYaml() {
           </div>
         </template>
 
+        <!-- ── Gate detail ── -->
+        <template v-else-if="panelTarget.type === 'gate'">
+          <div class="sticky top-0 z-10 bg-white/95 dark:bg-[#1e1e22]/95 backdrop-blur-xl border-b border-gray-200/60 dark:border-white/[0.06] px-6 py-5">
+            <div class="flex items-start justify-between">
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2.5">
+                  <div class="w-8 h-8 rounded-lg bg-amber-100 dark:bg-amber-500/10 flex items-center justify-center">
+                    <div class="i-carbon-locked w-4 h-4 text-amber-600 dark:text-amber-400" />
+                  </div>
+                  <div>
+                    <h2 class="text-[17px] font-bold text-gray-900 dark:text-gray-50 tracking-tight">门禁条件</h2>
+                    <div class="flex items-center gap-2 mt-1">
+                      <code class="text-[12px] font-mono text-amber-600 dark:text-amber-400 font-semibold">{{ panelTarget.gate }}</code>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors ml-3 shrink-0" @click="closePanel">
+                <div class="i-carbon-close w-4.5 h-4.5" />
+              </button>
+            </div>
+          </div>
+
+          <div class="px-6 py-5 space-y-6">
+            <!-- Condition description -->
+            <section>
+              <h3 class="panel-title">条件说明</h3>
+              <div class="condition-block">
+                <div class="condition-label">
+                  <div class="i-carbon-information w-3 h-3" />
+                  含义
+                </div>
+                <p class="condition-desc mt-1">{{ describeCondition(panelTarget.gate) }}</p>
+              </div>
+            </section>
+
+            <!-- Belongs to stage -->
+            <section>
+              <h3 class="panel-title">所属 Stage</h3>
+              <div
+                class="p-3 rounded-lg border cursor-pointer transition-all hover:border-indigo-300 dark:hover:border-indigo-500/30"
+                :class="[theme(panelTarget.stageIdx).bg, theme(panelTarget.stageIdx).border]"
+                @click="selectStage(config!.stages[panelTarget.stageIdx], panelTarget.stageIdx)"
+              >
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center gap-2">
+                    <div class="w-6 h-6 rounded-lg flex items-center justify-center" :class="theme(panelTarget.stageIdx).num">
+                      <span class="text-[11px] font-bold">{{ panelTarget.stageIdx + 1 }}</span>
+                    </div>
+                    <span class="text-[13px] font-semibold" :class="theme(panelTarget.stageIdx).header">{{ panelTarget.stageName }}</span>
+                  </div>
+                  <div class="i-carbon-chevron-right w-3 h-3 text-gray-300" />
+                </div>
+                <div class="text-[11px] font-mono text-gray-400 mt-1 ml-8">{{ panelTarget.stageId }}</div>
+              </div>
+            </section>
+
+            <!-- Related state inference rules -->
+            <section v-if="getRelatedRules(panelTarget.gate).length">
+              <h3 class="panel-title">关联的状态推断规则</h3>
+              <div class="space-y-2">
+                <div
+                  v-for="(rule, ri) in getRelatedRules(panelTarget.gate)"
+                  :key="ri"
+                  class="condition-block"
+                >
+                  <div class="flex items-center gap-2 text-[12px] font-mono mb-1.5">
+                    <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5 text-gray-700 dark:text-gray-300 font-semibold">{{ rule.condition }}</code>
+                    <span class="text-gray-400">→</span>
+                    <span class="pill pill--indigo">{{ rule.stage }}</span>
+                    <span class="text-gray-300">/</span>
+                    <span class="pill pill--green">{{ rule.phase }}</span>
+                  </div>
+                  <p v-if="rule.description" class="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed">{{ rule.description }}</p>
+                </div>
+              </div>
+            </section>
+
+            <!-- Other stages using the same gate -->
+            <section v-if="getGateStages(panelTarget.gate).length > 1">
+              <h3 class="panel-title">共用此门禁的 Stage</h3>
+              <div class="space-y-2">
+                <div
+                  v-for="(s, si2) in getGateStages(panelTarget.gate)"
+                  :key="s.id"
+                  class="flex items-center gap-2 p-2.5 rounded-lg bg-gray-50 dark:bg-white/[0.02] border border-gray-100 dark:border-white/5 cursor-pointer hover:border-indigo-300 dark:hover:border-indigo-500/30 transition-all"
+                  @click="selectStage(s, config!.stages.indexOf(s))"
+                >
+                  <div class="i-carbon-flow w-3.5 h-3.5 text-gray-400 shrink-0" />
+                  <div class="flex-1 min-w-0">
+                    <span class="text-[12px] font-medium text-gray-700 dark:text-gray-200">{{ s.name }}</span>
+                    <span class="text-[11px] font-mono text-gray-400 ml-2">{{ s.id }}</span>
+                  </div>
+                  <div class="i-carbon-chevron-right w-3 h-3 text-gray-300" />
+                </div>
+              </div>
+            </section>
+
+            <!-- Phases that reference this condition -->
+            <section v-if="getGatePhases(panelTarget.gate).length">
+              <h3 class="panel-title">引用此条件的 Phase</h3>
+              <div class="space-y-2">
+                <div
+                  v-for="item in getGatePhases(panelTarget.gate)"
+                  :key="item.phase.id"
+                  class="p-3 rounded-lg bg-gray-50 dark:bg-white/[0.02] border border-gray-100 dark:border-white/5 cursor-pointer hover:border-indigo-300 dark:hover:border-indigo-500/30 transition-all"
+                  @click="selectPhase(item.phase, item.stageId, item.stageName)"
+                >
+                  <div class="flex items-center justify-between mb-1">
+                    <span class="text-[13px] font-medium text-gray-800 dark:text-gray-100">{{ item.phase.name }}</span>
+                    <div class="i-carbon-chevron-right w-3 h-3 text-gray-300" />
+                  </div>
+                  <div class="text-[11px] font-mono text-gray-400 mb-1.5">{{ item.phase.id }}</div>
+                  <div class="flex items-center gap-1 flex-wrap">
+                    <span v-if="item.phase.entry_gate === panelTarget.gate" class="text-[10px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                      <div class="i-carbon-locked w-2.5 h-2.5" />
+                      作为入口门禁
+                    </span>
+                    <span v-if="item.phase.completion_check === panelTarget.gate" class="text-[10px] text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                      <div class="i-carbon-task-complete w-2.5 h-2.5" />
+                      作为完成条件
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </template>
+
         <!-- ── Stage detail ── -->
         <template v-else-if="panelTarget.type === 'stage'">
           <div class="sticky top-0 z-10 bg-white/95 dark:bg-[#1e1e22]/95 backdrop-blur-xl border-b border-gray-200/60 dark:border-white/[0.06] px-6 py-5">
@@ -848,13 +1028,19 @@ function toggleYaml() {
           </div>
 
           <div class="px-6 py-5 space-y-6">
-            <!-- Gate -->
+            <!-- Gate (clickable to open gate detail) -->
             <section v-if="panelTarget.stage.gate">
               <h3 class="panel-title">Stage 门禁</h3>
-              <div class="condition-block">
-                <div class="condition-label">
-                  <div class="i-carbon-locked w-3 h-3" />
-                  门禁条件
+              <div
+                class="condition-block condition-block--clickable"
+                @click="selectGate(panelTarget.stage.gate, panelTarget.stage.id, panelTarget.stage.name, panelTarget.stageIdx)"
+              >
+                <div class="flex items-center justify-between">
+                  <div class="condition-label">
+                    <div class="i-carbon-locked w-3 h-3" />
+                    门禁条件
+                  </div>
+                  <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600" />
                 </div>
                 <code class="condition-code">{{ panelTarget.stage.gate }}</code>
                 <p class="condition-desc">{{ describeCondition(panelTarget.stage.gate) }}</p>
@@ -993,9 +1179,27 @@ function toggleYaml() {
 .panel-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: baseline; }
 .panel-k { font-size: 12px; font-weight: 500; color: #9ca3af; }
 
+/* ── Gate block (in stage card) ── */
+.gate-block {
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.gate-block:hover { border-color: rgba(245, 158, 11, 0.3); background: rgba(255, 255, 255, 0.8); }
+.gate-block:hover .gate-arrow { color: #d97706; }
+:is(.dark) .gate-block { background: rgba(255, 255, 255, 0.03); border-color: rgba(255, 255, 255, 0.05); }
+:is(.dark) .gate-block:hover { border-color: rgba(245, 158, 11, 0.25); background: rgba(255, 255, 255, 0.05); }
+:is(.dark) .gate-block:hover .gate-arrow { color: #fbbf24; }
+
 /* ── Condition block ── */
 .condition-block { padding: 10px 12px; border-radius: 10px; background: #fafafa; border: 1px solid rgba(0, 0, 0, 0.04); }
 :is(.dark) .condition-block { background: rgba(255, 255, 255, 0.02); border-color: rgba(255, 255, 255, 0.04); }
+.condition-block--clickable { cursor: pointer; transition: all 0.15s; }
+.condition-block--clickable:hover { border-color: rgba(245, 158, 11, 0.3); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04); }
+:is(.dark) .condition-block--clickable:hover { border-color: rgba(245, 158, 11, 0.25); }
 .condition-label { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: #6b7280; margin-bottom: 4px; }
 :is(.dark) .condition-label { color: #9ca3af; }
 .condition-code { display: block; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; color: #4f46e5; font-weight: 500; margin-bottom: 2px; }
