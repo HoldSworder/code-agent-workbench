@@ -60,6 +60,8 @@ const PhaseSchema = z.object({
   entry_gate: z.string().optional(),
   is_terminal: z.boolean().optional(),
 
+  /** 完成后允许用户挂起需求（auto-commit 后进入 suspended 状态） */
+  suspendable: z.boolean().optional(),
   /** 默认跳过，需要 trigger 激活才执行 */
   optional: z.boolean().optional(),
   /** 默认执行，用户可选择跳过 */

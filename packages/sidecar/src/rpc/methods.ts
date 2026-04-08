@@ -232,6 +232,12 @@ export function registerMethods(
     })
     return { ok: true }
   })
+  server.register('workflow.suspend', async ({ repoTaskId }) => {
+    engine.suspendTask(repoTaskId).catch((err) => {
+      process.stderr.write(`[workflow] suspend failed for ${repoTaskId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
   server.register('workflow.feedback', async ({ repoTaskId, feedback }) => {
     engine.provideFeedback(repoTaskId, feedback).catch((err) => {
       process.stderr.write(`[workflow] feedback failed for ${repoTaskId}: ${err}\n`)
@@ -321,12 +327,12 @@ export function registerMethods(
   })
 
   // ── 完整配置读写 ──
-  server.register('workflow.getFullConfig', async () => {
-    return engine.getFullConfig()
+  server.register('workflow.getFullConfig', async ({ workflowId }: { workflowId?: string } = {}) => {
+    return engine.getWorkflowConfig(workflowId)
   })
 
-  server.register('workflow.getRawYaml', async () => {
-    return { yaml: engine.getRawYaml() }
+  server.register('workflow.getRawYaml', async ({ workflowId }: { workflowId?: string } = {}) => {
+    return { yaml: engine.getRawYaml(workflowId) }
   })
 
   server.register('workflow.resolveSkill', async ({ skillPath }: { skillPath: string }) => {
@@ -337,12 +343,12 @@ export function registerMethods(
     return { prompt: engine.previewPhasePrompt(repoTaskId, phaseId) }
   })
 
-  server.register('workflow.previewPromptTemplate', async ({ phaseId }: { phaseId: string }) => {
-    return { prompt: engine.previewPhasePromptTemplate(phaseId) }
+  server.register('workflow.previewPromptTemplate', async ({ phaseId, workflowId }: { phaseId: string, workflowId?: string }) => {
+    return { prompt: engine.previewPhasePromptTemplate(phaseId, workflowId) }
   })
 
-  server.register('workflow.getPhaseEnabledMap', async () => {
-    return engine.getPhaseEnabledMap()
+  server.register('workflow.getPhaseEnabledMap', async ({ workflowId }: { workflowId?: string } = {}) => {
+    return engine.getPhaseEnabledMap(workflowId)
   })
 
   server.register('workflow.setPhaseEnabled', async ({ phaseId, enabled }: { phaseId: string, enabled: boolean }) => {

@@ -45,6 +45,7 @@ const chatContainer = ref<HTMLElement>()
 interface WorkflowPhase {
   id: string
   name: string
+  suspendable?: boolean
 }
 
 interface WorkflowStage {
@@ -73,6 +74,7 @@ const statusLabel: Record<string, string> = {
   waiting_input: '待反馈',
   waiting_confirm: '待确认',
   waiting_event: '等待事件',
+  suspended: '已挂起',
   completed: '已完成',
   failed: '失败',
   cancelled: '已取消',
@@ -90,6 +92,15 @@ const displayStatus = computed(() =>
 )
 
 const isRunning = computed(() => task.value?.phase_status === 'running')
+
+const currentPhaseSuspendable = computed(() => {
+  if (!task.value) return false
+  for (const stage of workflowStages.value) {
+    const phase = stage.phases.find(p => p.id === task.value!.current_phase)
+    if (phase) return !!phase.suspendable
+  }
+  return false
+})
 
 const currentPhaseIndex = computed(() => {
   if (!task.value) return -1
@@ -543,6 +554,14 @@ async function handleConfirmAndAdvance() {
   startPolling()
 }
 
+async function handleSuspend() {
+  if (!task.value) return
+  await rpc('workflow.suspend', { repoTaskId: task.value.id })
+  await new Promise(r => setTimeout(r, 500))
+  const t = await rpc<RepoTask>('task.get', { id: taskId })
+  if (t) task.value = t
+}
+
 const composing = ref(false)
 let compositionEndTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -727,6 +746,7 @@ async function handleCancel() {
             'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400': task.phase_status === 'failed',
             'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400': task.phase_status === 'running',
             'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400': task.phase_status === 'completed',
+            'bg-gray-100 text-gray-600 dark:bg-gray-500/10 dark:text-gray-400': task.phase_status === 'suspended',
             'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-500': task.phase_status === 'cancelled' || task.phase_status === 'pending',
           }"
         >
@@ -1034,6 +1054,13 @@ async function handleCancel() {
                     取消任务
                   </button>
                   <button
+                    v-if="currentPhaseSuspendable"
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-600/30 hover:bg-gray-100/50 dark:hover:bg-gray-500/10 transition-colors"
+                    @click="handleSuspend"
+                  >
+                    挂起需求
+                  </button>
+                  <button
                     class="px-4 py-1.5 rounded-lg bg-orange-500 text-white text-[12px] font-medium hover:bg-orange-400 shadow-sm shadow-orange-500/20 transition-all duration-150 active:scale-[0.97]"
                     @click="handleConfirmAndAdvance"
                   >
@@ -1061,6 +1088,13 @@ async function handleCancel() {
                     取消任务
                   </button>
                   <button
+                    v-if="currentPhaseSuspendable"
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-600/30 hover:bg-gray-100/50 dark:hover:bg-gray-500/10 transition-colors"
+                    @click="handleSuspend"
+                  >
+                    挂起需求
+                  </button>
+                  <button
                     class="px-3 py-1.5 rounded-lg text-[12px] text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 hover:bg-amber-100/50 dark:hover:bg-amber-500/10 transition-colors"
                     @click="handleFeedback"
                   >
@@ -1077,6 +1111,33 @@ async function handleCancel() {
                     @click="handleConfirmAndAdvance"
                   >
                     确认通过并进入下一阶段
+                  </button>
+                </div>
+              </div>
+
+              <!-- Inline suspended card -->
+              <div
+                v-if="task?.phase_status === 'suspended' && task.current_phase === group.phaseId"
+                class="rounded-xl border border-gray-200/60 dark:border-gray-600/20 bg-gray-50/50 dark:bg-gray-500/[0.04] px-4 py-3 max-w-[85%]"
+              >
+                <div class="flex items-center gap-2 mb-3">
+                  <div class="i-carbon-pause-filled w-4 h-4 text-gray-400" />
+                  <span class="text-[13px] text-gray-600 dark:text-gray-400 font-medium">
+                    需求已挂起，等待外部依赖就绪后继续
+                  </span>
+                </div>
+                <div class="flex items-center gap-2 justify-end">
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                    @click="handleCancel"
+                  >
+                    取消任务
+                  </button>
+                  <button
+                    class="px-4 py-1.5 rounded-lg bg-indigo-500 text-white text-[12px] font-medium hover:bg-indigo-400 shadow-sm shadow-indigo-500/20 transition-all duration-150 active:scale-[0.97]"
+                    @click="handleConfirmAndAdvance"
+                  >
+                    恢复并继续
                   </button>
                 </div>
               </div>

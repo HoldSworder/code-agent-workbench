@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { AgentProvider, PhaseContext, PhaseResult } from './types'
+import { buildSignalPrompt } from './signal-prompt'
 
 export interface ApiProviderConfig {
   type: 'anthropic' | 'openai-compatible'
@@ -95,7 +96,7 @@ export class ApiProvider implements AgentProvider {
       sections.push(`---\n\n## 护栏规则\n\n${context.guardrails.map(g => `- ${g}`).join('\n')}`)
     }
 
-    sections.push(`---\n\n## 阶段完成状态标记（必须遵守）\n\n你必须在回复的最末尾添加以下标记之一来声明本次执行的完成状态：\n\n- \`<<PHASE_COMPLETE>>\` — 你已完成本阶段的所有产出（文件已写入、命令已执行等）\n- \`<<PENDING_INPUT>>\` — 你需要用户确认或提供更多信息后才能继续\n\n如果上方列出了 ✅ [完成条件]，你必须确保条件中描述的产出物已实际生成后，才能标记 \`<<PHASE_COMPLETE>>\`。\n如果你尚未生成这些产出物（例如在等待用户确认方案），必须标记 \`<<PENDING_INPUT>>\`。\n\n**不要遗漏此标记，它决定了工作流引擎如何推进。**`)
+    sections.push(buildSignalPrompt(context))
 
     if (context.conversationHistory?.length) {
       sections.push('---\n\n## 历史对话\n\n以下是本阶段之前的对话记录：')

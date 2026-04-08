@@ -151,15 +151,6 @@ state_inference:
       phase: self-test
       description: tasks.md 全部勾选且无法匹配更具体状态 → 回退到代码 review
 
-# ── 需求收集（独立于工作流，在需求看板中执行） ──
-# 手动需求：直接保存内容，无需执行阶段，分发后进入任务规划
-# 飞书需求：通过 feishu-requirement skill 获取需求内容后进入任务规划
-requirement_phases:
-  - id: feishu-requirement
-    name: 飞书需求获取
-    provider: external-cli
-    skill: skills/feishu-requirement.md
-
 stages:
   # ──────────────────────────────────────────────
   # Stage 1: 任务规划
@@ -199,6 +190,7 @@ stages:
         name: 任务验证
         provider: external-cli
         skill: skills/task-validate.md
+        requires_confirm: true
         invoke_commands:
           - openspec validate "{{change_id}}"
 
@@ -207,6 +199,7 @@ stages:
         provider: external-cli
         skill: skills/codex-cross-review-planning.md
         optional: true
+        requires_confirm: true
 
   # ──────────────────────────────────────────────
   # Stage 3: 代码开发
@@ -219,6 +212,8 @@ stages:
         name: 开发
         provider: external-cli
         skill: skills/tdd-dev.md
+        requires_confirm: true
+        suspendable: true
         invoke_skills:
           - superpowers:test-driven-development
           - superpowers:verification-before-completion
@@ -242,6 +237,7 @@ stages:
         name: 代码 Review
         provider: external-cli
         skill: skills/self-test.md
+        requires_confirm: true
         invoke_skills:
           - superpowers:verification-before-completion
 
@@ -250,6 +246,7 @@ stages:
         provider: external-cli
         skill: skills/codex-cross-review-dev.md
         optional: true
+        requires_confirm: true
 
   # ──────────────────────────────────────────────
   # Stage 4: 测试
@@ -262,6 +259,7 @@ stages:
         name: E2E 浏览器测试
         provider: external-cli
         skill: skills/e2e-test.md
+        requires_confirm: true
         completion_check: e2e_report_pass
 
       - id: bug-fix

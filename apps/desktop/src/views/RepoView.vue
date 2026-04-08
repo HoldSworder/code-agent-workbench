@@ -127,6 +127,11 @@ const statusConfig: Record<string, { label: string, dotClass: string, badgeClass
     dotClass: 'bg-blue-400',
     badgeClass: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400',
   },
+  suspended: {
+    label: '已挂起',
+    dotClass: 'bg-gray-400 dark:bg-gray-500',
+    badgeClass: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
+  },
   failed: {
     label: '失败',
     dotClass: 'bg-red-500',

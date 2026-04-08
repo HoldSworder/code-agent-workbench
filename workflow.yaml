@@ -199,6 +199,7 @@ stages:
         name: 任务验证
         provider: external-cli
         skill: skills/frontend/task-validate.md
+        requires_confirm: true
         invoke_commands:
           - openspec validate "{{change_id}}"
 
@@ -207,6 +208,7 @@ stages:
         provider: external-cli
         skill: skills/frontend/codex-cross-review-planning.md
         optional: true
+        requires_confirm: true
 
   # ──────────────────────────────────────────────
   # Stage 3: 代码开发
@@ -219,6 +221,8 @@ stages:
         name: 开发
         provider: external-cli
         skill: skills/frontend/tdd-dev.md
+        requires_confirm: true
+        suspendable: true
         invoke_skills:
           - superpowers:test-driven-development
           - superpowers:verification-before-completion
@@ -242,6 +246,7 @@ stages:
         name: 代码 Review
         provider: external-cli
         skill: skills/frontend/self-test.md
+        requires_confirm: true
         invoke_skills:
           - superpowers:verification-before-completion
 
@@ -250,6 +255,7 @@ stages:
         provider: external-cli
         skill: skills/frontend/codex-cross-review-dev.md
         optional: true
+        requires_confirm: true
 
   # ──────────────────────────────────────────────
   # Stage 4: 测试
@@ -262,6 +268,7 @@ stages:
         name: E2E 浏览器测试
         provider: external-cli
         skill: skills/frontend/e2e-test.md
+        requires_confirm: true
         completion_check: e2e_report_pass
 
       - id: bug-fix

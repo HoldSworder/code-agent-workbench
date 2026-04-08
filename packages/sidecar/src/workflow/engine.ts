@@ -21,7 +21,7 @@ import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phas
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { getHead, getMergeBase, resetHard } from '../git/operations'
+import { git, getHead, getMergeBase, resetHard } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
 
@@ -58,6 +58,7 @@ export class WorkflowEngine {
 
   private rawYaml: string
   private configs = new Map<string, WorkflowConfig>()
+  private rawYamls = new Map<string, string>()
 
   constructor(opts: WorkflowEngineOptions) {
     this.db = opts.db
@@ -79,10 +80,13 @@ export class WorkflowEngine {
   addWorkflow(id: string, yamlContent: string): void {
     const config = parseWorkflow(yamlContent)
     this.configs.set(id, config)
+    this.rawYamls.set(id, yamlContent)
   }
 
   listWorkflows(): { id: string, name: string, description: string }[] {
-    const result = [{ id: 'default', name: this.config.name, description: this.config.description ?? '' }]
+    if (this.configs.size === 0)
+      return [{ id: 'default', name: this.config.name, description: this.config.description ?? '' }]
+    const result: { id: string, name: string, description: string }[] = []
     for (const [id, config] of this.configs) {
       result.push({ id, name: config.name, description: config.description ?? '' })
     }
@@ -335,9 +339,10 @@ export class WorkflowEngine {
     this.settingsRepo.set(`phase.${phaseId}.enabled`, enabled ? 'true' : 'false')
   }
 
-  getPhaseEnabledMap(): Record<string, boolean> {
+  getPhaseEnabledMap(workflowId?: string | null): Record<string, boolean> {
+    const wf = this.getWorkflowConfig(workflowId)
     const result: Record<string, boolean> = {}
-    for (const stage of this.config.stages) {
+    for (const stage of wf.stages) {
       for (const phase of stage.phases) {
         if (phase.optional && !phase.triggers?.length && !phase.loopable) {
           const val = this.settingsRepo.get(`phase.${phase.id}.enabled`)
@@ -410,7 +415,7 @@ export class WorkflowEngine {
     const advance = options?.advance ?? false
     const task = this.taskRepo.findById(repoTaskId)
     elog(`confirmPhase: task=${repoTaskId} stage=${task?.current_stage} phase=${task?.current_phase} status=${task?.phase_status} advance=${advance}`)
-    if (!task || (task.phase_status !== 'waiting_confirm' && task.phase_status !== 'waiting_input'))
+    if (!task || !['waiting_confirm', 'waiting_input', 'suspended'].includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
 
     const wf = this.resolveConfigForTask(repoTaskId)
@@ -469,10 +474,44 @@ export class WorkflowEngine {
     await this.executePhase(repoTaskId, next.phase, next.stage)
   }
 
+  async suspendTask(repoTaskId: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    elog(`suspendTask: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'waiting_event']
+    if (!task || !allowedStates.includes(task.phase_status))
+      throw new Error(`Task ${repoTaskId} is not in a suspendable state (current: ${task?.phase_status})`)
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, task.current_phase)
+    if (!found)
+      throw new Error(`Phase ${task.current_phase} not found in workflow config`)
+
+    try {
+      const status = await git(task.worktree_path, ['status', '--porcelain'])
+      if (status.trim()) {
+        await git(task.worktree_path, ['add', '-A'])
+        await git(task.worktree_path, ['commit', '-m', `wip: suspend at ${found.phase.name} (${task.current_phase})`])
+        elog(`suspendTask: auto-committed WIP changes`)
+      }
+    }
+    catch (err) {
+      elog(`suspendTask: git commit failed: ${err}`)
+    }
+
+    this.msgRepo.create({
+      repo_task_id: repoTaskId,
+      phase_id: task.current_phase,
+      role: 'system',
+      content: `需求已挂起，当前进度保存在阶段「${found.phase.name}」。恢复后将从此处继续。`,
+    })
+
+    this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'suspended')
+  }
+
   async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} feedback=${feedback.slice(0, 100)}`)
-    const allowedStates = ['waiting_confirm', 'waiting_input', 'failed', 'cancelled']
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended', 'failed', 'cancelled']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
 
@@ -496,7 +535,7 @@ export class WorkflowEngine {
   async confirmAndExecute(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`confirmAndExecute: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
-    const allowedStates = ['waiting_confirm', 'waiting_input']
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
 
@@ -675,8 +714,9 @@ export class WorkflowEngine {
     return this.config
   }
 
-  getRawYaml(): string {
-    return this.rawYaml
+  getRawYaml(workflowId?: string | null): string {
+    if (!workflowId || workflowId === 'default') return this.rawYaml
+    return this.rawYamls.get(workflowId) ?? this.rawYaml
   }
 
   reloadConfig(yamlContent: string): void {
@@ -688,12 +728,12 @@ export class WorkflowEngine {
     return this.resolveSkillContent(skillPath)
   }
 
-  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, phases: { id: string, name: string }[] }[] {
+  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, phases: { id: string, name: string, suspendable?: boolean }[] }[] {
     const wf = this.getWorkflowConfig(workflowId)
     return wf.stages.map(s => ({
       id: s.id,
       name: s.name,
-      phases: s.phases.map(p => ({ id: p.id, name: p.name })),
+      phases: s.phases.map(p => ({ id: p.id, name: p.name, suspendable: p.suspendable || undefined })),
     }))
   }
 
@@ -711,12 +751,12 @@ export class WorkflowEngine {
     phaseId: string,
     userMessage?: string,
   ): Promise<void> {
-    const wf = this.resolveConfigForTask(repoTaskId)
-    const phase = (wf.requirement_phases ?? []).find(p => p.id === phaseId)
+    const reqPhases = this.config.requirement_phases ?? []
+    const phase = reqPhases.find(p => p.id === phaseId)
     if (!phase)
       throw new Error(`Requirement phase "${phaseId}" not found`)
 
-    const virtualStage: StageConfig = { id: '_requirements', name: '需求收集', phases: wf.requirement_phases ?? [] }
+    const virtualStage: StageConfig = { id: '_requirements', name: '需求收集', phases: reqPhases }
     this.taskRepo.updatePhase(repoTaskId, '_requirements', phaseId, 'running')
     await this.executePhase(repoTaskId, phase, virtualStage, userMessage)
   }
@@ -737,11 +777,13 @@ export class WorkflowEngine {
    * 无需 taskId，用占位变量生成某个 phase 的提示词模板。
    * 用于工作流编辑器中预览 "Agent 大概会收到什么 prompt"。
    */
-  previewPhasePromptTemplate(phaseId: string): string {
-    const found = findPhaseById(this.config.stages, phaseId)
-      ?? (this.config.requirement_phases ?? []).map((p) => {
+  previewPhasePromptTemplate(phaseId: string, workflowId?: string | null): string {
+    const wf = this.getWorkflowConfig(workflowId)
+    const reqPhases = this.config.requirement_phases ?? []
+    const found = findPhaseById(wf.stages, phaseId)
+      ?? reqPhases.map((p) => {
         if (p.id !== phaseId) return null
-        const virtualStage = { id: '_requirements', name: '需求收集', phases: this.config.requirement_phases ?? [] }
+        const virtualStage = { id: '_requirements', name: '需求收集', phases: reqPhases }
         return { stage: virtualStage, phase: p, stageIdx: -1, phaseIdx: 0 }
       }).find(Boolean)
 
@@ -757,8 +799,8 @@ export class WorkflowEngine {
 
     const ctxDeps = {
       resolveSkillContent: this.resolveSkillContent,
-      guardrailDefinitions: this.config.guardrail_definitions,
-      gateDefinitions: this.config.gate_definitions,
+      guardrailDefinitions: wf.guardrail_definitions,
+      gateDefinitions: wf.gate_definitions,
     }
 
     const context = buildPhaseContext(
@@ -790,10 +832,11 @@ export class WorkflowEngine {
     if (!task) throw new Error(`Task not found: ${repoTaskId}`)
 
     const wf = this.resolveConfigForTask(repoTaskId)
+    const reqPhases = this.config.requirement_phases ?? []
     const found = findPhaseById(wf.stages, phaseId)
-      ?? (wf.requirement_phases ?? []).map((p, i) => {
+      ?? reqPhases.map((p, i) => {
         if (p.id !== phaseId) return null
-        const virtualStage = { id: '_requirements', name: '需求收集', phases: wf.requirement_phases ?? [] }
+        const virtualStage = { id: '_requirements', name: '需求收集', phases: reqPhases }
         return { stage: virtualStage, phase: p, stageIdx: -1, phaseIdx: i }
       }).find(Boolean)
 

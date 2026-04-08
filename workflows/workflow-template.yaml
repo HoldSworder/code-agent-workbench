@@ -1,0 +1,349 @@
+# ============================================================
+# Workflow 模板文件
+# ============================================================
+#
+# 本文件是创建新工作流的完整参考模板。
+# 复制本文件到 workflows/<your-workflow>/ 目录下并重命名为 workflow.yaml，
+# 根据实际需求修改各配置项。
+#
+# 配置项带有 [必填] / [可选] 标记，[可选] 项可直接删除。
+# 模板变量使用 {{variable}} 语法，引擎会在运行时替换为实际值。
+#
+# 可用模板变量：
+#   {{openspec_path}}  — 当前 change 的 OpenSpec 目录路径
+#   {{change_id}}      — 当前 change ID
+#   {{branch_name}}    — 当前 Git 分支名
+#   {{repo_path}}      — 仓库根目录路径
+#
+# ============================================================
+
+# [必填] 工作流名称
+name: my-workflow
+
+# [必填] 工作流描述
+description: >-
+  描述你的工作流用途和执行流程。
+
+# ============================================================
+# profile_detection — 项目类型检测（可选）
+# ============================================================
+# 引擎根据项目中的标记文件自动选择对应的 skill 目录。
+# 若不配置，默认使用 skill 字段中的路径。
+#
+# profile_detection:
+#   frontend:
+#     markers:                    # [必填] 必须存在的文件，全部匹配才选中
+#       - package.json
+#       - tsconfig.json
+#     indicators:                 # [可选] 辅助判断文件，提高匹配置信度
+#       - src/App.vue
+#       - src/main.ts
+#     skill_dir: skills/frontend  # [必填] 选中后 skill 路径前缀替换为此目录
+
+# ============================================================
+# dependencies — 外部依赖声明（可选）
+# ============================================================
+# 声明工作流依赖的 CLI 工具或 skill-pack。
+# 引擎启动时会检查依赖是否可用。
+#
+# dependencies:
+#   openspec:
+#     type: cli                   # cli | skill-pack
+#     check: "which openspec"     # [可选] 检查命令（exit 0 = 已安装）
+#     install_hint: "npm i -g openspec"  # [可选] 安装提示
+#     commands:                   # [可选] 该依赖提供的可用命令列表（仅文档用途）
+#       - openspec new change
+#       - openspec validate
+#
+#   superpowers:
+#     type: skill-pack
+#     skills:                     # skill-pack 类型需声明 skill 映射
+#       test-driven-development: superpowers:test-driven-development
+#       verification-before-completion: superpowers:verification-before-completion
+
+# ============================================================
+# gate_definitions — 门禁定义（可选）
+# ============================================================
+# 声明式条件检查，用于 entry_gate / completion_check / stage.gate。
+# 每个门禁由一组 checks 组成，全部通过才算满足。
+#
+# 支持的 check 类型：
+#   exists            — 文件/目录存在（支持 glob）
+#   not_exists        — 文件/目录不存在
+#   file_contains     — 文件内容包含指定子串（pattern）
+#   file_not_contains — 文件内容不包含指定子串
+#   file_section_matches     — 文件中 after 标记之后的内容匹配 pattern（正则）
+#   file_section_not_matches — 文件中 after 标记之后的内容不匹配 pattern
+#   command_succeeds  — 在 worktree 中执行 command，exit 0 = 通过
+#
+# gate_definitions:
+#   has_spec_files:
+#     description: proposal.md 和 specs/ 已存在
+#     checks:
+#       - type: exists
+#         path: "{{openspec_path}}/proposal.md"
+#       - type: exists
+#         path: "{{openspec_path}}/specs"
+#
+#   all_tasks_done:
+#     description: tasks.md 中所有任务项已勾选完成
+#     checks:
+#       - type: file_contains
+#         path: "{{openspec_path}}/tasks.md"
+#         pattern: "- [x]"
+#       - type: file_not_contains
+#         path: "{{openspec_path}}/tasks.md"
+#         pattern: "- [ ]"
+#
+#   working_tree_clean:
+#     description: Git 工作区干净
+#     checks:
+#       - type: command_succeeds
+#         command: "git diff --quiet && git diff --cached --quiet"
+
+# ============================================================
+# guardrail_definitions — 护栏定义（可选）
+# ============================================================
+# 注入到 Agent prompt 中的行为约束规则。
+# severity: hard = 强制（🚫），soft = 建议（⚠️）
+#
+# guardrail_definitions:
+#   no_skip_tdd:
+#     description: 必须严格遵循 TDD 纪律
+#     severity: hard
+#   no_uncommitted_claim:
+#     description: 不得在没有运行验证命令的情况下声称任务完成
+#     severity: soft
+
+# ============================================================
+# state_inference — 状态推断（可选）
+# ============================================================
+# 当用户说"继续开发"等模糊指令时，引擎根据文件系统状态
+# 自动推断应该从哪个 stage/phase 继续执行。
+# 规则按声明顺序匹配，命中第一条即停止。
+#
+# state_inference:
+#   rules:
+#     - condition: has_spec_files      # 引用 gate_definitions 中的条件
+#       stage: development
+#       phase: tdd-dev
+#       description: 有 spec 文件 → 进入开发
+
+# ============================================================
+# requirement_phases — 需求收集阶段（可选）
+# ============================================================
+# 独立于工作流 stages 的需求获取阶段，在需求看板中执行。
+#
+# requirement_phases:
+#   - id: feishu-requirement
+#     name: 飞书需求获取
+#     provider: external-cli
+#     skill: skills/feishu-requirement.md
+
+# ============================================================
+# stages — 工作流阶段（必填）
+# ============================================================
+# 工作流的核心结构。每个 stage 包含若干 phase，按顺序执行。
+# Stage 之间通过 gate 门禁控制推进。
+#
+stages:
+  # ── Stage 示例 ──
+  - id: planning               # [必填] Stage 唯一标识
+    name: 任务规划              # [必填] Stage 显示名称
+    gate: has_spec_files        # [可选] 引用 gate_definitions，满足后才能进入下一 Stage
+    phases:
+
+      # ── Phase 完整配置参考 ──
+      - id: my-phase            # [必填] Phase 唯一标识（全局唯一）
+        name: 示例阶段          # [必填] Phase 显示名称
+        provider: external-cli  # [必填] 执行方式：external-cli | api
+
+        # ─── Skill 与执行内容 ───
+        skill: skills/my-skill.md      # [可选] 主 skill 文件路径（Markdown）
+        invoke_skills:                  # [可选] 额外调用的技能（注入到 prompt）
+          - superpowers:test-driven-development
+        invoke_commands:                # [可选] Agent 需要执行的 CLI 命令
+          - openspec validate "{{change_id}}"
+        tools:                          # [可选] 限定 Agent 可用的工具列表
+          - Read
+          - Write
+          - Shell
+        mcp_config: path/to/mcp.json   # [可选] MCP 服务器配置文件路径
+
+        # ─── 流程控制 ───
+        #
+        # requires_confirm (boolean, 默认 false)
+        #   设为 true 后，引擎会动态注入以下 prompt 指令给 Agent：
+        #   ┌─────────────────────────────────────────────┐
+        #   │ 1. 首次执行：展示方案/概要 → <<PENDING_INPUT>>│
+        #   │ 2. 用户确认后重跑：落地实施 → <<PHASE_COMPLETE>>│
+        #   └─────────────────────────────────────────────┘
+        #   前端会在该阶段显示确认卡片，用户可以：
+        #   - "反馈修改"  → 给 Agent 发反馈，重跑当前阶段
+        #   - "确认通过"  → 标记确认，等待后续手动推进
+        #   - "确认通过并进入下一阶段" → 确认 + 自动推进
+        #
+        requires_confirm: true
+
+        # confirm_files (string[], 可选)
+        #   用户点击"确认通过"时，引擎检查这些文件是否存在。
+        #   任一缺失则阻止确认并提示用户。支持 glob 和模板变量。
+        #
+        confirm_files:
+          - "{{openspec_path}}/proposal.md"
+          - "{{openspec_path}}/specs/*/spec.md"
+
+        # entry_gate (string, 可选)
+        #   引用 gate_definitions 中的条件。
+        #   Phase 执行前检查，不满足则跳过或报错。
+        #
+        entry_gate: working_tree_clean
+
+        # completion_check (string, 可选)
+        #   引用 gate_definitions 中的条件。
+        #   Agent 执行完成后引擎自动验证，不满足则进入 waiting_input 状态。
+        #   会在 prompt 中以 ✅ [完成条件] 告知 Agent。
+        #
+        # completion_check: all_tasks_done
+
+        # guardrails (string[], 可选)
+        #   引用 guardrail_definitions 中的规则 ID。
+        #   注入到 prompt 中约束 Agent 行为。
+        #
+        guardrails:
+          - no_skip_tdd
+
+        # ─── 特殊 Phase 类型 ───
+
+        # optional (boolean, 默认 false)
+        #   设为 true 后，Phase 默认跳过，需要 trigger 激活才执行。
+        #   典型场景：联调（等后端 spec 到达后触发）、交叉 Review。
+        #
+        # optional: true
+
+        # triggers (string[], 可选)
+        #   与 optional 配合，用户输入包含这些短语时激活该 Phase。
+        #   也可在 trigger_mapping 中统一配置。
+        #
+        # triggers:
+        #   - "后端spec到了"
+        #   - "联调"
+
+        # suspendable (boolean, 默认 false)
+        #   设为 true 后，Phase 完成时确认卡片中会额外显示"挂起需求"按钮。
+        #   用户点击后：
+        #   1. 引擎自动 git add + commit (WIP) 保存当前进度
+        #   2. Phase 状态变为 suspended
+        #   3. 后续用户可通过触发语（如"继续开发"）或"恢复并继续"按钮恢复执行
+        #   典型场景：开发完成后等待后端接口，需要长时间挂起。
+        #
+        # suspendable: true
+
+        # skippable (boolean, 默认 false)
+        #   设为 true 后，Phase 默认执行，但用户可选择跳过。
+        #
+        # skippable: true
+
+        # loopable / loop_target (boolean / string, 可选)
+        #   loopable=true 时，Phase 完成后可跳回 loop_target 指定的 Phase 重新执行。
+        #   典型场景：Bug 修复 → 回到 E2E 测试重跑。
+        #
+        # loopable: true
+        # loop_target: e2e-test
+
+        # is_terminal (boolean, 可选)
+        #   标记为终止阶段。确认后直接标记整个任务为 completed，不再寻找下一阶段。
+        #
+        # is_terminal: true
+
+  # ── Stage 2 示例 ──
+  - id: development
+    name: 代码开发
+    # gate: all_tasks_done
+    phases:
+      - id: dev
+        name: 开发
+        provider: external-cli
+        skill: skills/dev.md
+        requires_confirm: true
+
+# ============================================================
+# trigger_mapping — 触发语映射（可选）
+# ============================================================
+# 用户输入包含指定短语时，直接跳转到目标 stage/phase。
+# 匹配规则：子串包含（userInput.includes(pattern)）
+#
+# trigger_mapping:
+#   - patterns: ["新需求", "新功能", "开始开发"]
+#     target_stage: planning
+#     target_phase: spec-create
+#
+#   - patterns: ["继续开发", "接着做"]
+#     target_stage: auto
+#     target_phase: auto
+#     strategy: infer_from_state      # 使用 state_inference 规则推断
+
+# ============================================================
+# Prompt 注入机制说明
+# ============================================================
+#
+# 引擎在构建 Agent prompt 时，会按以下顺序注入内容：
+#
+# ┌───────────────────────────────────────────────┐
+# │ 1. 需求信息（requirementTitle + description） │
+# │ 2. Skill 文件内容（skill 字段指向的 .md）     │
+# │ 3. 外部技能（invoke_skills 的完整内容）        │
+# │ 4. CLI 命令（invoke_commands）                 │
+# │ 5. 门禁规则（entry_gate + completion_check     │
+# │    + stage.gate 解析后的描述）                  │
+# │ 6. ⭐ 阶段完成状态标记（动态生成）              │
+# │ 7. 护栏规则（guardrails 解析后的描述）          │
+# │ 8. 历史对话（conversationHistory）              │
+# │ 9. 用户最新反馈（userMessage）                  │
+# │ 10. 执行上下文（repoPath, branch 等）          │
+# └───────────────────────────────────────────────┘
+#
+# 其中第 6 项「阶段完成状态标记」由 signal-prompt.ts 根据
+# phase 配置动态生成，无需在 skill 文件中手动编写。
+#
+# ── 动态注入规则 ──
+#
+# ┌─────────────────────┬──────────────────────────────────┐
+# │ Phase 配置          │ 注入的 prompt 内容               │
+# ├─────────────────────┼──────────────────────────────────┤
+# │ 默认（无特殊配置）   │ 基础标记协议：                    │
+# │                     │ <<PHASE_COMPLETE>> 或             │
+# │                     │ <<PENDING_INPUT>>                 │
+# ├─────────────────────┼──────────────────────────────────┤
+# │ requires_confirm    │ + "本阶段需要用户确认"指令：       │
+# │                     │ 首次执行展示方案 → PENDING_INPUT  │
+# │                     │ 确认后重跑落地 → PHASE_COMPLETE   │
+# ├─────────────────────┼──────────────────────────────────┤
+# │ completion_check    │ + "完成条件验证"警告：             │
+# │                     │ 引擎会在标记完成后自动验证条件，   │
+# │                     │ 未通过则回退到 waiting_input      │
+# ├─────────────────────┼──────────────────────────────────┤
+# │ 两者同时配置         │ 同时注入上述两段指令              │
+# └─────────────────────┴──────────────────────────────────┘
+#
+# ── Phase 状态流转 ──
+#
+#   running
+#     ├─ Agent 输出 <<PENDING_INPUT>> ──→ waiting_input
+#     │    └─ 用户反馈 → running（重跑当前 phase）
+#     │    └─ 用户"确认并进入下一阶段" → running（确认反馈 + 自动推进标记）
+#     │
+#     ├─ Agent 输出 <<PHASE_COMPLETE>>
+#     │    ├─ completion_check 不通过 ──→ waiting_input
+#     │    ├─ requires_confirm ──→ waiting_confirm
+#     │    │    └─ 用户"确认通过" → waiting_event（等待手动推进）
+#     │    │    └─ 用户"确认通过并进入下一阶段" → running（确认反馈 + 自动推进）
+#     │    │    └─ 用户"反馈修改" → running（重跑当前 phase）
+#     │    └─ 无确认要求 ──→ 自动推进到下一 phase
+#     │
+#     ├─ failed ──→ failed
+#     └─ cancelled ──→ cancelled
+#
+#   waiting_confirm / waiting_input (当 suspendable=true)
+#     └─ 用户"挂起需求" → suspended（auto-commit WIP）
+#          └─ 用户"恢复并继续" 或触发语 → running

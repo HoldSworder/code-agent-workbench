@@ -27,6 +27,10 @@ export interface PhaseContext {
   guardrails?: string[]
   /** 门禁规则描述，注入到 prompt 中让 Agent 感知 */
   gates?: string[]
+  /** 本阶段完成后是否需要用户确认才能推进 */
+  requiresConfirm?: boolean
+  /** 本阶段完成后是否允许用户挂起需求 */
+  suspendable?: boolean
   changeId?: string
   requirementTitle?: string
   requirementDescription?: string

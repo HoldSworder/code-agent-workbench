@@ -119,5 +119,7 @@ export function buildPhaseContext(
     invokeCommands: leanMode ? undefined : interpolateCommands(phase.invoke_commands, templateVars),
     guardrails: leanMode ? undefined : resolveGuardrails(phase.guardrails, deps.guardrailDefinitions),
     gates: leanMode ? undefined : resolveGates(phase, stageGate, deps.gateDefinitions),
+    requiresConfirm: phase.requires_confirm,
+    suspendable: phase.suspendable,
   }
 }

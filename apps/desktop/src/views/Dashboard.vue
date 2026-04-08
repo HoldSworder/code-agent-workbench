@@ -80,6 +80,7 @@ const phaseStatusLabels: Record<string, string> = {
   waiting_input: '待反馈',
   waiting_confirm: '待确认',
   waiting_event: '等待事件',
+  suspended: '已挂起',
   completed: '已完成',
   failed: '失败',
   cancelled: '已取消',
@@ -98,6 +99,8 @@ function phaseStatusClass(status: string) {
     return 'text-emerald-600 dark:text-emerald-400'
   if (status === 'waiting_event')
     return 'text-blue-600 dark:text-blue-400'
+  if (status === 'suspended')
+    return 'text-gray-500 dark:text-gray-400'
   if (status === 'failed')
     return 'text-red-600 dark:text-red-400'
   return 'text-gray-500'
@@ -513,7 +516,8 @@ async function retryTask(taskId: string) {
                     'bg-orange-50 dark:bg-orange-500/10': task.phase_status === 'waiting_input',
                     'bg-red-50 dark:bg-red-500/10': task.phase_status === 'failed',
                     'bg-slate-50 dark:bg-slate-500/10 border border-dashed border-slate-300 dark:border-slate-600': task.phase_status === 'pending',
-                    'bg-gray-50 dark:bg-white/5': !['waiting_confirm', 'waiting_input', 'failed', 'pending'].includes(task.phase_status),
+                    'bg-gray-100 dark:bg-gray-500/10': task.phase_status === 'suspended',
+                    'bg-gray-50 dark:bg-white/5': !['waiting_confirm', 'waiting_input', 'failed', 'pending', 'suspended'].includes(task.phase_status),
                   }"
                 >
                   <div class="i-carbon-folder-details w-3.5 h-3.5 text-gray-400 opacity-60" />

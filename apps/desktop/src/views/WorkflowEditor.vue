@@ -89,6 +89,30 @@ interface WorkflowConfig {
 
 const md = new MarkdownIt({ html: false, linkify: true, typographer: true })
 
+// ── Multi-workflow state ──
+
+interface WorkflowEntry {
+  id: string
+  name: string
+  description: string
+}
+
+const workflows = ref<WorkflowEntry[]>([])
+const activeWorkflowId = ref<string>('')
+
+// ── Requirement phases (shared, independent of workflow) ──
+
+const requirementPhases = ref<PhaseConfig[]>([])
+
+async function loadRequirementPhases() {
+  try {
+    const res = await rpc<{ phases: PhaseConfig[] }>('workflow.requirementPhases')
+    requirementPhases.value = res?.phases ?? []
+  } catch {
+    requirementPhases.value = []
+  }
+}
+
 // ── State ──
 
 const loading = ref(true)
@@ -163,12 +187,28 @@ function theme(idx: number) { return stageThemes[idx % stageThemes.length] }
 
 // ── Load ──
 
+async function loadWorkflowList() {
+  try {
+    const res = await rpc<{ workflows: WorkflowEntry[] }>('workflow.listAll')
+    workflows.value = res.workflows
+    if (!activeWorkflowId.value && res.workflows.length)
+      activeWorkflowId.value = res.workflows[0].id
+  } catch (err) {
+    console.error('Failed to load workflow list:', err)
+  }
+}
+
 async function loadConfig() {
   loading.value = true
+  closePanel()
+  showYaml.value = false
   try {
+    const wfParam = activeWorkflowId.value && activeWorkflowId.value !== 'default'
+      ? activeWorkflowId.value
+      : undefined
     const [cfg, enabledMap] = await Promise.all([
-      rpc<WorkflowConfig>('workflow.getFullConfig'),
-      rpc<Record<string, boolean>>('workflow.getPhaseEnabledMap'),
+      rpc<WorkflowConfig>('workflow.getFullConfig', { workflowId: wfParam }),
+      rpc<Record<string, boolean>>('workflow.getPhaseEnabledMap', { workflowId: wfParam }),
     ])
     config.value = cfg
     if (enabledMap) phaseEnabledMap.value = enabledMap
@@ -177,6 +217,12 @@ async function loadConfig() {
   } finally {
     loading.value = false
   }
+}
+
+async function switchWorkflow(id: string) {
+  if (id === activeWorkflowId.value) return
+  activeWorkflowId.value = id
+  await loadConfig()
 }
 
 async function togglePhaseEnabled(phaseId: string) {
@@ -192,12 +238,18 @@ async function togglePhaseEnabled(phaseId: string) {
 
 async function loadRawYaml() {
   try {
-    const res = await rpc<{ yaml: string }>('workflow.getRawYaml')
+    const wfParam = activeWorkflowId.value && activeWorkflowId.value !== 'default'
+      ? activeWorkflowId.value
+      : undefined
+    const res = await rpc<{ yaml: string }>('workflow.getRawYaml', { workflowId: wfParam })
     rawYaml.value = res.yaml
   } catch { rawYaml.value = '' }
 }
 
-onMounted(loadConfig)
+onMounted(async () => {
+  await Promise.all([loadWorkflowList(), loadRequirementPhases()])
+  await loadConfig()
+})
 
 // ── Panel ──
 
@@ -274,7 +326,10 @@ async function loadPromptPreview(phaseId: string) {
   if (!showPrompt.value) return
   promptLoading.value = true
   try {
-    const res = await rpc<{ prompt: string }>('workflow.previewPromptTemplate', { phaseId })
+    const wfParam = activeWorkflowId.value && activeWorkflowId.value !== 'default'
+      ? activeWorkflowId.value
+      : undefined
+    const res = await rpc<{ prompt: string }>('workflow.previewPromptTemplate', { phaseId, workflowId: wfParam })
     promptPreview.value = res?.prompt ?? ''
   }
   catch (e: any) {
@@ -334,6 +389,49 @@ function toggleYaml() {
       </div>
 
       <div v-else-if="config" class="p-8 space-y-8">
+        <!-- ─── Requirement Phases (shared, above workflow tabs) ─── -->
+        <section v-if="requirementPhases.length" class="wf-card">
+          <div class="px-4 py-3 border-b border-gray-100 dark:border-white/[0.04] flex items-center gap-2.5">
+            <div class="w-7 h-7 rounded-lg bg-violet-100 dark:bg-violet-500/10 flex items-center justify-center">
+              <div class="i-carbon-task w-3.5 h-3.5 text-violet-500" />
+            </div>
+            <div>
+              <h3 class="text-[13px] font-semibold text-gray-700 dark:text-gray-200">需求收集</h3>
+              <p class="text-[11px] text-gray-400">独立于工作流，在需求看板中执行</p>
+            </div>
+          </div>
+          <div class="p-3 flex gap-2 overflow-x-auto">
+            <div
+              v-for="phase in requirementPhases"
+              :key="phase.id"
+              class="phase-card shrink-0 min-w-[160px]"
+              :class="panelTarget?.type === 'phase' && (panelTarget as any).phase.id === phase.id && 'ring-2 ring-indigo-500/40'"
+              @click="selectPhase(phase, '_requirements', '需求收集', true)"
+            >
+              <div class="text-[13px] font-medium text-gray-800 dark:text-gray-100 mb-0.5">{{ phase.name }}</div>
+              <div class="text-[11px] text-gray-400 font-mono mb-2">{{ phase.id }}</div>
+              <div class="flex items-center gap-1 flex-wrap">
+                <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
+                <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ─── Workflow Tabs ─── -->
+        <div v-if="workflows.length > 1" class="flex items-center gap-1 p-1 rounded-xl bg-gray-100/80 dark:bg-white/[0.04] border border-gray-200/60 dark:border-white/[0.06]">
+          <button
+            v-for="wf in workflows"
+            :key="wf.id"
+            class="wf-tab"
+            :class="activeWorkflowId === wf.id ? 'wf-tab--active' : 'wf-tab--inactive'"
+            @click="switchWorkflow(wf.id)"
+          >
+            <div class="i-carbon-flow w-3.5 h-3.5 shrink-0" />
+            {{ wf.name }}
+          </button>
+        </div>
+
         <!-- ─── Header ─── -->
         <div class="flex items-start justify-between">
           <div class="flex items-center gap-3">
@@ -369,35 +467,6 @@ function toggleYaml() {
             <pre class="px-4 py-3 text-[12px] font-mono leading-relaxed text-gray-600 dark:text-gray-400 max-h-80 overflow-auto">{{ rawYaml || '加载中…' }}</pre>
           </div>
         </Transition>
-
-        <!-- ─── Requirement Phases ─── -->
-        <section v-if="config.requirement_phases?.length" class="wf-card">
-          <div class="px-4 py-3 border-b border-gray-100 dark:border-white/[0.04] flex items-center gap-2.5">
-            <div class="w-7 h-7 rounded-lg bg-violet-100 dark:bg-violet-500/10 flex items-center justify-center">
-              <div class="i-carbon-task w-3.5 h-3.5 text-violet-500" />
-            </div>
-            <div>
-              <h3 class="text-[13px] font-semibold text-gray-700 dark:text-gray-200">需求收集</h3>
-              <p class="text-[11px] text-gray-400">独立于主流程，在需求看板中执行</p>
-            </div>
-          </div>
-          <div class="p-3 flex gap-2 overflow-x-auto">
-            <div
-              v-for="phase in config.requirement_phases"
-              :key="phase.id"
-              class="phase-card shrink-0 min-w-[160px]"
-              :class="panelTarget?.type === 'phase' && (panelTarget as any).phase.id === phase.id && 'ring-2 ring-indigo-500/40'"
-              @click="selectPhase(phase, '_requirements', '需求收集', true)"
-            >
-              <div class="text-[13px] font-medium text-gray-800 dark:text-gray-100 mb-0.5">{{ phase.name }}</div>
-              <div class="text-[11px] text-gray-400 font-mono mb-2">{{ phase.id }}</div>
-              <div class="flex items-center gap-1 flex-wrap">
-                <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
-                <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
-              </div>
-            </div>
-          </div>
-        </section>
 
         <!-- ─── Main Pipeline ─── -->
         <section>
@@ -1453,5 +1522,46 @@ function toggleYaml() {
 :is(.dark) .skill-prose :deep(blockquote) {
   border-left-color: rgba(139, 92, 246, 0.4);
   color: #9ca3af;
+}
+
+/* ── Workflow tabs ── */
+.wf-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.wf-tab--active {
+  background: white;
+  color: #4f46e5;
+  border-color: rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+.wf-tab--inactive {
+  color: #6b7280;
+}
+.wf-tab--inactive:hover {
+  color: #374151;
+  background: rgba(0, 0, 0, 0.03);
+}
+:is(.dark) .wf-tab--active {
+  background: rgba(255, 255, 255, 0.08);
+  color: #818cf8;
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+:is(.dark) .wf-tab--inactive {
+  color: #9ca3af;
+}
+:is(.dark) .wf-tab--inactive:hover {
+  color: #e5e7eb;
+  background: rgba(255, 255, 255, 0.04);
 }
 </style>

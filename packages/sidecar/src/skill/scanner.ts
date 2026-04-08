@@ -106,7 +106,7 @@ function safeRealpath(p: string): string | null {
 
 // ── Env Status ──
 
-function buildEnvStatus(dirName: string, realDir: string): Record<ManageableEnv, EnvInstallation> {
+function buildEnvStatus(dirName: string): Record<ManageableEnv, EnvInstallation> {
   const result = {} as Record<ManageableEnv, EnvInstallation>
   for (const { env, dir } of ENV_DIRS) {
     const entryPath = join(dir, dirName)
@@ -116,10 +116,7 @@ function buildEnvStatus(dirName: string, realDir: string): Record<ManageableEnv,
     }
     try {
       const isSymlink = lstatSync(entryPath).isSymbolicLink()
-      const resolved = realpathSync(entryPath)
-      result[env] = resolved === realDir
-        ? { installed: true, path: entryPath, isSymlink }
-        : { installed: false }
+      result[env] = { installed: true, path: entryPath, isSymlink }
     }
     catch {
       result[env] = { installed: false }
@@ -144,6 +141,7 @@ interface RawSkill {
   realDir: string
   skillMdPath: string
   plugin?: PluginMeta
+  nativeEnvs: Set<ManageableEnv>
 }
 
 // ── Directory Scanner ──
@@ -172,6 +170,7 @@ function scanSkillDir(dir: string): RawSkill[] {
       dirName: entry,
       realDir,
       skillMdPath: skillMd,
+      nativeEnvs: new Set(),
     })
   }
   return results
@@ -217,6 +216,7 @@ function scanPluginCache(cacheDir: string): RawSkill[] {
               realDir,
               skillMdPath: safeRealpath(skillMd) ?? skillMd,
               plugin: pluginMeta,
+              nativeEnvs: new Set(),
             })
           }
         }
@@ -242,6 +242,7 @@ function scanPluginCache(cacheDir: string): RawSkill[] {
               realDir: safeRealpath(filePath) ?? filePath,
               skillMdPath: safeRealpath(filePath) ?? filePath,
               plugin: pluginMeta,
+              nativeEnvs: new Set(),
             })
           }
         }
@@ -262,40 +263,65 @@ export function scanAllSkills(): SkillInfo[] {
   }
 
   const codexSystem = join(HOME, '.codex', 'skills', '.system')
-  if (existsSync(codexSystem)) rawSkills.push(...scanSkillDir(codexSystem))
+  if (existsSync(codexSystem)) {
+    for (const s of scanSkillDir(codexSystem)) {
+      s.nativeEnvs.add('codex')
+      rawSkills.push(s)
+    }
+  }
 
   const cursorBuiltin = join(HOME, '.cursor', 'skills-cursor')
-  if (existsSync(cursorBuiltin)) rawSkills.push(...scanSkillDir(cursorBuiltin))
+  if (existsSync(cursorBuiltin)) {
+    for (const s of scanSkillDir(cursorBuiltin)) {
+      s.nativeEnvs.add('cursor')
+      rawSkills.push(s)
+    }
+  }
 
   const pluginCache = join(HOME, '.cursor', 'plugins', 'cache')
-  if (existsSync(pluginCache)) rawSkills.push(...scanPluginCache(pluginCache))
+  if (existsSync(pluginCache)) {
+    for (const s of scanPluginCache(pluginCache)) {
+      s.nativeEnvs.add('cursor')
+      rawSkills.push(s)
+    }
+  }
 
-  const byRealDir = new Map<string, RawSkill>()
+  const byDirName = new Map<string, RawSkill>()
   for (const skill of rawSkills) {
-    const existing = byRealDir.get(skill.realDir)
+    const existing = byDirName.get(skill.dirName)
     if (!existing) {
-      byRealDir.set(skill.realDir, skill)
+      byDirName.set(skill.dirName, skill)
     }
     else {
       if (!existing.description && skill.description) existing.description = skill.description
       if (!existing.plugin && skill.plugin) existing.plugin = skill.plugin
+      for (const env of skill.nativeEnvs) existing.nativeEnvs.add(env)
     }
   }
 
-  return [...byRealDir.values()]
-    .map(skill => ({
-      id: skill.realDir,
-      name: skill.name,
-      description: skill.description,
-      type: skill.type,
-      dirName: skill.dirName,
-      realDir: skill.realDir,
-      skillMdPath: skill.skillMdPath,
-      plugin: skill.plugin,
-      envs: skill.type === 'command'
+  return [...byDirName.values()]
+    .map((skill) => {
+      const envs = skill.type === 'command'
         ? { ...EMPTY_ENV_STATUS }
-        : buildEnvStatus(skill.dirName, skill.realDir),
-    }))
+        : buildEnvStatus(skill.dirName)
+
+      for (const env of skill.nativeEnvs) {
+        if (!envs[env].installed)
+          envs[env] = { installed: true, path: skill.realDir }
+      }
+
+      return {
+        id: skill.dirName,
+        name: skill.name,
+        description: skill.description,
+        type: skill.type,
+        dirName: skill.dirName,
+        realDir: skill.realDir,
+        skillMdPath: skill.skillMdPath,
+        plugin: skill.plugin,
+        envs,
+      }
+    })
     .sort((a, b) => a.name.localeCompare(b.name))
 }
 
