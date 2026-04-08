@@ -63,15 +63,16 @@ export interface ChangedFile {
 }
 
 /**
- * Get all changed files: committed changes (baseSha..HEAD) + uncommitted + untracked.
- * If baseSha is null, only show uncommitted + untracked working tree changes.
+ * Get all changed files relative to baseSha.
+ * When baseSha is provided, compares baseSha to the working tree (committed + staged + unstaged).
+ * When baseSha is null, only shows uncommitted + untracked working tree changes.
  */
 export async function getChangedFiles(cwd: string, baseSha: string | null): Promise<ChangedFile[]> {
   const fileMap = new Map<string, ChangedFile>()
 
   if (baseSha) {
-    const numstat = await git(cwd, ['diff', '--numstat', '--diff-filter=ADMR', baseSha, 'HEAD']).catch(() => '')
-    const nameStatus = await git(cwd, ['diff', '--name-status', '--diff-filter=ADMR', baseSha, 'HEAD']).catch(() => '')
+    const numstat = await git(cwd, ['diff', '--numstat', '--diff-filter=ADMR', baseSha]).catch(() => '')
+    const nameStatus = await git(cwd, ['diff', '--name-status', '--diff-filter=ADMR', baseSha]).catch(() => '')
 
     const statusMap = new Map<string, string>()
     for (const line of nameStatus.split('\n')) {
@@ -95,19 +96,20 @@ export async function getChangedFiles(cwd: string, baseSha: string | null): Prom
       })
     }
   }
-
-  const wcNumstat = await git(cwd, ['diff', '--numstat']).catch(() => '')
-  for (const line of wcNumstat.split('\n')) {
-    if (!line) continue
-    const [add, del, ...pathParts] = line.split('\t')
-    const filePath = pathParts.join('\t')
-    if (fileMap.has(filePath)) continue
-    fileMap.set(filePath, {
-      path: filePath,
-      status: 'modified',
-      additions: add === '-' ? 0 : Number.parseInt(add, 10) || 0,
-      deletions: del === '-' ? 0 : Number.parseInt(del, 10) || 0,
-    })
+  else {
+    const wcNumstat = await git(cwd, ['diff', '--numstat']).catch(() => '')
+    for (const line of wcNumstat.split('\n')) {
+      if (!line) continue
+      const [add, del, ...pathParts] = line.split('\t')
+      const filePath = pathParts.join('\t')
+      if (fileMap.has(filePath)) continue
+      fileMap.set(filePath, {
+        path: filePath,
+        status: 'modified',
+        additions: add === '-' ? 0 : Number.parseInt(add, 10) || 0,
+        deletions: del === '-' ? 0 : Number.parseInt(del, 10) || 0,
+      })
+    }
   }
 
   const untracked = await git(cwd, ['ls-files', '--others', '--exclude-standard']).catch(() => '')
@@ -134,12 +136,14 @@ async function countFileLines(cwd: string, filePath: string): Promise<number> {
 }
 
 /**
- * Get unified diff for a single file. Handles committed, unstaged, and untracked files.
+ * Get unified diff for a single file.
+ * When baseSha is provided, compares baseSha to the working tree (covers committed + staged + unstaged).
+ * Falls back to unstaged diff or synthesises a new-file diff for untracked files.
  */
 export async function getFileDiff(cwd: string, baseSha: string | null, filePath: string): Promise<string> {
   if (baseSha) {
-    const committed = await git(cwd, ['diff', '--unified=5', baseSha, 'HEAD', '--', filePath]).catch(() => '')
-    if (committed) return committed
+    const diff = await git(cwd, ['diff', '--unified=5', baseSha, '--', filePath]).catch(() => '')
+    if (diff) return diff
   }
 
   const unstaged = await git(cwd, ['diff', '--unified=5', '--', filePath]).catch(() => '')

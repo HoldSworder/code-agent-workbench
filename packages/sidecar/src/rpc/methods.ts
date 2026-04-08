@@ -13,7 +13,7 @@ import { existsSync, writeFileSync } from 'node:fs'
 import { stringify as yamlStringify } from 'yaml'
 import type { WorkflowEngine } from '../workflow/engine'
 import { parseWorkflow } from '../workflow/parser'
-import { createBranch, getChangedFiles, getFileDiff } from '../git/operations'
+import { createBranch, getChangedFiles, getFileDiff, getMergeBase } from '../git/operations'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 import { readTranscript, listSessionsForRepo } from '../transcript/reader'
 import { scanAllSkills, readSkillContent, enableSkill, disableSkill, ENV_LABELS } from '../skill/scanner'
@@ -160,10 +160,25 @@ export function registerMethods(
   })
 
   // ── Changed files (git diff against initial commit) ──
+
+  async function resolveBaseSha(repoTaskId: string, worktreePath: string): Promise<string | null> {
+    const stored = commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+    if (stored) return stored
+    try {
+      const sha = await getMergeBase(worktreePath)
+      if (sha) {
+        commitRepo.save(repoTaskId, INITIAL_PHASE_ID, sha)
+        return sha
+      }
+    }
+    catch {}
+    return null
+  }
+
   server.register('task.changedFiles', async ({ repoTaskId }) => {
     const task = taskRepo.findById(repoTaskId)
     if (!task) throw new Error(`Task not found: ${repoTaskId}`)
-    const baseSha = commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+    const baseSha = await resolveBaseSha(repoTaskId, task.worktree_path)
     try {
       const files = await getChangedFiles(task.worktree_path, baseSha)
       return { files }
@@ -176,7 +191,7 @@ export function registerMethods(
   server.register('task.fileDiff', async ({ repoTaskId, filePath }) => {
     const task = taskRepo.findById(repoTaskId)
     if (!task) throw new Error(`Task not found: ${repoTaskId}`)
-    const baseSha = commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+    const baseSha = await resolveBaseSha(repoTaskId, task.worktree_path)
     try {
       const diff = await getFileDiff(task.worktree_path, baseSha, filePath)
       return { diff }
