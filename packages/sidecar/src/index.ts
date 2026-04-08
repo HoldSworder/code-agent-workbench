@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline'
 import { resolve, dirname, join } from 'node:path'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { getDb } from './db/connection'
@@ -14,6 +14,7 @@ import { SettingsRepository } from './db/repositories/settings.repo'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 const projectRoot = resolve(__dirname, '../../..')
+const workflowsDir = resolve(projectRoot, 'workflows')
 
 const dbPath = process.env.DB_PATH ?? resolve(__dirname, '..', 'code-agent.db')
 const workflowPath = process.env.WORKFLOW_PATH ?? resolve(process.cwd(), 'workflow.yaml')
@@ -45,6 +46,12 @@ function resolveSkillContent(skillPath: string): string {
       resolve(skillPath),
       resolve(projectRoot, skillPath),
     ]
+    if (existsSync(workflowsDir)) {
+      for (const entry of readdirSync(workflowsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        candidates.push(resolve(workflowsDir, entry.name, skillPath))
+      }
+    }
     for (const p of candidates) {
       if (existsSync(p))
         return readFileSync(p, 'utf-8')
@@ -166,6 +173,22 @@ const engine = new WorkflowEngine({
   },
   resolveSkillContent,
 })
+
+if (existsSync(workflowsDir)) {
+  for (const entry of readdirSync(workflowsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const wfYamlPath = resolve(workflowsDir, entry.name, 'workflow.yaml')
+    if (existsSync(wfYamlPath)) {
+      try {
+        const yaml = readFileSync(wfYamlPath, 'utf-8')
+        engine.addWorkflow(entry.name, yaml)
+      }
+      catch (err) {
+        process.stderr.write(`sidecar: failed to load workflow ${entry.name}: ${err}\n`)
+      }
+    }
+  }
+}
 
 engine.recoverMcpBackups()
 

@@ -54,8 +54,10 @@ export class WorkflowEngine {
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
   private activatedPhases = new Map<string, Set<string>>()
+  private pendingAdvance = new Set<string>()
 
   private rawYaml: string
+  private configs = new Map<string, WorkflowConfig>()
 
   constructor(opts: WorkflowEngineOptions) {
     this.db = opts.db
@@ -72,6 +74,29 @@ export class WorkflowEngine {
     this.mcpBindingRepo = new McpBindingRepository(this.db)
     this.repoRepo = new RepoRepository(this.db)
     this.settingsRepo = new SettingsRepository(this.db)
+  }
+
+  addWorkflow(id: string, yamlContent: string): void {
+    const config = parseWorkflow(yamlContent)
+    this.configs.set(id, config)
+  }
+
+  listWorkflows(): { id: string, name: string, description: string }[] {
+    const result = [{ id: 'default', name: this.config.name, description: this.config.description ?? '' }]
+    for (const [id, config] of this.configs) {
+      result.push({ id, name: config.name, description: config.description ?? '' })
+    }
+    return result
+  }
+
+  getWorkflowConfig(workflowId?: string | null): WorkflowConfig {
+    if (!workflowId || workflowId === 'default') return this.config
+    return this.configs.get(workflowId) ?? this.config
+  }
+
+  private resolveConfigForTask(repoTaskId: string): WorkflowConfig {
+    const task = this.taskRepo.findById(repoTaskId)
+    return this.getWorkflowConfig(task?.workflow_id)
   }
 
   recoverMcpBackups(): void {
@@ -122,18 +147,19 @@ export class WorkflowEngine {
   inferStageAndPhase(
     worktreePath: string,
     openspecPath: string,
+    wfConfig: WorkflowConfig = this.config,
   ): { stageId: string, phaseId: string } {
-    const rules = this.config.state_inference?.rules
+    const rules = wfConfig.state_inference?.rules
     const fallback = {
-      stageId: this.config.stages[0].id,
-      phaseId: this.config.stages[0].phases[0].id,
+      stageId: wfConfig.stages[0].id,
+      phaseId: wfConfig.stages[0].phases[0].id,
     }
 
     if (!rules?.length)
       return fallback
 
     for (const rule of rules) {
-      if (this.evaluateGate(rule.condition, worktreePath, openspecPath))
+      if (this.evaluateGate(rule.condition, worktreePath, openspecPath, wfConfig))
         return { stageId: rule.stage, phaseId: rule.phase }
     }
 
@@ -148,8 +174,9 @@ export class WorkflowEngine {
     condition: string,
     worktreePath: string,
     openspecPath: string,
+    wfConfig: WorkflowConfig = this.config,
   ): boolean {
-    const def = this.config.gate_definitions?.[condition]
+    const def = wfConfig.gate_definitions?.[condition]
     if (!def) {
       elog(`evaluateGate: condition "${condition}" not found in gate_definitions, returning false`)
       return false
@@ -325,15 +352,16 @@ export class WorkflowEngine {
 
   routeTrigger(
     userInput: string,
+    wfConfig: WorkflowConfig = this.config,
   ): { targetStage: string, targetPhase?: string, strategy?: 'infer_from_state' } | null {
-    for (const stage of this.config.stages) {
+    for (const stage of wfConfig.stages) {
       for (const phase of stage.phases) {
         if (phase.triggers?.some(t => userInput.includes(t)))
           return { targetStage: stage.id, targetPhase: phase.id }
       }
     }
 
-    for (const mapping of this.config.trigger_mapping ?? []) {
+    for (const mapping of wfConfig.trigger_mapping ?? []) {
       if (mapping.patterns.some(p => userInput.includes(p))) {
         if (mapping.strategy === 'infer_from_state')
           return { targetStage: mapping.target_stage, strategy: 'infer_from_state' }
@@ -346,35 +374,47 @@ export class WorkflowEngine {
 
   // ── 工作流生命周期 ──
 
-  async startWorkflow(repoTaskId: string): Promise<void> {
+  async startWorkflow(repoTaskId: string, workflowId?: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
 
+    if (workflowId !== undefined) {
+      this.taskRepo.updateWorkflowId(
+        repoTaskId,
+        !workflowId || workflowId === 'default' ? null : workflowId,
+      )
+    }
+
+    const taskFresh = this.taskRepo.findById(repoTaskId)!
+    const wf = this.resolveConfigForTask(repoTaskId)
+
     if (!this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)) {
       try {
-        const sha = await getMergeBase(task.worktree_path) ?? await getHead(task.worktree_path)
+        const sha = await getMergeBase(taskFresh.worktree_path) ?? await getHead(taskFresh.worktree_path)
         this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, sha)
       }
       catch { /* non-git worktree, skip */ }
     }
 
-    const { stageId, phaseId } = this.inferStageAndPhase(task.worktree_path, task.openspec_path)
-    const found = findPhaseInStages(this.config.stages, stageId, phaseId)
-    const stage = found?.stage ?? this.config.stages[0]
-    const phase = found?.phase ?? this.config.stages[0].phases[0]
+    const { stageId, phaseId } = this.inferStageAndPhase(taskFresh.worktree_path, taskFresh.openspec_path, wf)
+    const found = findPhaseInStages(wf.stages, stageId, phaseId)
+    const stage = found?.stage ?? wf.stages[0]
+    const phase = found?.phase ?? wf.stages[0].phases[0]
 
     this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
     await this.executePhase(repoTaskId, phase, stage)
   }
 
-  async confirmPhase(repoTaskId: string): Promise<void> {
+  async confirmPhase(repoTaskId: string, options?: { advance?: boolean }): Promise<void> {
+    const advance = options?.advance ?? false
     const task = this.taskRepo.findById(repoTaskId)
-    elog(`confirmPhase: task=${repoTaskId} stage=${task?.current_stage} phase=${task?.current_phase} status=${task?.phase_status}`)
-    if (!task || task.phase_status !== 'waiting_confirm')
-      throw new Error(`Task ${repoTaskId} is not in waiting_confirm state`)
+    elog(`confirmPhase: task=${repoTaskId} stage=${task?.current_stage} phase=${task?.current_phase} status=${task?.phase_status} advance=${advance}`)
+    if (!task || (task.phase_status !== 'waiting_confirm' && task.phase_status !== 'waiting_input'))
+      throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
 
-    const found = findPhaseById(this.config.stages, task.current_phase)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, task.current_phase)
     if (!found)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
     const { stage, phase } = found
@@ -404,8 +444,13 @@ export class WorkflowEngine {
       return
     }
 
+    if (!advance) {
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_event')
+      return
+    }
+
     if (phase.loopable && phase.loop_target) {
-      const loopTarget = findPhaseById(this.config.stages, phase.loop_target)
+      const loopTarget = findPhaseById(wf.stages, phase.loop_target)
       if (loopTarget) {
         this.taskRepo.updatePhase(repoTaskId, loopTarget.stage.id, loopTarget.phase.id, 'running')
         await this.executePhase(repoTaskId, loopTarget.phase, loopTarget.stage)
@@ -427,11 +472,12 @@ export class WorkflowEngine {
   async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} feedback=${feedback.slice(0, 100)}`)
-    const allowedStates = ['waiting_confirm', 'failed', 'cancelled']
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'failed', 'cancelled']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
 
-    const found = findPhaseById(this.config.stages, task.current_phase)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, task.current_phase)
     if (!found)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
     const { stage, phase } = found
@@ -447,8 +493,35 @@ export class WorkflowEngine {
     await this.executePhase(repoTaskId, phase, stage, feedback)
   }
 
+  async confirmAndExecute(repoTaskId: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    elog(`confirmAndExecute: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
+    const allowedStates = ['waiting_confirm', 'waiting_input']
+    if (!task || !allowedStates.includes(task.phase_status))
+      throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, task.current_phase)
+    if (!found)
+      throw new Error(`Phase ${task.current_phase} not found in workflow config`)
+    const { stage, phase } = found
+
+    const feedback = '用户已确认，请实施方案并完成本阶段所有产出。'
+    this.msgRepo.create({
+      repo_task_id: repoTaskId,
+      phase_id: phase.id,
+      role: 'user',
+      content: feedback,
+    })
+
+    this.pendingAdvance.add(repoTaskId)
+    this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+    await this.executePhase(repoTaskId, phase, stage, feedback)
+  }
+
   async routeAndExecute(repoTaskId: string, userInput: string): Promise<string | null> {
-    const match = this.routeTrigger(userInput)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const match = this.routeTrigger(userInput, wf)
     if (!match)
       return null
 
@@ -458,7 +531,7 @@ export class WorkflowEngine {
     }
 
     if (match.targetPhase) {
-      const found = findPhaseInStages(this.config.stages, match.targetStage, match.targetPhase)
+      const found = findPhaseInStages(wf.stages, match.targetStage, match.targetPhase)
       if (found) {
         if (found.phase.optional)
           this.activatePhase(repoTaskId, found.phase.id)
@@ -468,7 +541,7 @@ export class WorkflowEngine {
       }
     }
 
-    const stage = this.config.stages.find(s => s.id === match.targetStage)
+    const stage = wf.stages.find(s => s.id === match.targetStage)
     if (stage) {
       const phase = stage.phases[0]
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
@@ -487,7 +560,8 @@ export class WorkflowEngine {
     if (task.phase_status !== 'failed' && task.phase_status !== 'cancelled')
       throw new Error(`Task ${repoTaskId} is not in a retryable state (current: ${task.phase_status})`)
 
-    const found = findPhaseById(this.config.stages, task.current_phase)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, task.current_phase)
     if (!found)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
 
@@ -515,7 +589,8 @@ export class WorkflowEngine {
     this.msgRepo.deleteByTask(repoTaskId)
     this.runRepo.deleteByTask(repoTaskId)
     this.commitRepo.deleteByTask(repoTaskId)
-    const firstStage = this.config.stages[0]
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const firstStage = wf.stages[0]
     const firstPhase = firstStage.phases[0]
     this.taskRepo.updatePhase(repoTaskId, firstStage.id, firstPhase.id, 'pending')
   }
@@ -538,11 +613,12 @@ export class WorkflowEngine {
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
 
-    const target = findPhaseInStages(this.config.stages, targetStageId, targetPhaseId)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const target = findPhaseInStages(wf.stages, targetStageId, targetPhaseId)
     if (!target)
       throw new Error(`Phase "${targetPhaseId}" not found in stage "${targetStageId}"`)
 
-    const current = findPhaseById(this.config.stages, task.current_phase)
+    const current = findPhaseById(wf.stages, task.current_phase)
     if (current) {
       const targetFlat = target.stageIdx * 10000 + target.phaseIdx
       const currentFlat = current.stageIdx * 10000 + current.phaseIdx
@@ -558,7 +634,7 @@ export class WorkflowEngine {
       resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
     }
     else {
-      const allPhases = flattenPhases(this.config)
+      const allPhases = flattenPhases(wf)
       const flatIdx = allPhases.findIndex(
         p => p.id === targetPhaseId && p.stageId === targetStageId,
       )
@@ -578,7 +654,7 @@ export class WorkflowEngine {
       catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
     }
 
-    const phasesToClear = this.collectPhaseIdsAfter(target.stageIdx, target.phaseIdx)
+    const phasesToClear = this.collectPhaseIdsAfter(target.stageIdx, target.phaseIdx, wf)
     this.msgRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.runRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
@@ -588,7 +664,8 @@ export class WorkflowEngine {
   }
 
   async rollbackToStage(repoTaskId: string, targetStageId: string): Promise<void> {
-    const stage = this.config.stages.find(s => s.id === targetStageId)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const stage = wf.stages.find(s => s.id === targetStageId)
     if (!stage)
       throw new Error(`Stage "${targetStageId}" not found`)
     await this.rollbackToPhase(repoTaskId, targetStageId, stage.phases[0].id)
@@ -611,8 +688,9 @@ export class WorkflowEngine {
     return this.resolveSkillContent(skillPath)
   }
 
-  getStagesAndPhases(): { id: string, name: string, phases: { id: string, name: string }[] }[] {
-    return this.config.stages.map(s => ({
+  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, phases: { id: string, name: string }[] }[] {
+    const wf = this.getWorkflowConfig(workflowId)
+    return wf.stages.map(s => ({
       id: s.id,
       name: s.name,
       phases: s.phases.map(p => ({ id: p.id, name: p.name })),
@@ -633,11 +711,12 @@ export class WorkflowEngine {
     phaseId: string,
     userMessage?: string,
   ): Promise<void> {
-    const phase = (this.config.requirement_phases ?? []).find(p => p.id === phaseId)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const phase = (wf.requirement_phases ?? []).find(p => p.id === phaseId)
     if (!phase)
       throw new Error(`Requirement phase "${phaseId}" not found`)
 
-    const virtualStage: StageConfig = { id: '_requirements', name: '需求收集', phases: this.config.requirement_phases ?? [] }
+    const virtualStage: StageConfig = { id: '_requirements', name: '需求收集', phases: wf.requirement_phases ?? [] }
     this.taskRepo.updatePhase(repoTaskId, '_requirements', phaseId, 'running')
     await this.executePhase(repoTaskId, phase, virtualStage, userMessage)
   }
@@ -710,10 +789,11 @@ export class WorkflowEngine {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) throw new Error(`Task not found: ${repoTaskId}`)
 
-    const found = findPhaseById(this.config.stages, phaseId)
-      ?? (this.config.requirement_phases ?? []).map((p, i) => {
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, phaseId)
+      ?? (wf.requirement_phases ?? []).map((p, i) => {
         if (p.id !== phaseId) return null
-        const virtualStage = { id: '_requirements', name: '需求收集', phases: this.config.requirement_phases ?? [] }
+        const virtualStage = { id: '_requirements', name: '需求收集', phases: wf.requirement_phases ?? [] }
         return { stage: virtualStage, phase: p, stageIdx: -1, phaseIdx: i }
       }).find(Boolean)
 
@@ -732,8 +812,8 @@ export class WorkflowEngine {
 
     const ctxDeps = {
       resolveSkillContent: this.resolveSkillContent,
-      guardrailDefinitions: this.config.guardrail_definitions,
-      gateDefinitions: this.config.gate_definitions,
+      guardrailDefinitions: wf.guardrail_definitions,
+      gateDefinitions: wf.gate_definitions,
     }
 
     const context = buildPhaseContext(
@@ -770,12 +850,14 @@ export class WorkflowEngine {
 
     try {
       const task = this.taskRepo.findById(repoTaskId)!
+      const wf = this.resolveConfigForTask(repoTaskId)
 
       if (phase.entry_gate && !options?.skipEntryGate) {
         const gatePassed = this.evaluateGate(
           phase.entry_gate,
           task.worktree_path,
           task.openspec_path,
+          wf,
         )
         if (!gatePassed) {
           elog(`executePhase: entry_gate "${phase.entry_gate}" BLOCKED for phase ${phase.id}`)
@@ -806,8 +888,8 @@ export class WorkflowEngine {
 
       const ctxDeps = {
         resolveSkillContent: this.resolveSkillContent,
-        guardrailDefinitions: this.config.guardrail_definitions,
-        gateDefinitions: this.config.gate_definitions,
+        guardrailDefinitions: wf.guardrail_definitions,
+        gateDefinitions: wf.gate_definitions,
       }
 
       const context = isResume
@@ -910,7 +992,7 @@ export class WorkflowEngine {
           repo_task_id: repoTaskId,
           phase_id: phase.id,
           role: 'assistant',
-          content: result.output,
+          content: this.stripPhaseSignals(result.output),
         })
       }
 
@@ -937,10 +1019,29 @@ export class WorkflowEngine {
     stage: StageConfig,
     result: PhaseResult,
   ): Promise<void> {
-    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} error=${result.error?.slice(0, 200) ?? 'none'}`)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const agentSignal = this.parsePhaseSignal(result.output)
+    const shouldAutoAdvance = this.pendingAdvance.has(repoTaskId)
+    if (shouldAutoAdvance) this.pendingAdvance.delete(repoTaskId)
+    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} agentSignal=${agentSignal} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} autoAdvance=${shouldAutoAdvance} error=${result.error?.slice(0, 200) ?? 'none'}`)
+
     if (result.status === 'failed' || result.status === 'cancelled') {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, result.status)
       return
+    }
+
+    if (result.status === 'pending_input' || agentSignal === 'pending_input') {
+      if (!shouldAutoAdvance) {
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: phase.id,
+          role: 'system',
+          content: `阶段「${phase.name}」等待你的反馈后继续执行。`,
+        })
+        this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
+        return
+      }
+      elog(`handlePhaseResult: autoAdvance overrides pending_input, proceeding`)
     }
 
     try {
@@ -959,23 +1060,27 @@ export class WorkflowEngine {
           phase.completion_check,
           task.worktree_path,
           task.openspec_path,
+          wf,
         )
-        elog(`handlePhaseResult: completion_check="${phase.completion_check}" passed=${passed}`)
+        elog(`handlePhaseResult: completion_check="${phase.completion_check}" passed=${passed} agentSignal=${agentSignal}`)
         if (!passed) {
-          const reason = `阶段「${phase.name}」的完成条件「${phase.completion_check}」未满足，请检查产出后重试或提供反馈。`
+          const gateDef = wf.gate_definitions?.[phase.completion_check]
+          const desc = gateDef?.description ?? phase.completion_check
           this.msgRepo.create({
             repo_task_id: repoTaskId,
             phase_id: phase.id,
-            role: 'assistant',
-            content: reason,
+            role: 'system',
+            content: agentSignal === 'complete'
+              ? `Agent 声明已完成，但完成条件「${desc}」未通过验证，请检查产出后反馈。`
+              : `阶段「${phase.name}」产出未就绪（${desc}），请反馈后继续。`,
           })
-          this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_confirm')
+          this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
           return
         }
       }
     }
 
-    if (phase.requires_confirm) {
+    if (phase.requires_confirm && !shouldAutoAdvance) {
       this.msgRepo.create({
         repo_task_id: repoTaskId,
         phase_id: phase.id,
@@ -992,7 +1097,7 @@ export class WorkflowEngine {
     }
 
     if (phase.loopable && phase.loop_target) {
-      const loopTarget = findPhaseById(this.config.stages, phase.loop_target)
+      const loopTarget = findPhaseById(wf.stages, phase.loop_target)
       if (loopTarget) {
         this.taskRepo.updatePhase(repoTaskId, loopTarget.stage.id, loopTarget.phase.id, 'running')
         await this.executePhase(repoTaskId, loopTarget.phase, loopTarget.stage)
@@ -1017,11 +1122,12 @@ export class WorkflowEngine {
     currentStageId: string,
     currentPhaseId: string,
   ): { stage: StageConfig, phase: PhaseConfig } | undefined {
-    const loc = findPhaseInStages(this.config.stages, currentStageId, currentPhaseId)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const loc = findPhaseInStages(wf.stages, currentStageId, currentPhaseId)
     if (!loc) return undefined
 
     const { stageIdx, phaseIdx } = loc
-    const stages = this.config.stages
+    const stages = wf.stages
     const currentStage = stages[stageIdx]
 
     for (let pi = phaseIdx + 1; pi < currentStage.phases.length; pi++) {
@@ -1048,14 +1154,15 @@ export class WorkflowEngine {
   }
 
   private checkStageGate(repoTaskId: string, stageId: string): boolean {
-    const stage = this.config.stages.find(s => s.id === stageId)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const stage = wf.stages.find(s => s.id === stageId)
     if (!stage?.gate)
       return true
 
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) return false
 
-    return this.evaluateGate(stage.gate, task.worktree_path, task.openspec_path)
+    return this.evaluateGate(stage.gate, task.worktree_path, task.openspec_path, wf)
   }
 
   private hasPhaseCompleted(repoTaskId: string, phaseId: string): boolean {
@@ -1065,8 +1172,9 @@ export class WorkflowEngine {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) return false
 
-    const target = findPhaseById(this.config.stages, phaseId)
-    const current = findPhaseById(this.config.stages, task.current_phase)
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const target = findPhaseById(wf.stages, phaseId)
+    const current = findPhaseById(wf.stages, task.current_phase)
 
     if (!target) return false
     if (!current) return true
@@ -1075,9 +1183,25 @@ export class WorkflowEngine {
       > (target.stageIdx * 10000 + target.phaseIdx)
   }
 
-  private collectPhaseIdsAfter(stageIdx: number, phaseIdx: number): string[] {
+  /**
+   * 从 Agent 输出中解析状态标记。
+   * Agent 应在回复末尾附加 <<PHASE_COMPLETE>> 或 <<PENDING_INPUT>>。
+   */
+  private parsePhaseSignal(output?: string): 'complete' | 'pending_input' | null {
+    if (!output) return null
+    const tail = output.slice(-500)
+    if (tail.includes('<<PENDING_INPUT>>')) return 'pending_input'
+    if (tail.includes('<<PHASE_COMPLETE>>')) return 'complete'
+    return null
+  }
+
+  private stripPhaseSignals(text: string): string {
+    return text.replace(/\s*<<(?:PHASE_COMPLETE|PENDING_INPUT)>>\s*/g, '').trimEnd()
+  }
+
+  private collectPhaseIdsAfter(stageIdx: number, phaseIdx: number, wf: WorkflowConfig): string[] {
     const result: string[] = []
-    const stages = this.config.stages
+    const stages = wf.stages
     for (let pi = phaseIdx; pi < stages[stageIdx].phases.length; pi++) {
       result.push(stages[stageIdx].phases[pi].id)
     }

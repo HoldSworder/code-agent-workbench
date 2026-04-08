@@ -117,7 +117,7 @@ export function registerMethods(
 
   server.register(
     'task.create',
-    async (params: { requirementId: string, repoId: string }) => {
+    async (params: { requirementId: string, repoId: string, workflowId?: string }) => {
       const requirement = reqRepo.findById(params.requirementId)
       if (!requirement)
         throw new Error(`Requirement not found: ${params.requirementId}`)
@@ -143,6 +143,7 @@ export function registerMethods(
         change_id: changeId,
         openspec_path: openspecPath,
         worktree_path: repo.local_path,
+        workflow_id: params.workflowId,
       })
     },
   )
@@ -205,19 +206,29 @@ export function registerMethods(
   )
 
   // ── Workflow actions ──
-  server.register('workflow.start', async ({ repoTaskId }) => {
+  server.register('workflow.listAll', async () => {
+    return { workflows: engine.listWorkflows() }
+  })
+
+  server.register('workflow.start', async ({ repoTaskId, workflowId }: { repoTaskId: string, workflowId?: string }) => {
     const task = taskRepo.findById(repoTaskId)
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
 
-    engine.startWorkflow(repoTaskId).catch((err) => {
+    engine.startWorkflow(repoTaskId, workflowId).catch((err) => {
       process.stderr.write(`[workflow] start failed for ${repoTaskId}: ${err}\n`)
     })
     return { ok: true }
   })
-  server.register('workflow.confirm', async ({ repoTaskId }) => {
-    engine.confirmPhase(repoTaskId).catch((err) => {
+  server.register('workflow.confirm', async ({ repoTaskId, advance }) => {
+    engine.confirmPhase(repoTaskId, { advance: !!advance }).catch((err) => {
       process.stderr.write(`[workflow] confirm failed for ${repoTaskId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
+  server.register('workflow.confirmAndAdvance', async ({ repoTaskId }) => {
+    engine.confirmAndExecute(repoTaskId).catch((err) => {
+      process.stderr.write(`[workflow] confirmAndAdvance failed for ${repoTaskId}: ${err}\n`)
     })
     return { ok: true }
   })
@@ -270,8 +281,8 @@ export function registerMethods(
     return { ok: true }
   })
 
-  server.register('workflow.phases', async () => {
-    return { stages: engine.getStagesAndPhases() }
+  server.register('workflow.phases', async ({ workflowId }: { workflowId?: string } = {}) => {
+    return { stages: engine.getStagesAndPhases(workflowId) }
   })
 
   server.register('workflow.requirementPhases', async () => {
@@ -290,7 +301,8 @@ export function registerMethods(
     const task = taskRepo.findById(repoTaskId)
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
-    return engine.inferStageAndPhase(task.worktree_path, task.openspec_path)
+    const wf = engine.getWorkflowConfig(task.workflow_id)
+    return engine.inferStageAndPhase(task.worktree_path, task.openspec_path, wf)
   })
 
   // ── 新增：触发语路由 ──

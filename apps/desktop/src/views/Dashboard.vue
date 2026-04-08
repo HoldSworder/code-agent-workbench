@@ -75,7 +75,9 @@ const statusBadge: Record<string, { label: string, class: string }> = {
 }
 
 const phaseStatusLabels: Record<string, string> = {
+  pending: '待启动',
   running: '运行中',
+  waiting_input: '待反馈',
   waiting_confirm: '待确认',
   waiting_event: '等待事件',
   completed: '已完成',
@@ -84,6 +86,10 @@ const phaseStatusLabels: Record<string, string> = {
 }
 
 function phaseStatusClass(status: string) {
+  if (status === 'pending')
+    return 'text-gray-500 dark:text-gray-400'
+  if (status === 'waiting_input')
+    return 'text-orange-600 dark:text-orange-400'
   if (status === 'waiting_confirm')
     return 'text-amber-600 dark:text-amber-400'
   if (status === 'running')
@@ -233,15 +239,14 @@ const dispatchedRepoIds = computed(() => {
   return new Set(tasks.map(t => t.repo_id))
 })
 
-async function dispatchAndStart() {
+async function dispatchToRepos() {
   if (!selectedRepoIds.value.length)
     return
   dispatching.value = true
   dispatchError.value = ''
   try {
     for (const repoId of selectedRepoIds.value) {
-      const task = await tasksStore.createTask(dispatchReqId.value, repoId)
-      await tasksStore.startWorkflow(task.id)
+      await tasksStore.createTask(dispatchReqId.value, repoId)
     }
     showDispatchDialog.value = false
     await refreshTaskMap()
@@ -505,8 +510,10 @@ async function retryTask(taskId: string) {
                   class="flex items-center gap-2 px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors"
                   :class="{
                     'bg-amber-50 dark:bg-amber-500/10': task.phase_status === 'waiting_confirm',
+                    'bg-orange-50 dark:bg-orange-500/10': task.phase_status === 'waiting_input',
                     'bg-red-50 dark:bg-red-500/10': task.phase_status === 'failed',
-                    'bg-gray-50 dark:bg-white/5': task.phase_status !== 'waiting_confirm' && task.phase_status !== 'failed',
+                    'bg-slate-50 dark:bg-slate-500/10 border border-dashed border-slate-300 dark:border-slate-600': task.phase_status === 'pending',
+                    'bg-gray-50 dark:bg-white/5': !['waiting_confirm', 'waiting_input', 'failed', 'pending'].includes(task.phase_status),
                   }"
                 >
                   <div class="i-carbon-folder-details w-3.5 h-3.5 text-gray-400 opacity-60" />
@@ -517,8 +524,9 @@ async function retryTask(taskId: string) {
                     ({{ phaseStatusLabels[task.phase_status] || task.phase_status }})
                   </span>
                   <div
-                    v-if="task.phase_status === 'waiting_confirm'"
-                    class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"
+                    v-if="task.phase_status === 'waiting_confirm' || task.phase_status === 'waiting_input'"
+                    class="w-1.5 h-1.5 rounded-full animate-pulse"
+                    :class="task.phase_status === 'waiting_input' ? 'bg-orange-400' : 'bg-amber-400'"
                   />
                   <button
                     v-if="task.phase_status === 'failed' || task.phase_status === 'cancelled'"
@@ -758,7 +766,7 @@ async function retryTask(taskId: string) {
             <div class="bg-white dark:bg-[#2c2c30] rounded-2xl shadow-2xl shadow-black/10 w-full max-w-md p-6">
               <h2 class="text-base font-semibold mb-1">分发到仓库</h2>
               <p class="text-[13px] text-gray-400 mb-5">
-                选择要分发的仓库，将为每个仓库创建独立任务并启动工作流
+                选择要分发的仓库，将为每个仓库创建独立任务（分发后可在仓库页面选择工作流并启动）
               </p>
 
               <div class="space-y-2 max-h-64 overflow-y-auto">
@@ -808,11 +816,11 @@ async function retryTask(taskId: string) {
                 <button
                   class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
                   :disabled="selectedRepoIds.length === 0 || dispatching"
-                  @click="dispatchAndStart"
+                  @click="dispatchToRepos"
                 >
                   <div v-if="dispatching" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
-                  <div v-else class="i-carbon-play-filled w-4 h-4" />
-                  {{ dispatching ? '分发中...' : `分发并启动 (${selectedRepoIds.length})` }}
+                  <div v-else class="i-carbon-deploy w-4 h-4" />
+                  {{ dispatching ? '分发中...' : `分发到仓库 (${selectedRepoIds.length})` }}
                 </button>
               </div>
             </div>

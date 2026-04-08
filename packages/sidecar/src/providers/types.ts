@@ -33,7 +33,7 @@ export interface PhaseContext {
 }
 
 export interface PhaseResult {
-  status: 'success' | 'failed' | 'cancelled'
+  status: 'success' | 'failed' | 'cancelled' | 'pending_input'
   output?: string
   error?: string
   tokenUsage?: number

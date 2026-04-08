@@ -51,11 +51,71 @@ const stageNameMap = computed(() => {
   return map
 })
 
+// ── Workflow selection for pending tasks ──
+
+interface WorkflowInfo {
+  id: string
+  name: string
+  description: string
+}
+
+const availableWorkflows = ref<WorkflowInfo[]>([])
+const showWorkflowPicker = ref(false)
+const workflowPickerTaskId = ref('')
+const selectedWorkflowId = ref('')
+const startingWorkflow = ref(false)
+
+function openWorkflowPicker(taskId: string) {
+  workflowPickerTaskId.value = taskId
+  selectedWorkflowId.value = availableWorkflows.value[0]?.id ?? ''
+  showWorkflowPicker.value = true
+}
+
+async function confirmStartWithWorkflow() {
+  const taskId = workflowPickerTaskId.value
+  if (!taskId || !selectedWorkflowId.value) return
+  startingWorkflow.value = true
+  try {
+    await rpc('workflow.start', {
+      repoTaskId: taskId,
+      workflowId: selectedWorkflowId.value,
+    })
+    showWorkflowPicker.value = false
+    await tasksStore.fetchByRepo(repoId.value)
+    router.push(`/repo/${repoId.value}/task/${taskId}`)
+  }
+  catch (err) {
+    console.error('Failed to start workflow:', err)
+  }
+  finally {
+    startingWorkflow.value = false
+  }
+}
+
+function handleTaskClick(task: { id: string, phase_status: string }) {
+  if (task.phase_status === 'pending') {
+    openWorkflowPicker(task.id)
+  }
+  else {
+    openTask(task.id)
+  }
+}
+
 const statusConfig: Record<string, { label: string, dotClass: string, badgeClass: string }> = {
+  pending: {
+    label: '待启动',
+    dotClass: 'bg-gray-400 dark:bg-gray-500',
+    badgeClass: 'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400',
+  },
   running: {
     label: '运行中',
     dotClass: 'bg-indigo-500 animate-pulse',
     badgeClass: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400',
+  },
+  waiting_input: {
+    label: '待反馈',
+    dotClass: 'bg-orange-400 animate-pulse',
+    badgeClass: 'bg-orange-50 text-orange-600 dark:bg-orange-500/10 dark:text-orange-400',
   },
   waiting_confirm: {
     label: '待确认',
@@ -92,7 +152,7 @@ const requirementById = computed(() =>
   Object.fromEntries(requirementsStore.requirements.map(r => [r.id, r])),
 )
 
-const ACTIVE_STATUSES = new Set(['running', 'waiting_confirm', 'waiting_event', 'failed'])
+const ACTIVE_STATUSES = new Set(['pending', 'running', 'waiting_input', 'waiting_confirm', 'waiting_event', 'failed'])
 
 const activeTasks = computed(() =>
   tasksStore.tasks
@@ -362,6 +422,10 @@ onMounted(async () => {
       if (res?.stages)
         workflowStages.value = res.stages
     }),
+    rpc<{ workflows: WorkflowInfo[] }>('workflow.listAll').then((res) => {
+      if (res?.workflows)
+        availableWorkflows.value = res.workflows
+    }),
   ])
   await loadRepoData()
 })
@@ -450,8 +514,11 @@ async function retryTask(taskId: string) {
               <div
                 v-for="task in activeTasks"
                 :key="task.id"
-                class="group bg-white dark:bg-[#28282c] rounded-xl p-3.5 shadow-sm shadow-black/[0.04] dark:shadow-none border border-gray-100 dark:border-white/[0.04] transition-all duration-150 cursor-pointer hover:shadow-md hover:shadow-black/[0.06] hover:border-gray-200 dark:hover:border-white/[0.08]"
-                @click="openTask(task.id)"
+                class="group bg-white dark:bg-[#28282c] rounded-xl p-3.5 shadow-sm shadow-black/[0.04] dark:shadow-none border transition-all duration-150 cursor-pointer hover:shadow-md hover:shadow-black/[0.06]"
+                :class="task.phase_status === 'pending'
+                  ? 'border-dashed border-gray-300 dark:border-gray-600 hover:border-indigo-400 dark:hover:border-indigo-500'
+                  : 'border-gray-100 dark:border-white/[0.04] hover:border-gray-200 dark:hover:border-white/[0.08]'"
+                @click="handleTaskClick(task)"
               >
                 <div class="flex items-start gap-3">
                   <div class="mt-1.5 shrink-0">
@@ -469,7 +536,12 @@ async function retryTask(taskId: string) {
                         class="shrink-0 px-2 py-0.5 rounded-md text-[10px] font-medium"
                         :class="statusConfig[task.phase_status]?.badgeClass"
                       >
-                        {{ stageNameMap[task.current_phase] ? `${stageNameMap[task.current_phase]} · ` : '' }}{{ phaseNameMap[task.current_phase] ?? task.current_phase }} · {{ statusConfig[task.phase_status]?.label ?? task.phase_status }}
+                        <template v-if="task.phase_status === 'pending'">
+                          待启动 · 点击选择工作流
+                        </template>
+                        <template v-else>
+                          {{ stageNameMap[task.current_phase] ? `${stageNameMap[task.current_phase]} · ` : '' }}{{ phaseNameMap[task.current_phase] ?? task.current_phase }} · {{ statusConfig[task.phase_status]?.label ?? task.phase_status }}
+                        </template>
                       </span>
                     </div>
                     <div class="flex items-center gap-3 text-[11px] text-gray-400">
@@ -477,7 +549,14 @@ async function retryTask(taskId: string) {
                       <span class="shrink-0 tabular-nums">{{ timeAgo(task.updated_at) }}</span>
                     </div>
                   </div>
-                  <div class="i-carbon-chevron-right w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 mt-1 opacity-0 group-hover:opacity-100 transition-opacity" />
+                  <div
+                    v-if="task.phase_status === 'pending'"
+                    class="i-carbon-play-filled w-4 h-4 text-indigo-500 shrink-0 mt-1 opacity-60 group-hover:opacity-100 transition-opacity"
+                  />
+                  <div
+                    v-else
+                    class="i-carbon-chevron-right w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 mt-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                  />
                 </div>
 
                 <div
@@ -832,6 +911,85 @@ async function retryTask(taskId: string) {
               {{ transcriptFilePath }}
             </div>
           </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- Workflow selection dialog -->
+    <Teleport to="body">
+      <Transition
+        enter-active-class="transition-all duration-200 ease-out"
+        leave-active-class="transition-all duration-150 ease-in"
+        enter-from-class="opacity-0"
+        leave-to-class="opacity-0"
+      >
+        <div
+          v-if="showWorkflowPicker"
+          class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+          @click.self="showWorkflowPicker = false"
+        >
+          <Transition
+            appear
+            enter-active-class="transition-all duration-200 ease-out"
+            enter-from-class="opacity-0 scale-95 translate-y-2"
+          >
+            <div class="bg-white dark:bg-[#2c2c30] rounded-2xl shadow-2xl shadow-black/10 w-full max-w-md p-6">
+              <div class="flex items-center gap-3 mb-5">
+                <div class="w-10 h-10 rounded-full bg-indigo-50 dark:bg-indigo-500/10 flex items-center justify-center shrink-0">
+                  <div class="i-carbon-flow w-5 h-5 text-indigo-500" />
+                </div>
+                <div>
+                  <h2 class="text-base font-semibold">选择工作流</h2>
+                  <p class="text-[13px] text-gray-400 mt-0.5">选择一套工作流来驱动此任务的执行</p>
+                </div>
+              </div>
+
+              <div class="space-y-2 max-h-64 overflow-y-auto mb-5">
+                <label
+                  v-for="wf in availableWorkflows"
+                  :key="wf.id"
+                  class="flex items-start gap-3 px-4 py-3 rounded-xl cursor-pointer transition-all duration-150"
+                  :class="selectedWorkflowId === wf.id
+                    ? 'bg-indigo-50 dark:bg-indigo-500/10 border-2 border-indigo-400 dark:border-indigo-500/40'
+                    : 'bg-gray-50 dark:bg-white/3 border-2 border-transparent hover:border-indigo-200 dark:hover:border-indigo-500/20'"
+                  @click.prevent="selectedWorkflowId = wf.id"
+                >
+                  <input
+                    type="radio"
+                    :checked="selectedWorkflowId === wf.id"
+                    class="mt-0.5 w-4 h-4 text-indigo-600 focus:ring-indigo-500/20 cursor-pointer"
+                  >
+                  <div class="flex-1 min-w-0">
+                    <div class="text-[13px] font-semibold text-gray-800 dark:text-gray-100">{{ wf.name }}</div>
+                    <div v-if="wf.description" class="text-[12px] text-gray-400 mt-1 leading-relaxed line-clamp-2">{{ wf.description }}</div>
+                  </div>
+                </label>
+              </div>
+
+              <div v-if="availableWorkflows.length === 0" class="text-center py-8 text-gray-400">
+                <div class="i-carbon-flow w-8 h-8 mx-auto mb-2 opacity-30" />
+                <p class="text-[13px]">暂无可用工作流</p>
+              </div>
+
+              <div class="flex justify-end gap-2">
+                <button
+                  class="px-4 py-2 rounded-lg text-[13px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                  @click="showWorkflowPicker = false"
+                >
+                  取消
+                </button>
+                <button
+                  class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
+                  :disabled="!selectedWorkflowId || startingWorkflow"
+                  @click="confirmStartWithWorkflow"
+                >
+                  <div v-if="startingWorkflow" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+                  <div v-else class="i-carbon-play-filled w-4 h-4" />
+                  {{ startingWorkflow ? '启动中...' : '启动工作流' }}
+                </button>
+              </div>
+            </div>
+          </Transition>
         </div>
       </Transition>
     </Teleport>

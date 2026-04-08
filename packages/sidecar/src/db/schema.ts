@@ -30,9 +30,10 @@ export function applySchema(db: Database.Database): void {
       change_id TEXT NOT NULL,
       current_stage TEXT NOT NULL DEFAULT 'planning',
       current_phase TEXT NOT NULL DEFAULT 'task-breakdown',
-      phase_status TEXT NOT NULL DEFAULT 'running',
+      phase_status TEXT NOT NULL DEFAULT 'pending',
       openspec_path TEXT NOT NULL,
       worktree_path TEXT NOT NULL,
+      workflow_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -125,5 +126,10 @@ export function applySchema(db: Database.Database): void {
   }
   if (!cols.some(c => c.name === 'model')) {
     db.exec(`ALTER TABLE agent_runs ADD COLUMN model TEXT`)
+  }
+
+  const taskCols2 = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
+  if (!taskCols2.some(c => c.name === 'workflow_id')) {
+    db.exec(`ALTER TABLE repo_tasks ADD COLUMN workflow_id TEXT`)
   }
 }

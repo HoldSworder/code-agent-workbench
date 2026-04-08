@@ -12,6 +12,7 @@ export interface RepoTask {
   phase_status: string
   openspec_path: string
   worktree_path: string
+  workflow_id: string | null
   created_at: string
   updated_at: string
 }
@@ -23,6 +24,7 @@ export interface CreateRepoTaskInput {
   change_id: string
   openspec_path: string
   worktree_path: string
+  workflow_id?: string
 }
 
 export class RepoTaskRepository {
@@ -35,9 +37,9 @@ export class RepoTaskRepository {
         `
       INSERT INTO repo_tasks (
         id, requirement_id, repo_id, branch_name, change_id,
-        openspec_path, worktree_path
+        openspec_path, worktree_path, workflow_id
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `,
       )
       .run(
@@ -48,6 +50,7 @@ export class RepoTaskRepository {
         input.change_id,
         input.openspec_path,
         input.worktree_path,
+        input.workflow_id ?? null,
       )
     return this.findById(id)!
   }
@@ -74,6 +77,18 @@ export class RepoTaskRepository {
         'SELECT * FROM repo_tasks WHERE requirement_id = ? ORDER BY created_at DESC',
       )
       .all(requirementId) as RepoTask[]
+  }
+
+  updateWorkflowId(id: string, workflow_id: string | null): void {
+    this.db
+      .prepare(
+        `
+      UPDATE repo_tasks
+      SET workflow_id = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `,
+      )
+      .run(workflow_id, id)
   }
 
   updatePhase(id: string, currentStage: string, currentPhase: string, phaseStatus: string): void {

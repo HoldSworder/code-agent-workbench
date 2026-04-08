@@ -70,12 +70,13 @@ const flatPhases = computed(() =>
 
 const statusLabel: Record<string, string> = {
   running: '运行中',
+  waiting_input: '待反馈',
   waiting_confirm: '待确认',
   waiting_event: '等待事件',
   completed: '已完成',
   failed: '失败',
   cancelled: '已取消',
-  pending: '未开始',
+  pending: '待启动',
 }
 
 const displayPhase = computed(() => {
@@ -96,11 +97,10 @@ const currentPhaseIndex = computed(() => {
 })
 
 function phaseState(index: number): 'done' | 'active' | 'future' {
-  if (task.value?.phase_status === 'completed') return 'done'
   const ci = currentPhaseIndex.value
   if (ci === -1) return 'future'
   if (index < ci) return 'done'
-  if (index === ci) return 'active'
+  if (index === ci) return task.value?.phase_status === 'completed' ? 'done' : 'active'
   return 'future'
 }
 
@@ -166,7 +166,6 @@ const viewingStagePhases = computed(() => {
 })
 
 function stageState(stageId: string): 'done' | 'active' | 'future' {
-  if (task.value?.phase_status === 'completed') return 'done'
   const ci = currentPhaseIndex.value
   if (ci === -1) return 'future'
   const stagePhases = workflowStages.value.find(s => s.id === stageId)?.phases ?? []
@@ -174,7 +173,10 @@ function stageState(stageId: string): 'done' | 'active' | 'future' {
   const firstIdx = flatPhases.value.findIndex(p => p.id === stagePhases[0].id)
   const lastIdx = flatPhases.value.findIndex(p => p.id === stagePhases[stagePhases.length - 1].id)
   if (ci > lastIdx) return 'done'
-  if (ci >= firstIdx && ci <= lastIdx) return 'active'
+  if (ci >= firstIdx && ci <= lastIdx) {
+    if (ci === lastIdx && task.value?.phase_status === 'completed') return 'done'
+    return 'active'
+  }
   return 'future'
 }
 
@@ -303,7 +305,11 @@ async function pollLiveOutput() {
     if (t) {
       const phaseChanged = task.value?.current_phase !== t.current_phase
       task.value = t
-      if (phaseChanged) viewingPhaseId.value = t.current_phase
+      if (phaseChanged) {
+        viewingPhaseId.value = t.current_phase
+        await refreshMessages()
+        liveOutput.value = ''
+      }
       if (t.phase_status !== 'running') {
         clearInterval(pollTimer!)
         pollTimer = null
@@ -508,9 +514,29 @@ async function sendMessage() {
   startPolling()
 }
 
-async function handleConfirm() {
+async function handleConfirm(advance = false) {
   if (!task.value) return
-  await rpc('workflow.confirm', { repoTaskId: task.value.id })
+  await rpc('workflow.confirm', { repoTaskId: task.value.id, advance })
+  await new Promise(r => setTimeout(r, 300))
+  const t = await rpc<RepoTask>('task.get', { id: taskId })
+  if (t) task.value = t
+  if (advance) startPolling()
+}
+
+async function handleConfirmAndAdvance() {
+  if (!task.value) return
+
+  const content = '用户已确认，请实施方案并完成本阶段所有产出。'
+  messages.value.push({
+    id: `local-${Date.now()}`,
+    phase_id: task.value.current_phase,
+    role: 'user',
+    content,
+    created_at: new Date().toISOString(),
+  })
+  scrollToBottom()
+
+  await rpc('workflow.confirmAndAdvance', { repoTaskId: task.value.id })
   await new Promise(r => setTimeout(r, 300))
   const t = await rpc<RepoTask>('task.get', { id: taskId })
   if (t) task.value = t
@@ -696,6 +722,7 @@ async function handleCancel() {
           class="px-2 py-0.5 rounded-md text-[11px] font-medium shrink-0"
           :class="{
             'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400': task.phase_status === 'waiting_confirm',
+            'bg-orange-50 text-orange-600 dark:bg-orange-500/10 dark:text-orange-400': task.phase_status === 'waiting_input',
             'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400': task.phase_status === 'waiting_event',
             'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400': task.phase_status === 'failed',
             'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400': task.phase_status === 'running',
@@ -922,44 +949,13 @@ async function handleCancel() {
                   </div>
                 </div>
 
-                <!-- System notification bubble + inline confirm card -->
-                <div v-else-if="msg.role === 'system'" class="max-w-[85%] space-y-2">
+                <!-- System notification bubble -->
+                <div v-else-if="msg.role === 'system'" class="max-w-[85%]">
                   <div class="flex justify-center">
                     <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-50 dark:bg-amber-500/[0.06] border border-amber-200/50 dark:border-amber-500/15">
                       <div class="i-carbon-warning-alt w-3.5 h-3.5 text-amber-500 shrink-0" />
                       <span class="text-[12px] text-amber-700 dark:text-amber-400">{{ msg.content }}</span>
                       <span class="text-[10px] text-amber-400/60 dark:text-amber-500/40 tabular-nums shrink-0">{{ formatTime(msg.created_at) }}</span>
-                    </div>
-                  </div>
-                  <div
-                    v-if="task?.phase_status === 'waiting_confirm' && task.current_phase === group.phaseId"
-                    class="rounded-xl border border-amber-200/60 dark:border-amber-500/15 bg-amber-50/50 dark:bg-amber-500/[0.04] px-4 py-3"
-                  >
-                    <div class="flex items-center gap-2 mb-3">
-                      <div class="i-carbon-task-complete w-4 h-4 text-amber-500" />
-                      <span class="text-[13px] text-amber-700 dark:text-amber-400 font-medium">
-                        {{ displayPhase }} 阶段已完成，请确认是否继续推进
-                      </span>
-                    </div>
-                    <div class="flex items-center gap-2 justify-end">
-                      <button
-                        class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
-                        @click="handleCancel"
-                      >
-                        取消任务
-                      </button>
-                      <button
-                        class="px-3 py-1.5 rounded-lg text-[12px] text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 hover:bg-amber-100/50 dark:hover:bg-amber-500/10 transition-colors"
-                        @click="handleFeedback"
-                      >
-                        反馈修改
-                      </button>
-                      <button
-                        class="px-4 py-1.5 rounded-lg bg-amber-500 text-white text-[12px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
-                        @click="handleConfirm"
-                      >
-                        确认通过
-                      </button>
                     </div>
                   </div>
                 </div>
@@ -1018,6 +1014,72 @@ async function handleCancel() {
                   </div>
                 </div>
               </template>
+
+              <!-- Inline action card for waiting_input phase -->
+              <div
+                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId"
+                class="rounded-xl border border-orange-200/60 dark:border-orange-500/15 bg-orange-50/50 dark:bg-orange-500/[0.04] px-4 py-3 max-w-[85%]"
+              >
+                <div class="flex items-center gap-2 mb-3">
+                  <div class="i-carbon-chat w-4 h-4 text-orange-500" />
+                  <span class="text-[13px] text-orange-700 dark:text-orange-400 font-medium">
+                    {{ displayPhase }} 等待你的反馈后继续执行
+                  </span>
+                </div>
+                <div class="flex items-center gap-2 justify-end">
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                    @click="handleCancel"
+                  >
+                    取消任务
+                  </button>
+                  <button
+                    class="px-4 py-1.5 rounded-lg bg-orange-500 text-white text-[12px] font-medium hover:bg-orange-400 shadow-sm shadow-orange-500/20 transition-all duration-150 active:scale-[0.97]"
+                    @click="handleConfirmAndAdvance"
+                  >
+                    确认并进入下一阶段
+                  </button>
+                </div>
+              </div>
+
+              <!-- Inline confirm card (once per group, only for current phase in waiting_confirm) -->
+              <div
+                v-if="task?.phase_status === 'waiting_confirm' && task.current_phase === group.phaseId"
+                class="rounded-xl border border-amber-200/60 dark:border-amber-500/15 bg-amber-50/50 dark:bg-amber-500/[0.04] px-4 py-3 max-w-[85%]"
+              >
+                <div class="flex items-center gap-2 mb-3">
+                  <div class="i-carbon-task-complete w-4 h-4 text-amber-500" />
+                  <span class="text-[13px] text-amber-700 dark:text-amber-400 font-medium">
+                    {{ displayPhase }} 产出已就绪，请确认后继续推进
+                  </span>
+                </div>
+                <div class="flex items-center gap-2 justify-end">
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                    @click="handleCancel"
+                  >
+                    取消任务
+                  </button>
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 hover:bg-amber-100/50 dark:hover:bg-amber-500/10 transition-colors"
+                    @click="handleFeedback"
+                  >
+                    反馈修改
+                  </button>
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 hover:bg-amber-100/50 dark:hover:bg-amber-500/10 transition-colors"
+                    @click="handleConfirm(false)"
+                  >
+                    确认通过
+                  </button>
+                  <button
+                    class="px-4 py-1.5 rounded-lg bg-amber-500 text-white text-[12px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
+                    @click="handleConfirmAndAdvance"
+                  >
+                    确认通过并进入下一阶段
+                  </button>
+                </div>
+              </div>
 
               <!-- Phase end divider (completed phases only) -->
               <div v-if="group.state === 'done'" class="flex items-center gap-2.5 py-3 max-w-[85%]">

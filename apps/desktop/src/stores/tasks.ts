@@ -13,6 +13,7 @@ export interface RepoTask {
   phase_status: string
   openspec_path: string
   worktree_path: string
+  workflow_id: string | null
   created_at: string
   updated_at: string
 }
