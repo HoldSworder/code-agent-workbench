@@ -401,13 +401,13 @@ async function pollLiveOutput() {
       task.value = t
       if (phaseChanged) {
         viewingPhaseId.value = t.current_phase
-        await refreshMessages()
+        await Promise.all([refreshMessages(), loadAgentRuns()])
         liveOutput.value = ''
       }
       if (t.phase_status !== 'running') {
         clearInterval(pollTimer!)
         pollTimer = null
-        await refreshMessages()
+        await Promise.all([refreshMessages(), loadAgentRuns()])
         liveOutput.value = ''
       }
     }
@@ -490,7 +490,7 @@ onMounted(async () => {
   }
 
   if (!isPending.value) {
-    await refreshMessages()
+    await Promise.all([refreshMessages(), loadAgentRuns()])
     if (isRunning.value) startPolling()
   }
 })

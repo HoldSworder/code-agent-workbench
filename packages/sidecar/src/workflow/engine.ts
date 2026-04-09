@@ -1048,19 +1048,20 @@ export class WorkflowEngine {
             effectiveStageGate,
           )
 
-      const agentRun = this.runRepo.create({
-        repo_task_id: repoTaskId,
-        phase_id: phase.id,
-        provider: phase.provider,
-      })
-      agentRunId = agentRun.id
-
       const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
       const provider = this.resolveProvider(phase.provider, {
         resumeSessionId: previousSessionId ?? undefined,
         agentOverride: phaseAgentCfg.agent,
         modelOverride: phaseAgentCfg.model,
       })
+
+      const actualAgent = phaseAgentCfg.agent ?? this.settingsRepo.get('agent.provider') ?? phase.provider
+      const agentRun = this.runRepo.create({
+        repo_task_id: repoTaskId,
+        phase_id: phase.id,
+        provider: actualAgent,
+      })
+      agentRunId = agentRun.id
       this.activeProviders.set(repoTaskId, provider)
       this.liveOutputs.set(repoTaskId, '')
 
