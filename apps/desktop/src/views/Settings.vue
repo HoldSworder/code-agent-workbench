@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { useReposStore } from '../stores/repos'
 import { rpc } from '../composables/use-sidecar'
-import { useModelList } from '../composables/use-model-list'
+import AgentSelector from '../components/AgentSelector.vue'
 
 const router = useRouter()
 
@@ -24,9 +24,6 @@ const agentBaseUrl = ref('https://api.openai.com/v1')
 const agentModel = ref('')
 const agentBinaryPath = ref('')
 const saving = ref(false)
-const customModelInput = ref(false)
-
-const { models: availableModels, loading: loadingModels, fetchModels, refreshModels } = useModelList(agentProvider)
 
 const isApiMode = computed(() => agentProvider.value === 'custom-api')
 const isCliMode = computed(() => ['cursor-cli', 'claude-code', 'codex'].includes(agentProvider.value))
@@ -35,13 +32,6 @@ const isCliMode = computed(() => ['cursor-cli', 'claude-code', 'codex'].includes
 const proxyEnabled = ref(false)
 const proxyUrl = ref('')
 const savingProxy = ref(false)
-
-const providers = [
-  { value: 'cursor-cli', label: 'Cursor CLI' },
-  { value: 'claude-code', label: 'Claude Code' },
-  { value: 'codex', label: 'Codex' },
-  { value: 'custom-api', label: 'Custom API' },
-]
 
 async function loadSettings() {
   try {
@@ -53,27 +43,9 @@ async function loadSettings() {
     if (all['agent.baseUrl']) agentBaseUrl.value = all['agent.baseUrl']
     proxyEnabled.value = all['proxy.enabled'] === 'true'
     if (all['proxy.url']) proxyUrl.value = all['proxy.url']
-    await fetchModels()
-    if (agentModel.value && availableModels.value.length > 0) {
-      const exists = availableModels.value.some(m => m.id === agentModel.value)
-      if (!exists) customModelInput.value = true
-    }
   }
   catch { /* sidecar may not be ready */ }
 }
-
-watch(agentProvider, async () => {
-  agentModel.value = ''
-  customModelInput.value = false
-  await fetchModels()
-})
-
-watch(agentModel, (v) => {
-  if (v === '__custom__') {
-    customModelInput.value = true
-    agentModel.value = ''
-  }
-})
 
 async function saveAgentConfig() {
   saving.value = true
@@ -136,46 +108,6 @@ const tabs = [
 
 const inputClass = 'w-full h-9 px-3 py-2 rounded-xl bg-[#fafafa] dark:bg-white/[0.04] text-[13px] border border-gray-200 dark:border-white/[0.08] placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/10 focus:bg-white dark:focus:bg-white/[0.06] outline-none transition-all duration-150'
 
-// --- Custom model dropdown ---
-const modelDropdownOpen = ref(false)
-const modelDropdownRef = ref<HTMLElement | null>(null)
-const modelSearchQuery = ref('')
-
-const selectedModelLabel = computed(() => {
-  if (!agentModel.value) return ''
-  const found = availableModels.value.find(m => m.id === agentModel.value)
-  if (found) return found.label ? `${found.id} — ${found.label}` : found.id
-  return agentModel.value
-})
-
-const filteredModels = computed(() => {
-  const q = modelSearchQuery.value.toLowerCase().trim()
-  if (!q) return availableModels.value
-  return availableModels.value.filter(
-    m => m.id.toLowerCase().includes(q) || m.label?.toLowerCase().includes(q),
-  )
-})
-
-function selectModel(id: string) {
-  agentModel.value = id
-  modelDropdownOpen.value = false
-  modelSearchQuery.value = ''
-}
-
-function toggleModelDropdown() {
-  modelDropdownOpen.value = !modelDropdownOpen.value
-  if (!modelDropdownOpen.value) modelSearchQuery.value = ''
-}
-
-function onDocClick(e: MouseEvent) {
-  if (modelDropdownRef.value && !modelDropdownRef.value.contains(e.target as Node)) {
-    modelDropdownOpen.value = false
-    modelSearchQuery.value = ''
-  }
-}
-
-onMounted(() => document.addEventListener('click', onDocClick, true))
-onUnmounted(() => document.removeEventListener('click', onDocClick, true))
 </script>
 
 <template>
@@ -206,7 +138,7 @@ onUnmounted(() => document.removeEventListener('click', onDocClick, true))
       <!-- Agent config -->
       <Transition name="tab" mode="out-in">
         <div v-if="activeTab === 'agent'" key="agent" class="space-y-6">
-          <!-- Provider card -->
+          <!-- Provider + Model -->
           <section class="settings-card">
             <div class="settings-card-header">
               <div class="settings-card-icon bg-indigo-50 dark:bg-indigo-500/10">
@@ -214,45 +146,21 @@ onUnmounted(() => document.removeEventListener('click', onDocClick, true))
               </div>
               <div>
                 <h3 class="settings-card-title">Agent Provider</h3>
-                <p class="settings-card-desc">选择 AI 编码助手的后端引擎</p>
+                <p class="settings-card-desc">选择 AI 编码助手的后端引擎和模型</p>
               </div>
             </div>
             <div class="settings-card-body">
-              <div class="grid grid-cols-2 gap-2">
-                <button
-                  v-for="p in providers"
-                  :key="p.value"
-                  class="flex items-center gap-2.5 px-3.5 py-3 rounded-xl border text-left transition-all duration-150"
-                  :class="agentProvider === p.value
-                    ? 'border-indigo-500/40 bg-indigo-50/50 dark:bg-indigo-500/[0.06] ring-1 ring-indigo-500/20'
-                    : 'border-gray-150 dark:border-white/[0.06] hover:border-gray-300 dark:hover:border-white/10 hover:bg-gray-50 dark:hover:bg-white/[0.02]'"
-                  @click="agentProvider = p.value"
-                >
-                  <div
-                    class="w-3.5 h-3.5 rounded-full border-2 transition-colors shrink-0"
-                    :class="agentProvider === p.value
-                      ? 'border-indigo-500 bg-indigo-500'
-                      : 'border-gray-300 dark:border-gray-600'"
-                  >
-                    <div
-                      v-if="agentProvider === p.value"
-                      class="w-full h-full rounded-full flex items-center justify-center"
-                    >
-                      <div class="w-1.5 h-1.5 rounded-full bg-white" />
-                    </div>
-                  </div>
-                  <span
-                    class="text-[13px] font-medium"
-                    :class="agentProvider === p.value
-                      ? 'text-indigo-600 dark:text-indigo-400'
-                      : 'text-gray-600 dark:text-gray-300'"
-                  >{{ p.label }}</span>
-                </button>
-              </div>
+              <AgentSelector
+                :provider="agentProvider"
+                :model="agentModel"
+                show-api-option
+                @update:provider="agentProvider = $event"
+                @update:model="agentModel = $event"
+              />
             </div>
           </section>
 
-          <!-- CLI settings -->
+          <!-- CLI Binary path -->
           <section v-if="isCliMode" class="settings-card">
             <div class="settings-card-header">
               <div class="settings-card-icon bg-emerald-50 dark:bg-emerald-500/10">
@@ -260,10 +168,10 @@ onUnmounted(() => document.removeEventListener('click', onDocClick, true))
               </div>
               <div>
                 <h3 class="settings-card-title">CLI 配置</h3>
-                <p class="settings-card-desc">设置命令行工具路径和模型</p>
+                <p class="settings-card-desc">设置命令行工具路径</p>
               </div>
             </div>
-            <div class="settings-card-body space-y-5">
+            <div class="settings-card-body">
               <div>
                 <label class="settings-label">Binary 路径</label>
                 <div class="relative">
@@ -276,121 +184,6 @@ onUnmounted(() => document.removeEventListener('click', onDocClick, true))
                   >
                 </div>
                 <p class="settings-hint">留空使用默认路径</p>
-              </div>
-              <div>
-                <label class="settings-label">模型</label>
-                <div class="flex gap-2 items-center">
-                  <div class="flex-1 relative" ref="modelDropdownRef">
-                    <!-- Loading state -->
-                    <div
-                      v-if="loadingModels && availableModels.length === 0 && !customModelInput"
-                      class="custom-select-trigger cursor-default"
-                    >
-                      <div class="i-carbon-circle-dash w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 animate-spin" />
-                      <span class="flex-1 text-left text-gray-400 dark:text-gray-500">加载模型列表...</span>
-                    </div>
-
-                    <!-- Custom dropdown trigger -->
-                    <button
-                      v-else-if="availableModels.length > 0 && !customModelInput"
-                      type="button"
-                      class="custom-select-trigger"
-                      :class="modelDropdownOpen && 'custom-select-trigger--active'"
-                      @click="toggleModelDropdown"
-                    >
-                      <div class="i-carbon-machine-learning-model w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0" />
-                      <span class="flex-1 min-w-0 truncate text-left" :class="agentModel ? 'text-gray-800 dark:text-gray-100' : 'text-gray-400 dark:text-gray-500'">
-                        {{ agentModel ? selectedModelLabel : '使用默认模型' }}
-                      </span>
-                      <div
-                        class="i-carbon-chevron-down w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 transition-transform duration-200"
-                        :class="modelDropdownOpen && 'rotate-180'"
-                      />
-                    </button>
-
-                    <!-- Custom dropdown panel -->
-                    <Transition name="dropdown">
-                      <div v-if="modelDropdownOpen" class="custom-select-panel">
-                        <div class="custom-select-search-wrap">
-                          <div class="i-carbon-search w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0" />
-                          <input
-                            v-model="modelSearchQuery"
-                            type="text"
-                            class="custom-select-search"
-                            placeholder="搜索模型..."
-                            @click.stop
-                          >
-                        </div>
-                        <div class="custom-select-options">
-                          <button
-                            type="button"
-                            class="custom-select-option"
-                            :class="!agentModel && 'custom-select-option--selected'"
-                            @click="selectModel('')"
-                          >
-                            <span class="flex-1 text-gray-500 dark:text-gray-400">使用默认模型</span>
-                            <div v-if="!agentModel" class="i-carbon-checkmark w-3.5 h-3.5 text-indigo-500" />
-                          </button>
-                          <button
-                            v-for="m in filteredModels"
-                            :key="m.id"
-                            type="button"
-                            class="custom-select-option"
-                            :class="agentModel === m.id && 'custom-select-option--selected'"
-                            @click="selectModel(m.id)"
-                          >
-                            <div class="flex-1 min-w-0">
-                              <div class="text-[13px] text-gray-800 dark:text-gray-100 font-mono truncate">{{ m.id }}</div>
-                              <div v-if="m.label" class="text-[11px] text-gray-400 dark:text-gray-500 truncate mt-0.5">{{ m.label }}</div>
-                            </div>
-                            <div v-if="agentModel === m.id" class="i-carbon-checkmark w-3.5 h-3.5 text-indigo-500 shrink-0" />
-                          </button>
-                          <div v-if="filteredModels.length === 0 && modelSearchQuery" class="px-3 py-4 text-center text-[12px] text-gray-400 dark:text-gray-500">
-                            未找到匹配的模型
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          class="custom-select-footer"
-                          @click="customModelInput = true; modelDropdownOpen = false; modelSearchQuery = ''; agentModel = ''"
-                        >
-                          <div class="i-carbon-edit w-3.5 h-3.5" />
-                          自定义输入
-                        </button>
-                      </div>
-                    </Transition>
-
-                    <!-- Manual input mode -->
-                    <div v-if="customModelInput || (availableModels.length === 0 && !loadingModels)" class="relative">
-                      <div class="absolute left-3 top-1/2 -translate-y-1/2 i-carbon-machine-learning-model w-3.5 h-3.5 text-gray-300 dark:text-gray-600" />
-                      <input
-                        v-model="agentModel"
-                        type="text"
-                        placeholder="输入模型名称"
-                        :class="[inputClass, 'pl-9']"
-                      >
-                    </div>
-                  </div>
-                  <button
-                    v-if="customModelInput && availableModels.length > 0"
-                    class="settings-icon-btn"
-                    title="切换到选择列表"
-                    @click="customModelInput = false; agentModel = ''"
-                  >
-                    <div class="i-carbon-list w-4 h-4" />
-                  </button>
-                  <button
-                    class="settings-icon-btn disabled:opacity-30"
-                    :disabled="loadingModels"
-                    title="刷新模型列表"
-                    @click="refreshModels()"
-                  >
-                    <div class="i-carbon-renew w-4 h-4" :class="loadingModels && 'animate-spin'" />
-                  </button>
-                </div>
-                <p v-if="customModelInput" class="settings-hint">
-                  手动输入模型名称，点击列表图标切回选择
-                </p>
               </div>
             </div>
           </section>
@@ -750,171 +543,4 @@ onUnmounted(() => document.removeEventListener('click', onDocClick, true))
   transform: translateY(-4px);
 }
 
-/* Custom select / dropdown */
-.custom-select-trigger {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px 12px;
-  border-radius: 12px;
-  background: #fafafa;
-  border: 1px solid #e5e7eb;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.custom-select-trigger:hover {
-  border-color: #d1d5db;
-  background: #f5f5f5;
-}
-.custom-select-trigger--active {
-  border-color: #6366f1;
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
-  background: white;
-}
-:is(.dark) .custom-select-trigger {
-  background: rgba(255, 255, 255, 0.04);
-  border-color: rgba(255, 255, 255, 0.08);
-}
-:is(.dark) .custom-select-trigger:hover {
-  border-color: rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
-}
-:is(.dark) .custom-select-trigger--active {
-  border-color: #818cf8;
-  box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.1);
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.custom-select-panel {
-  position: absolute;
-  z-index: 50;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
-  background: white;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
-  overflow: hidden;
-}
-:is(.dark) .custom-select-panel {
-  background: #2c2c30;
-  border-color: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.2);
-}
-
-.custom-select-search-wrap {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid #f3f4f6;
-}
-:is(.dark) .custom-select-search-wrap {
-  border-bottom-color: rgba(255, 255, 255, 0.06);
-}
-
-.custom-select-search {
-  flex: 1;
-  background: transparent;
-  border: none;
-  outline: none;
-  font-size: 13px;
-  color: #1f2937;
-}
-.custom-select-search::placeholder {
-  color: #9ca3af;
-}
-:is(.dark) .custom-select-search {
-  color: #e5e7eb;
-}
-:is(.dark) .custom-select-search::placeholder {
-  color: #6b7280;
-}
-
-.custom-select-options {
-  max-height: 240px;
-  overflow-y: auto;
-  padding: 4px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(0, 0, 0, 0.1) transparent;
-}
-:is(.dark) .custom-select-options {
-  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
-}
-
-.custom-select-option {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px 10px;
-  border-radius: 10px;
-  text-align: left;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.1s;
-}
-.custom-select-option:hover {
-  background: #f3f4f6;
-}
-.custom-select-option--selected {
-  background: #eef2ff;
-}
-.custom-select-option--selected:hover {
-  background: #e0e7ff;
-}
-:is(.dark) .custom-select-option:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-:is(.dark) .custom-select-option--selected {
-  background: rgba(99, 102, 241, 0.08);
-}
-:is(.dark) .custom-select-option--selected:hover {
-  background: rgba(99, 102, 241, 0.12);
-}
-
-.custom-select-footer {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 10px 14px;
-  border-top: 1px solid #f3f4f6;
-  font-size: 12px;
-  font-weight: 500;
-  color: #6b7280;
-  cursor: pointer;
-  transition: all 0.1s;
-}
-.custom-select-footer:hover {
-  color: #6366f1;
-  background: #fafafe;
-}
-:is(.dark) .custom-select-footer {
-  border-top-color: rgba(255, 255, 255, 0.06);
-  color: #9ca3af;
-}
-:is(.dark) .custom-select-footer:hover {
-  color: #818cf8;
-  background: rgba(99, 102, 241, 0.04);
-}
-
-/* Dropdown transition */
-.dropdown-enter-active {
-  transition: opacity 0.15s ease, transform 0.15s ease;
-}
-.dropdown-leave-active {
-  transition: opacity 0.1s ease, transform 0.1s ease;
-}
-.dropdown-enter-from {
-  opacity: 0;
-  transform: translateY(-4px) scale(0.98);
-}
-.dropdown-leave-to {
-  opacity: 0;
-  transform: translateY(-2px) scale(0.99);
-}
 </style>

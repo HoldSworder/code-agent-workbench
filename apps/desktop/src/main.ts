@@ -13,6 +13,7 @@ const router = createRouter({
     { path: '/workflow', component: () => import('./views/WorkflowEditor.vue') },
     { path: '/skills', component: () => import('./views/SkillsView.vue') },
     { path: '/mcp', component: () => import('./views/McpView.vue') },
+    { path: '/orchestrator', component: () => import('./views/orchestrator/OrchestratorView.vue') },
     { path: '/settings', component: () => import('./views/Settings.vue') },
   ],
 })

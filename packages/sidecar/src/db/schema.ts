@@ -105,6 +105,49 @@ export function applySchema(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_phase_mcp_bindings_phase ON phase_mcp_bindings(stage_id, phase_id);
     CREATE INDEX IF NOT EXISTS idx_phase_mcp_bindings_server ON phase_mcp_bindings(mcp_server_id);
+
+    -- Orchestrator tables (multi-agent orchestration, independent from WorkflowEngine)
+
+    CREATE TABLE IF NOT EXISTS orchestrator_runs (
+      id TEXT PRIMARY KEY,
+      requirement_id TEXT NOT NULL REFERENCES requirements(id),
+      team_config TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      leader_decision TEXT,
+      reject_feedback TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS assignments (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES orchestrator_runs(id),
+      role TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      acceptance_criteria TEXT,
+      worktree_path TEXT,
+      branch_name TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      agent_provider TEXT,
+      agent_model TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS orchestrator_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL REFERENCES orchestrator_runs(id),
+      assignment_id TEXT,
+      event_type TEXT NOT NULL,
+      payload TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_requirement ON orchestrator_runs(requirement_id);
+    CREATE INDEX IF NOT EXISTS idx_assignments_run ON assignments(run_id);
+    CREATE INDEX IF NOT EXISTS idx_orchestrator_events_run ON orchestrator_events(run_id);
   `)
 
   // Migrations: add doc_url column to requirements for existing DBs
@@ -131,6 +174,12 @@ export function applySchema(db: Database.Database): void {
   const taskCols2 = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
   if (!taskCols2.some(c => c.name === 'workflow_id')) {
     db.exec(`ALTER TABLE repo_tasks ADD COLUMN workflow_id TEXT`)
+  }
+
+  // Migration: add mode column to requirements for orchestrator support
+  const reqCols2 = db.prepare(`PRAGMA table_info(requirements)`).all() as { name: string }[]
+  if (!reqCols2.some(c => c.name === 'mode')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN mode TEXT NOT NULL DEFAULT 'workflow'`)
   }
 
   // Fix stale default: old schema created tables with phase_status DEFAULT 'running'.

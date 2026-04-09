@@ -7,6 +7,9 @@ import { getDb } from './db/connection'
 import { RpcServer } from './rpc/server'
 import { registerMethods } from './rpc/methods'
 import { WorkflowEngine } from './workflow/engine'
+import { Orchestrator } from './orchestrator/orchestrator'
+import { parseTeamConfig } from './orchestrator/team-parser'
+import { registerOrchestratorMethods, registerTeamConfigMethods } from './orchestrator/rpc'
 import { ExternalCliProvider } from './providers/cli.provider'
 import { ApiProvider } from './providers/api.provider'
 import { SettingsRepository } from './db/repositories/settings.repo'
@@ -202,8 +205,42 @@ if (existsSync(workflowsDir)) {
 
 engine.recoverMcpBackups()
 
+// ── Orchestrator (multi-agent, independent from WorkflowEngine) ──
+
+const teamYamlPath = process.env.TEAM_YAML_PATH ?? resolve(projectRoot, 'team.yaml')
+let orchestrator: Orchestrator | null = null
+
+try {
+  if (existsSync(teamYamlPath)) {
+    const teamYaml = readFileSync(teamYamlPath, 'utf-8')
+    const teamConfig = parseTeamConfig(teamYaml, dirname(teamYamlPath))
+    const repoPath = settingsRepo.get('repo.path') ?? process.cwd()
+    const defaultBranch = settingsRepo.get('repo.defaultBranch') ?? 'main'
+
+    orchestrator = new Orchestrator({
+      db,
+      teamConfig,
+      teamYamlPath,
+      repoPath,
+      defaultBranch,
+      onEvent: (event, data) => {
+        process.stderr.write(`orchestrator: ${event} ${JSON.stringify(data ?? {})}\n`)
+      },
+    })
+  }
+}
+catch (err) {
+  process.stderr.write(`orchestrator: failed to load team.yaml: ${err}\n`)
+}
+
 const rpcServer = new RpcServer()
 registerMethods(rpcServer, db, engine, workflowPath)
+
+// 配置 RPC 始终可用（即使 team.yaml 不存在也能创建）
+registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator)
+
+if (orchestrator)
+  registerOrchestratorMethods(rpcServer, orchestrator)
 
 const rl = createInterface({ input: process.stdin })
 rl.on('line', async (line) => {

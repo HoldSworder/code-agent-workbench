@@ -9,6 +9,7 @@ export interface Requirement {
   source_url: string | null
   doc_url: string | null
   status: string
+  mode: string
   created_at: string
 }
 
@@ -18,6 +19,7 @@ export interface CreateRequirementInput {
   source: string
   source_url?: string
   doc_url?: string
+  mode?: string
 }
 
 function autoTitle(description: string): string {
@@ -34,10 +36,10 @@ export class RequirementRepository {
     const title = input.title?.trim() || autoTitle(input.description)
     this.db
       .prepare(
-        `INSERT INTO requirements (id, title, description, source, source_url, doc_url)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO requirements (id, title, description, source, source_url, doc_url, mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, title, input.description, input.source, input.source_url ?? null, input.doc_url ?? null)
+      .run(id, title, input.description, input.source, input.source_url ?? null, input.doc_url ?? null, input.mode ?? 'workflow')
     return this.findById(id)!
   }
 

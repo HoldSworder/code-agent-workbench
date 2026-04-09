@@ -174,6 +174,7 @@ function formatDate(iso: string) {
 const showDialog = ref(false)
 type CreateMode = 'manual' | 'feishu'
 const createMode = ref<CreateMode>('manual')
+const requirementMode = ref<'workflow' | 'orchestrator'>('workflow')
 const manualTitle = ref('')
 const manualDescription = ref('')
 const feishuUrl = ref('')
@@ -223,6 +224,7 @@ function toggleCreateMcp(serverId: string) {
 
 function resetCreateDialog() {
   createMode.value = 'manual'
+  requirementMode.value = 'workflow'
   manualTitle.value = ''
   manualDescription.value = ''
   feishuUrl.value = ''
@@ -245,6 +247,7 @@ async function submitRequirement() {
       title: manualTitle.value.trim() || undefined,
       description: manualDescription.value.trim(),
       source: 'manual',
+      mode: requirementMode.value,
     })
   }
   else {
@@ -254,6 +257,7 @@ async function submitRequirement() {
         : '',
       source: 'feishu',
       source_url: feishuUrl.value.trim(),
+      mode: requirementMode.value,
     })
 
     if (createMcpSelectedIds.value.size > 0) {
@@ -543,13 +547,19 @@ async function retryTask(taskId: string) {
                 </button>
               </div>
 
-              <!-- 来源 + 时间 -->
+              <!-- 来源 + 模式 + 时间 -->
               <div class="flex items-center gap-1.5 mt-1.5">
                 <span
                   class="px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0"
                   :class="sourceBadge[req.source]?.class"
                 >
                   {{ sourceBadge[req.source]?.label }}
+                </span>
+                <span
+                  v-if="req.mode === 'orchestrator'"
+                  class="px-1.5 py-0.5 rounded text-[10px] font-medium shrink-0 bg-violet-50 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400"
+                >
+                  编排
                 </span>
                 <span class="text-[10px] text-gray-400 tabular-nums ml-auto">{{ formatDate(req.created_at) }}</span>
               </div>
@@ -825,6 +835,35 @@ async function retryTask(taskId: string) {
                   <p class="text-[10px] text-gray-300 dark:text-gray-600 mt-1.5">
                     选中的 MCP 将在需求收集阶段自动注入到 Agent 运行环境
                   </p>
+                </div>
+              </div>
+
+              <!-- 执行模式 -->
+              <div class="mt-4 pt-4 border-t border-gray-100 dark:border-white/5">
+                <div class="text-[12px] font-medium text-gray-600 dark:text-gray-300 mb-2">执行模式</div>
+                <div class="flex gap-2">
+                  <button
+                    class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all"
+                    :class="requirementMode === 'workflow'
+                      ? 'border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-400'
+                      : 'border-gray-200 text-gray-500 hover:bg-gray-50 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5'"
+                    @click="requirementMode = 'workflow'"
+                  >
+                    <div class="i-carbon-flow w-4 h-4 mx-auto mb-1 opacity-60" />
+                    流水线
+                    <div class="text-[10px] opacity-60 mt-0.5">按阶段推进</div>
+                  </button>
+                  <button
+                    class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all"
+                    :class="requirementMode === 'orchestrator'
+                      ? 'border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-400'
+                      : 'border-gray-200 text-gray-500 hover:bg-gray-50 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5'"
+                    @click="requirementMode = 'orchestrator'"
+                  >
+                    <div class="i-carbon-group w-4 h-4 mx-auto mb-1 opacity-60" />
+                    多 Agent 编排
+                    <div class="text-[10px] opacity-60 mt-0.5">自动分配执行</div>
+                  </button>
                 </div>
               </div>
 

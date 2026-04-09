@@ -72,6 +72,14 @@ onMounted(async () => {
           MCP
         </router-link>
         <router-link
+          to="/orchestrator"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"
+          active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"
+        >
+          <div class="i-carbon-group w-4 h-4 opacity-60" />
+          编排
+        </router-link>
+        <router-link
           to="/settings"
           class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"
           active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"

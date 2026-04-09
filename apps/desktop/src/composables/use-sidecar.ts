@@ -287,6 +287,53 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'skillStore.uninstall':
       mockInstalledSkills.delete(params.slug)
       return { removed: true } as T
+    case 'orchestrator.status':
+      return { running: false, teamName: 'default-team', roles: ['leader', 'frontend_dev', 'backend_dev'] } as T
+    case 'orchestrator.start':
+    case 'orchestrator.stop':
+      return { success: true } as T
+    case 'orchestrator.getRuns':
+      return [
+        { id: 'run-mock-001', requirement_id: 'req-mock-1', team_config: '{}', status: 'completed', leader_decision: '{"decision":"single_worker","reason":"简单需求，分配给前端开发","assignments":[{"role":"frontend_dev","title":"添加用户头像组件","description":"在个人设置页添加头像上传和裁剪功能"}]}', reject_feedback: null, created_at: '2026-04-09T10:00:00Z', completed_at: '2026-04-09T10:15:00Z' },
+        { id: 'run-mock-002', requirement_id: 'req-mock-2', team_config: '{}', status: 'running', leader_decision: '{"decision":"split","reason":"需要前后端配合","assignments":[{"role":"frontend_dev","title":"登录表单 UI","description":"实现登录页面"},{"role":"backend_dev","title":"登录 API","description":"实现认证接口"}]}', reject_feedback: null, created_at: '2026-04-09T11:00:00Z', completed_at: null },
+        { id: 'run-mock-003', requirement_id: 'req-mock-3', team_config: '{}', status: 'failed', leader_decision: null, reject_feedback: null, created_at: '2026-04-09T09:00:00Z', completed_at: '2026-04-09T09:05:00Z' },
+      ] as T
+    case 'orchestrator.getRunDetail':
+      return {
+        run: { id: params.runId, requirement_id: 'req-mock-1', team_config: '{}', status: 'completed', leader_decision: '{"decision":"single_worker","reason":"简单前端任务"}', reject_feedback: null, created_at: '2026-04-09T10:00:00Z', completed_at: '2026-04-09T10:15:00Z' },
+        assignments: [
+          { id: 'assign-1', run_id: params.runId, role: 'frontend_dev', title: '添加用户头像组件', description: '在个人设置页添加头像上传和裁剪功能', acceptance_criteria: '支持 jpg/png，最大 5MB', worktree_path: '/tmp/worker-1', branch_name: 'orchestrator/run-mock/frontend-a1b2c3', status: 'completed', agent_provider: 'claude-code', agent_model: 'claude-sonnet-4-20250514', error_message: null, created_at: '2026-04-09T10:01:00Z', completed_at: '2026-04-09T10:14:00Z' },
+        ],
+      } as T
+    case 'orchestrator.getEvents':
+      return [
+        { id: 1, run_id: 'run-mock-001', assignment_id: null, event_type: 'leader_started', payload: '{"requirement":"req-mock-1"}', created_at: '2026-04-09T10:00:00Z' },
+        { id: 2, run_id: 'run-mock-001', assignment_id: null, event_type: 'requirement_analyzed', payload: '{"decision":"single_worker","reason":"简单前端任务","assignment_count":1}', created_at: '2026-04-09T10:00:30Z' },
+        { id: 3, run_id: 'run-mock-001', assignment_id: 'assign-1', event_type: 'task_assigned', payload: '{"role":"frontend_dev","title":"添加用户头像组件"}', created_at: '2026-04-09T10:01:00Z' },
+        { id: 4, run_id: 'run-mock-001', assignment_id: 'assign-1', event_type: 'worker_started', payload: '{"role":"frontend_dev","branch":"orchestrator/run-mock/frontend-a1b2c3"}', created_at: '2026-04-09T10:01:05Z' },
+        { id: 5, run_id: 'run-mock-001', assignment_id: 'assign-1', event_type: 'worker_completed', payload: '{"output":"已完成头像组件开发"}', created_at: '2026-04-09T10:14:00Z' },
+        { id: 6, run_id: 'run-mock-001', assignment_id: null, event_type: 'run_completed', payload: null, created_at: '2026-04-09T10:15:00Z' },
+      ] as T
+    case 'orchestrator.cancelRun':
+    case 'orchestrator.rejectRun':
+    case 'orchestrator.retryAssignment':
+    case 'orchestrator.pauseAssignment':
+    case 'orchestrator.saveTeamConfig':
+    case 'orchestrator.createDefaultConfig':
+      return { success: true } as T
+    case 'orchestrator.getTeamConfig':
+      return {
+        name: 'default-team',
+        description: '默认多 Agent 开发团队',
+        polling: { interval_seconds: 30, board_filter: { status: 'pending' } },
+        roles: {
+          leader: { description: '分析需求、拆分任务、分配给合适的角色', provider: 'claude-code', model: 'claude-sonnet-4-20250514', prompt_template: '你是一个技术 Leader…' },
+          frontend_dev: { description: '前端开发工程师', provider: 'claude-code', model: 'claude-sonnet-4-20250514', prompt_template: '你是一个高级前端开发工程师…' },
+          backend_dev: { description: '后端开发工程师', provider: 'claude-code', model: 'claude-sonnet-4-20250514', prompt_template: '你是一个高级后端开发工程师…' },
+        },
+      } as T
+    case 'orchestrator.getRawTeamYaml':
+      return { yaml: '# Mock team.yaml' } as T
     case 'task.get':
       return {
         id: params.id,

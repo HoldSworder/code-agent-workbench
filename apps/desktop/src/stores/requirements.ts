@@ -10,6 +10,7 @@ export interface Requirement {
   source_url: string | null
   doc_url: string | null
   status: string
+  mode: string
   created_at: string
 }
 
@@ -19,6 +20,7 @@ export interface CreateRequirementInput {
   source: string
   source_url?: string
   doc_url?: string
+  mode?: 'workflow' | 'orchestrator'
 }
 
 export const useRequirementsStore = defineStore('requirements', () => {
