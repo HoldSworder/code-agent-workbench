@@ -6,24 +6,39 @@
 
 ## 输入
 
-- 分支名：`{{branch_name}}`
 - 工作目录：`{{repo_path}}`
+- 需求标题 & 描述：见上方「需求」部分
+
+---
+
+## 分支命名规则（重要）
+
+1. 将需求标题翻译为 **简洁的英文短语**（3-6 个单词）
+2. 全部小写，单词之间用 `-` 连接，仅保留 `a-z`、`0-9`、`-`
+3. 最终分支名格式：`feature/<english-slug>`
+
+示例：
+- 需求「书签卡片增加右键菜单」→ `feature/bookmark-card-context-menu`
+- 需求「修复登录页白屏问题」→ `feature/fix-login-blank-screen`
+- 需求「用户列表支持批量导出」→ `feature/user-list-batch-export`
 
 ---
 
 ## 执行步骤
 
-### Step 1: 检查当前分支
+### Step 1: 确定分支名
+
+根据上述命名规则，将需求标题翻译为英文并生成分支名。
+
+### Step 2: 检查当前分支
 
 ```bash
 git branch --show-current
 ```
 
-如果当前已在 `{{branch_name}}` 分支上，跳过后续步骤，直接报告完成。
+如果当前已在目标 feature 分支上，跳过后续步骤，直接报告完成。
 
-### Step 2: 检测主干分支名称
-
-依次检查远程是否存在 `master` 或 `main` 分支：
+### Step 3: 检测主干分支名称
 
 ```bash
 git remote show origin | grep "HEAD branch"
@@ -31,22 +46,17 @@ git remote show origin | grep "HEAD branch"
 
 以实际检测结果确定主干分支名（下文以 `$BASE` 指代）。如果无法检测，默认使用 `master`。
 
-### Step 3: 切换到主干分支
+### Step 4: 切换到主干分支并拉取最新代码
 
 ```bash
 git checkout $BASE
-```
-
-### Step 4: 拉取最新代码
-
-```bash
 git pull origin $BASE
 ```
 
 ### Step 5: 创建 feature 分支
 
 ```bash
-git checkout -b {{branch_name}}
+git checkout -b feature/<english-slug>
 ```
 
 ### Step 6: 确认结果
@@ -55,20 +65,20 @@ git checkout -b {{branch_name}}
 git branch --show-current
 ```
 
-验证当前分支已切换为 `{{branch_name}}`。
+验证当前分支已切换到新创建的 feature 分支。
 
 ---
 
 ## 输出
 
-- 当前工作目录已切换到 `{{branch_name}}` 分支
+- 当前工作目录已切换到 `feature/<english-slug>` 分支
 - 分支基于远程主干分支的最新提交创建
 
 ---
 
 ## 异常处理
 
-- 如果 `{{branch_name}}` 分支已存在于本地：切换到该分支并从主干 rebase 最新代码
+- 如果目标分支已存在于本地：切换到该分支并从主干 rebase 最新代码
 - 如果网络不可用导致 pull 失败：基于本地主干分支的最新提交创建分支，并向用户报告网络异常
 
 ---

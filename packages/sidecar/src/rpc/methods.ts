@@ -13,7 +13,7 @@ import { existsSync, writeFileSync } from 'node:fs'
 import { stringify as yamlStringify } from 'yaml'
 import type { WorkflowEngine } from '../workflow/engine'
 import { parseWorkflow } from '../workflow/parser'
-import { createBranch, getChangedFiles, getFileDiff, getMergeBase } from '../git/operations'
+import { getChangedFiles, getFileDiff, getMergeBase } from '../git/operations'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 import { readTranscript, listSessionsForRepo } from '../transcript/reader'
 import { scanAllSkills, readSkillContent, enableSkill, disableSkill, ENV_LABELS } from '../skill/scanner'
@@ -27,18 +27,23 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 const projectRoot = resolve(__dirname, '../../..')
 
+/**
+ * 生成初始 changeId（占位符）。
+ * 实际语义化英文分支名由 create-branch workflow phase 的 agent 决定，
+ * engine 会在该 phase 完成后通过 syncBranchNameFromWorktree 回写。
+ */
 function changeIdFromRequirement(title: string, description?: string): string {
   const text = (title || description || '').trim()
   const slug = text
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
 
   const suffix = Date.now().toString(36).slice(-4)
 
-  if (!slug || slug === '-')
+  if (!slug)
     return `change-${suffix}`
 
   const truncated = slug.slice(0, 40).replace(/-$/, '')
@@ -129,13 +134,6 @@ export function registerMethods(
       const changeId = changeIdFromRequirement(requirement.title, requirement.description)
       const branchName = `feature/${changeId}`
       const openspecPath = `openspec/changes/${changeId}`
-
-      try {
-        await createBranch(repo.local_path, branchName, repo.default_branch)
-      }
-      catch {
-        // Missing origin or non-git cwd: still persist task for development
-      }
 
       return taskRepo.create({
         requirement_id: requirement.id,

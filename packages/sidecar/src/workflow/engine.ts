@@ -1181,6 +1181,10 @@ export class WorkflowEngine {
     }
     catch { /* non-git worktree */ }
 
+    if (phase.id === 'create-branch') {
+      this.syncBranchNameFromWorktree(repoTaskId)
+    }
+
     if (phase.completion_check) {
       const task = this.taskRepo.findById(repoTaskId)
       if (task) {
@@ -1325,6 +1329,36 @@ export class WorkflowEngine {
 
   private stripPhaseSignals(text: string): string {
     return text.replace(/\s*<<(?:PHASE_COMPLETE|PENDING_INPUT)>>\s*/g, '').trimEnd()
+  }
+
+  /**
+   * create-branch 阶段完成后，从 worktree 检测实际分支名并回写 task。
+   * 这允许 agent 根据需求标题自行翻译生成语义化英文分支名。
+   */
+  private syncBranchNameFromWorktree(repoTaskId: string): void {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return
+
+    try {
+      const actual = execSync('git branch --show-current', {
+        cwd: task.worktree_path,
+        encoding: 'utf-8',
+        timeout: 5_000,
+      }).trim()
+
+      if (!actual || actual === task.branch_name) return
+
+      const changeId = actual.startsWith('feature/')
+        ? actual.slice('feature/'.length)
+        : actual
+      const openspecPath = `openspec/changes/${changeId}`
+
+      elog(`syncBranchName: ${task.branch_name} → ${actual} (changeId=${changeId})`)
+      this.taskRepo.updateChangeInfo(repoTaskId, actual, changeId, openspecPath)
+    }
+    catch (err) {
+      elog(`syncBranchName failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   private collectPhaseIdsAfter(stageIdx: number, phaseIdx: number, wf: WorkflowConfig): string[] {

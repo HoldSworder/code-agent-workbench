@@ -92,6 +92,18 @@ export class RepoTaskRepository {
       .run(workflow_id, id)
   }
 
+  updateChangeInfo(id: string, branchName: string, changeId: string, openspecPath: string): void {
+    this.db
+      .prepare(
+        `
+      UPDATE repo_tasks
+      SET branch_name = ?, change_id = ?, openspec_path = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `,
+      )
+      .run(branchName, changeId, openspecPath, id)
+  }
+
   updatePhase(id: string, currentStage: string, currentPhase: string, phaseStatus: string): void {
     this.db
       .prepare(
