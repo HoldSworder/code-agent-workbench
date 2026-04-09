@@ -86,10 +86,18 @@ async function startWithWorkflow() {
   }
 }
 
+interface EntryInput {
+  label: string
+  description?: string
+  placeholder?: string
+}
+
 interface WorkflowPhase {
   id: string
   name: string
   suspendable?: boolean
+  optional?: boolean
+  entryInput?: EntryInput
 }
 
 interface WorkflowStage {
@@ -145,6 +153,46 @@ const currentPhaseSuspendable = computed(() => {
   }
   return false
 })
+
+interface AdvanceOption {
+  phaseId: string
+  phaseName: string
+  stageId: string
+  entryInput?: EntryInput
+}
+interface AdvanceOptions {
+  defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
+  optionalPhases: AdvanceOption[]
+}
+
+const advanceOptions = ref<AdvanceOptions | null>(null)
+const advanceInputExpanded = ref(false)
+const advanceInputText = ref('')
+
+const hasOptionalAdvance = computed(() =>
+  (advanceOptions.value?.optionalPhases.length ?? 0) > 0,
+)
+
+async function fetchAdvanceOptions() {
+  if (!task.value) return
+  const res = await rpc<AdvanceOptions>('workflow.getAdvanceOptions', { repoTaskId: task.value.id })
+  advanceOptions.value = res ?? null
+}
+
+watch(
+  () => task.value?.phase_status,
+  (status) => {
+    if (status === 'waiting_confirm' || status === 'waiting_input') {
+      fetchAdvanceOptions()
+    }
+    else {
+      advanceOptions.value = null
+      advanceInputExpanded.value = false
+      advanceInputText.value = ''
+    }
+  },
+  { immediate: true },
+)
 
 const currentPhaseIndex = computed(() => {
   if (!task.value) return -1
@@ -656,6 +704,34 @@ async function handleConfirmAndAdvance() {
   scrollToBottom()
 
   await rpc('workflow.confirmAndAdvance', { repoTaskId: task.value.id })
+  await new Promise(r => setTimeout(r, 300))
+  const t = await rpc<RepoTask>('task.get', { id: taskId })
+  if (t) task.value = t
+  startPolling()
+}
+
+async function handleConfirmAndAdvanceToPhase(targetPhaseId: string) {
+  if (!task.value) return
+
+  const input = advanceInputText.value.trim()
+  const content = input || '用户已确认，请实施方案并完成本阶段所有产出。'
+  messages.value.push({
+    id: `local-${Date.now()}`,
+    phase_id: targetPhaseId,
+    role: 'user',
+    content,
+    created_at: new Date().toISOString(),
+  })
+  scrollToBottom()
+
+  advanceInputExpanded.value = false
+  advanceInputText.value = ''
+
+  await rpc('workflow.confirmAndAdvanceToPhase', {
+    repoTaskId: task.value.id,
+    targetPhaseId,
+    input: input || undefined,
+  })
   await new Promise(r => setTimeout(r, 300))
   const t = await rpc<RepoTask>('task.get', { id: taskId })
   if (t) task.value = t
@@ -1231,6 +1307,55 @@ async function handleCancel() {
                     {{ displayPhase }} 等待你的反馈后继续执行
                   </span>
                 </div>
+
+                <!-- Optional phase advance input -->
+                <template v-if="hasOptionalAdvance">
+                  <div
+                    v-for="opt in advanceOptions!.optionalPhases"
+                    :key="opt.phaseId"
+                    class="mb-3"
+                  >
+                    <button
+                      class="flex items-center gap-1.5 text-[12px] text-orange-600 dark:text-orange-400 hover:text-orange-700 dark:hover:text-orange-300 transition-colors"
+                      @click="advanceInputExpanded = !advanceInputExpanded"
+                    >
+                      <div
+                        class="w-3.5 h-3.5 transition-transform"
+                        :class="advanceInputExpanded ? 'i-carbon-chevron-down' : 'i-carbon-chevron-right'"
+                      />
+                      {{ opt.entryInput?.label || opt.phaseName }}（可选）
+                    </button>
+                    <p v-if="opt.entryInput?.description && advanceInputExpanded" class="text-[11px] text-gray-500 dark:text-gray-400 mt-1 ml-5">
+                      {{ opt.entryInput.description }}
+                    </p>
+                    <div v-if="advanceInputExpanded" class="mt-2 ml-5">
+                      <textarea
+                        v-model="advanceInputText"
+                        :placeholder="opt.entryInput?.placeholder || '请输入...'"
+                        class="w-full min-h-[100px] max-h-[300px] p-2.5 rounded-lg text-[12px] bg-white dark:bg-[#1e1e22] border border-orange-200/60 dark:border-orange-500/15 text-gray-700 dark:text-gray-300 placeholder-gray-400 dark:placeholder-gray-500 resize-y focus:outline-none focus:ring-1 focus:ring-orange-400/50"
+                      />
+                      <div class="flex items-center gap-2 justify-end mt-2">
+                        <button
+                          class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                          @click="advanceInputExpanded = false; advanceInputText = ''"
+                        >
+                          收起
+                        </button>
+                        <button
+                          :disabled="!advanceInputText.trim()"
+                          class="px-4 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-150 active:scale-[0.97]"
+                          :class="advanceInputText.trim()
+                            ? 'bg-orange-500 text-white hover:bg-orange-400 shadow-sm shadow-orange-500/20'
+                            : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'"
+                          @click="handleConfirmAndAdvanceToPhase(opt.phaseId)"
+                        >
+                          确认并开始{{ opt.phaseName }}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+
                 <div class="flex items-center gap-2 justify-end">
                   <button
                     class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
@@ -1249,7 +1374,7 @@ async function handleCancel() {
                     class="px-4 py-1.5 rounded-lg bg-orange-500 text-white text-[12px] font-medium hover:bg-orange-400 shadow-sm shadow-orange-500/20 transition-all duration-150 active:scale-[0.97]"
                     @click="handleConfirmAndAdvance"
                   >
-                    确认并进入下一阶段
+                    {{ hasOptionalAdvance && advanceOptions?.defaultNext ? `跳过，进入${advanceOptions.defaultNext.phaseName}` : '确认并进入下一阶段' }}
                   </button>
                 </div>
               </div>
@@ -1265,6 +1390,55 @@ async function handleCancel() {
                     {{ displayPhase }} 产出已就绪，请确认后继续推进
                   </span>
                 </div>
+
+                <!-- Optional phase advance input (e.g. integration) -->
+                <template v-if="hasOptionalAdvance">
+                  <div
+                    v-for="opt in advanceOptions!.optionalPhases"
+                    :key="opt.phaseId"
+                    class="mb-3"
+                  >
+                    <button
+                      class="flex items-center gap-1.5 text-[12px] text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 transition-colors"
+                      @click="advanceInputExpanded = !advanceInputExpanded"
+                    >
+                      <div
+                        class="w-3.5 h-3.5 transition-transform"
+                        :class="advanceInputExpanded ? 'i-carbon-chevron-down' : 'i-carbon-chevron-right'"
+                      />
+                      {{ opt.entryInput?.label || opt.phaseName }}（可选）
+                    </button>
+                    <p v-if="opt.entryInput?.description && advanceInputExpanded" class="text-[11px] text-gray-500 dark:text-gray-400 mt-1 ml-5">
+                      {{ opt.entryInput.description }}
+                    </p>
+                    <div v-if="advanceInputExpanded" class="mt-2 ml-5">
+                      <textarea
+                        v-model="advanceInputText"
+                        :placeholder="opt.entryInput?.placeholder || '请输入...'"
+                        class="w-full min-h-[100px] max-h-[300px] p-2.5 rounded-lg text-[12px] bg-white dark:bg-[#1e1e22] border border-amber-200/60 dark:border-amber-500/15 text-gray-700 dark:text-gray-300 placeholder-gray-400 dark:placeholder-gray-500 resize-y focus:outline-none focus:ring-1 focus:ring-amber-400/50"
+                      />
+                      <div class="flex items-center gap-2 justify-end mt-2">
+                        <button
+                          class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                          @click="advanceInputExpanded = false; advanceInputText = ''"
+                        >
+                          收起
+                        </button>
+                        <button
+                          :disabled="!advanceInputText.trim()"
+                          class="px-4 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-150 active:scale-[0.97]"
+                          :class="advanceInputText.trim()
+                            ? 'bg-amber-500 text-white hover:bg-amber-400 shadow-sm shadow-amber-500/20'
+                            : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'"
+                          @click="handleConfirmAndAdvanceToPhase(opt.phaseId)"
+                        >
+                          确认并开始{{ opt.phaseName }}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+
                 <div class="flex items-center gap-2 justify-end">
                   <button
                     class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
@@ -1295,7 +1469,7 @@ async function handleCancel() {
                     class="px-4 py-1.5 rounded-lg bg-amber-500 text-white text-[12px] font-medium hover:bg-amber-400 shadow-sm shadow-amber-500/20 transition-all duration-150 active:scale-[0.97]"
                     @click="handleConfirmAndAdvance"
                   >
-                    确认通过并进入下一阶段
+                    {{ hasOptionalAdvance && advanceOptions?.defaultNext ? `跳过，进入${advanceOptions.defaultNext.phaseName}` : '确认通过并进入下一阶段' }}
                   </button>
                 </div>
               </div>

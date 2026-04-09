@@ -41,6 +41,14 @@ const TriggerMappingEntrySchema = z.object({
   strategy: z.enum(['infer_from_state']).optional(),
 })
 
+// ── Phase 进入时的输入收集 ──
+
+const EntryInputSchema = z.object({
+  label: z.string(),
+  description: z.string().optional(),
+  placeholder: z.string().optional(),
+})
+
 // ── Phase 配置（Stage 内子阶段） ──
 
 const PhaseSchema = z.object({
@@ -72,6 +80,8 @@ const PhaseSchema = z.object({
   loop_target: z.string().optional(),
   /** 激活 optional phase 的触发短语 */
   triggers: z.array(z.string()).optional(),
+  /** optional phase 被激活进入时需要收集的用户输入 */
+  entry_input: EntryInputSchema.optional(),
 })
 
 // ── Stage 配置（顶层阶段） ──
@@ -134,6 +144,7 @@ const WorkflowSchema = z.object({
   trigger_mapping: z.array(TriggerMappingEntrySchema).optional(),
 })
 
+export type EntryInput = z.infer<typeof EntryInputSchema>
 export type GateCheck = z.infer<typeof GateCheckSchema>
 export type GateDefinition = z.infer<typeof GateDefinitionSchema>
 export type PhaseConfig = z.infer<typeof PhaseSchema>

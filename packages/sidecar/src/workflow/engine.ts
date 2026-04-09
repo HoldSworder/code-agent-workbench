@@ -607,6 +607,119 @@ export class WorkflowEngine {
     await this.executePhase(repoTaskId, phase, stage, feedback)
   }
 
+  /**
+   * 返回当前 phase 确认后的推进选项：默认下一步 + 可激活的 optional phases。
+   * 供前端 confirm card 渲染"跳过联调 / 开始联调"等分支路径。
+   */
+  getAdvanceOptions(repoTaskId: string): {
+    defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
+    optionalPhases: { phaseId: string, phaseName: string, stageId: string, entryInput?: { label: string, description?: string, placeholder?: string } }[]
+  } {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return { defaultNext: null, optionalPhases: [] }
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const loc = findPhaseInStages(wf.stages, task.current_stage, task.current_phase)
+    if (!loc) return { defaultNext: null, optionalPhases: [] }
+
+    const { stageIdx, phaseIdx } = loc
+    const stages = wf.stages
+    const currentStage = stages[stageIdx]
+
+    let defaultNext: { phaseId: string, phaseName: string, stageId: string } | null = null
+    const optionalPhases: { phaseId: string, phaseName: string, stageId: string, entryInput?: { label: string, description?: string, placeholder?: string } }[] = []
+
+    const collectFromPhases = (phases: PhaseConfig[], startIdx: number, stage: StageConfig) => {
+      for (let pi = startIdx; pi < phases.length; pi++) {
+        const candidate = phases[pi]
+        if (candidate.optional && !this.isPhaseActivated(repoTaskId, candidate.id)) {
+          if (candidate.entry_input) {
+            optionalPhases.push({
+              phaseId: candidate.id,
+              phaseName: candidate.name,
+              stageId: stage.id,
+              entryInput: {
+                label: candidate.entry_input.label,
+                description: candidate.entry_input.description,
+                placeholder: candidate.entry_input.placeholder,
+              },
+            })
+          }
+          continue
+        }
+        if (!defaultNext) {
+          defaultNext = { phaseId: candidate.id, phaseName: candidate.name, stageId: stage.id }
+        }
+        break
+      }
+    }
+
+    collectFromPhases(currentStage.phases, phaseIdx + 1, currentStage)
+
+    if (!defaultNext && stageIdx < stages.length - 1 && this.checkStageGate(repoTaskId, currentStage.id)) {
+      const nextStage = stages[stageIdx + 1]
+      collectFromPhases(nextStage.phases, 0, nextStage)
+    }
+
+    return { defaultNext, optionalPhases }
+  }
+
+  /**
+   * 确认当前 phase 并推进到指定的目标 phase（支持激活 optional phase）。
+   * 如果提供了 input，作为 user message 写入并传给目标 phase 作为 feedback。
+   */
+  async confirmAndAdvanceToPhase(repoTaskId: string, targetPhaseId: string, input?: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    elog(`confirmAndAdvanceToPhase: task=${repoTaskId} target=${targetPhaseId} phase=${task?.current_phase} status=${task?.phase_status}`)
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended']
+    if (!task || !allowedStates.includes(task.phase_status))
+      throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+
+    const currentFound = findPhaseById(wf.stages, task.current_phase)
+    if (!currentFound)
+      throw new Error(`Current phase ${task.current_phase} not found in workflow config`)
+
+    if (currentFound.phase.confirm_files?.length) {
+      const missing = this.validateConfirmFiles(
+        currentFound.phase.confirm_files,
+        task.worktree_path,
+        task.openspec_path,
+        task.change_id,
+      )
+      if (missing.length) {
+        const reason = `确认被阻止：以下预期产出文件缺失\n${missing.map(f => `- ${f}`).join('\n')}`
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: task.current_phase,
+          role: 'assistant',
+          content: reason,
+        })
+        throw new Error(`Confirmation blocked: missing files: ${missing.join(', ')}`)
+      }
+    }
+
+    const targetFound = findPhaseById(wf.stages, targetPhaseId)
+    if (!targetFound)
+      throw new Error(`Target phase ${targetPhaseId} not found in workflow config`)
+
+    if (targetFound.phase.optional)
+      this.activatePhase(repoTaskId, targetFound.phase.id)
+
+    const feedback = input || `用户已确认，请实施方案并完成本阶段所有产出。`
+    this.msgRepo.create({
+      repo_task_id: repoTaskId,
+      phase_id: targetFound.phase.id,
+      role: 'user',
+      content: feedback,
+    })
+
+    this.pendingAdvance.add(repoTaskId)
+    this.taskRepo.updatePhase(repoTaskId, targetFound.stage.id, targetFound.phase.id, 'running')
+    await this.executePhase(repoTaskId, targetFound.phase, targetFound.stage, feedback)
+  }
+
   async routeAndExecute(repoTaskId: string, userInput: string): Promise<string | null> {
     const wf = this.resolveConfigForTask(repoTaskId)
     const match = this.routeTrigger(userInput, wf)
@@ -777,7 +890,7 @@ export class WorkflowEngine {
     return this.resolveSkillContent(skillPath)
   }
 
-  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, gate?: string, stageGatePhaseId?: string, phases: { id: string, name: string, suspendable?: boolean, carriesStageGate?: boolean }[] }[] {
+  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, gate?: string, stageGatePhaseId?: string, phases: { id: string, name: string, suspendable?: boolean, carriesStageGate?: boolean, optional?: boolean, entryInput?: { label: string, description?: string, placeholder?: string } }[] }[] {
     const wf = this.getWorkflowConfig(workflowId)
     return wf.stages.map((s) => {
       const gatePhaseId = s.gate ? getLastMandatoryPhaseId(s) : undefined
@@ -791,6 +904,8 @@ export class WorkflowEngine {
           name: p.name,
           suspendable: p.suspendable || undefined,
           carriesStageGate: gatePhaseId === p.id || undefined,
+          optional: p.optional || undefined,
+          entryInput: p.entry_input ? { label: p.entry_input.label, description: p.entry_input.description, placeholder: p.entry_input.placeholder } : undefined,
         })),
       }
     })

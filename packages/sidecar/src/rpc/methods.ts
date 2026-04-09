@@ -246,6 +246,15 @@ export function registerMethods(
     })
     return { ok: true }
   })
+  server.register('workflow.getAdvanceOptions', async ({ repoTaskId }) => {
+    return engine.getAdvanceOptions(repoTaskId)
+  })
+  server.register('workflow.confirmAndAdvanceToPhase', async ({ repoTaskId, targetPhaseId, input }) => {
+    engine.confirmAndAdvanceToPhase(repoTaskId, targetPhaseId, input).catch((err) => {
+      process.stderr.write(`[workflow] confirmAndAdvanceToPhase failed for ${repoTaskId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
   server.register('workflow.suspend', async ({ repoTaskId }) => {
     engine.suspendTask(repoTaskId).catch((err) => {
       process.stderr.write(`[workflow] suspend failed for ${repoTaskId}: ${err}\n`)

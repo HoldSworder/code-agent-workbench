@@ -1,16 +1,15 @@
-name: default-team
+name: 开发team
 description: 默认多 Agent 开发团队
-
 polling:
   interval_seconds: 30
   board_filter:
     status: pending
-
 roles:
   leader:
+    id: leader
     description: 分析需求、拆分任务、分配给合适的角色
-    provider: claude-code
-    model: claude-sonnet-4-20250514
+    provider: cursor-cli
+    model: claude-4.6-opus-high-thinking
     prompt_template: |
       你是一个技术 Leader。你的职责是分析需求并将其拆分为可执行的子任务。
 
@@ -28,11 +27,11 @@ roles:
 
       ## 输出格式
       使用 <decision> 标签包裹你的 JSON 决策。
-
   frontend_dev:
+    id: frontend_dev
     description: 前端开发工程师，负责 UI 组件和页面开发
-    provider: claude-code
-    model: claude-sonnet-4-20250514
+    provider: cursor-cli
+    model: claude-4.6-opus-high-thinking
     prompt_template: |
       你是一个高级前端开发工程师。请根据任务描述完成开发工作。
 
@@ -46,11 +45,11 @@ roles:
       2. 阅读相关现有代码
       3. 实现功能并确保质量
       4. 提交所有修改到当前分支
-
   backend_dev:
+    id: backend_dev
     description: 后端开发工程师，负责 API 和数据层开发
-    provider: claude-code
-    model: claude-sonnet-4-20250514
+    provider: cursor-cli
+    model: claude-4.6-opus-high-thinking
     prompt_template: |
       你是一个高级后端开发工程师。请根据任务描述完成开发工作。
 

@@ -75,7 +75,18 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'workflow.cancel':
     case 'workflow.executeRequirementPhase':
     case 'workflow.setPhaseEnabled':
+    case 'workflow.confirmAndAdvanceToPhase':
       return { ok: true } as T
+    case 'workflow.getAdvanceOptions':
+      return {
+        defaultNext: { phaseId: 'self-test', phaseName: '代码 Review', stageId: 'development' },
+        optionalPhases: [{
+          phaseId: 'integration',
+          phaseName: '联调',
+          stageId: 'development',
+          entryInput: { label: '联调信息', description: '请提供后端 Spec / API 文档 URL 或直接粘贴内容', placeholder: '粘贴后端 Spec URL、API 文档内容、联调环境地址等...' },
+        }],
+      } as T
     case 'workflow.getPhaseEnabledMap':
       return {} as T
     case 'workflow.phases':
