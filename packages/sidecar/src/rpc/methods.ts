@@ -18,6 +18,7 @@ import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phas
 import { readTranscript, listSessionsForRepo } from '../transcript/reader'
 import { scanAllSkills, readSkillContent, enableSkill, disableSkill, ENV_LABELS } from '../skill/scanner'
 import type { ManageableEnv } from '../skill/scanner'
+import { listRemoteSkills, searchRemoteSkills, getRemoteSkillDetail, installRemoteSkill, uninstallRemoteSkill } from '../skill/store'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import type { CreateMcpServerInput, UpdateMcpServerInput } from '../db/repositories/mcp-server.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
@@ -371,6 +372,15 @@ export function registerMethods(
     return { ok: true }
   })
 
+  server.register('workflow.getPhaseAgentMap', async ({ workflowId }: { workflowId?: string } = {}) => {
+    return engine.getPhaseAgentMap(workflowId)
+  })
+
+  server.register('workflow.setPhaseAgent', async ({ phaseId, agent, model }: { phaseId: string, agent?: string | null, model?: string | null }) => {
+    engine.setPhaseAgent(phaseId, agent, model)
+    return { ok: true }
+  })
+
   server.register('workflow.saveConfig', async ({ config }: { config: Record<string, any> }) => {
     const validated = parseWorkflow(yamlStringify(config))
     const yaml = yamlStringify(validated, { lineWidth: 120 })
@@ -402,6 +412,27 @@ export function registerMethods(
   server.register('skill.disable', async ({ dirName, env }: { dirName: string, env: ManageableEnv }) => {
     disableSkill(dirName, env)
     return { ok: true }
+  })
+
+  // ── Skill Store ──
+  server.register('skillStore.list', async ({ apiBase, cursor }: { apiBase: string, cursor?: string }) => {
+    return listRemoteSkills(apiBase, cursor)
+  })
+
+  server.register('skillStore.search', async ({ apiBase, query }: { apiBase: string, query: string }) => {
+    return searchRemoteSkills(apiBase, query)
+  })
+
+  server.register('skillStore.detail', async ({ apiBase, slug, source }: { apiBase: string, slug: string, source?: string }) => {
+    return getRemoteSkillDetail(apiBase, slug, source)
+  })
+
+  server.register('skillStore.install', async ({ apiBase, slug, version, source }: { apiBase: string, slug: string, version?: string, source?: string }) => {
+    return installRemoteSkill(apiBase, slug, version, source)
+  })
+
+  server.register('skillStore.uninstall', async ({ slug }: { slug: string }) => {
+    return { removed: uninstallRemoteSkill(slug) }
   })
 
   // ── MCP Management ──

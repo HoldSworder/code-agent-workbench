@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import { rpc } from '../composables/use-sidecar'
 
@@ -133,6 +133,115 @@ const showYaml = ref(false)
 const rawYaml = ref('')
 const phaseEnabledMap = ref<Record<string, boolean>>({})
 
+// ── Phase-level agent/model overrides ──
+
+interface ModelOption { id: string, label: string }
+
+const phaseAgentMap = ref<Record<string, { agent?: string, model?: string }>>({})
+const availableModels = ref<ModelOption[]>([])
+const loadingModels = ref(false)
+
+const agentProviders = [
+  { value: 'cursor-cli', label: 'Cursor CLI' },
+  { value: 'claude-code', label: 'Claude Code' },
+  { value: 'codex', label: 'Codex' },
+]
+
+const agentDropdownOpen = ref(false)
+const modelDropdownOpen = ref(false)
+const modelSearchQuery = ref('')
+const agentDropdownRef = ref<HTMLElement | null>(null)
+const modelDropdownRef = ref<HTMLElement | null>(null)
+
+function getAgentLabel(value: string): string {
+  return agentProviders.find(p => p.value === value)?.label ?? value
+}
+
+function getModelLabel(value: string): string {
+  const found = availableModels.value.find(m => m.id === value)
+  if (found) return found.label ? `${found.id} — ${found.label}` : found.id
+  return value
+}
+
+const filteredModels = computed(() => {
+  const q = modelSearchQuery.value.toLowerCase().trim()
+  if (!q) return availableModels.value
+  return availableModels.value.filter(
+    m => m.id.toLowerCase().includes(q) || m.label?.toLowerCase().includes(q),
+  )
+})
+
+function onDropdownDocClick(e: MouseEvent) {
+  if (agentDropdownRef.value && !agentDropdownRef.value.contains(e.target as Node))
+    agentDropdownOpen.value = false
+  if (modelDropdownRef.value && !modelDropdownRef.value.contains(e.target as Node)) {
+    modelDropdownOpen.value = false
+    modelSearchQuery.value = ''
+  }
+}
+
+onMounted(() => document.addEventListener('click', onDropdownDocClick, true))
+onUnmounted(() => document.removeEventListener('click', onDropdownDocClick, true))
+
+async function fetchModels() {
+  loadingModels.value = true
+  try {
+    const res = await rpc<{ models: ModelOption[] }>('agent.listModels')
+    availableModels.value = res?.models ?? []
+  }
+  catch {
+    availableModels.value = []
+  }
+  finally {
+    loadingModels.value = false
+  }
+}
+
+function getPhaseAgent(phaseId: string): string {
+  return phaseAgentMap.value[phaseId]?.agent ?? ''
+}
+
+function getPhaseModel(phaseId: string): string {
+  return phaseAgentMap.value[phaseId]?.model ?? ''
+}
+
+async function setPhaseAgent(phaseId: string, agent: string | null, model: string | null) {
+  const prev = phaseAgentMap.value[phaseId]
+  const next = { agent: agent || undefined, model: model || undefined }
+
+  if (next.agent || next.model)
+    phaseAgentMap.value = { ...phaseAgentMap.value, [phaseId]: next }
+  else {
+    const copy = { ...phaseAgentMap.value }
+    delete copy[phaseId]
+    phaseAgentMap.value = copy
+  }
+
+  try {
+    await rpc('workflow.setPhaseAgent', { phaseId, agent: agent || null, model: model || null })
+  }
+  catch {
+    if (prev)
+      phaseAgentMap.value = { ...phaseAgentMap.value, [phaseId]: prev }
+    else {
+      const copy = { ...phaseAgentMap.value }
+      delete copy[phaseId]
+      phaseAgentMap.value = copy
+    }
+  }
+}
+
+function selectPhaseAgentOption(phaseId: string, value: string) {
+  setPhaseAgent(phaseId, value || null, getPhaseModel(phaseId) || null)
+  agentDropdownOpen.value = false
+}
+
+function selectPhaseModelOption(phaseId: string, value: string) {
+  setPhaseAgent(phaseId, getPhaseAgent(phaseId) || null, value || null)
+  modelDropdownOpen.value = false
+  modelSearchQuery.value = ''
+}
+
 // ── Condition description map (driven by gate_definitions) ──
 
 const conditionDescMap = computed<Record<string, string>>(() => {
@@ -206,12 +315,14 @@ async function loadConfig() {
     const wfParam = activeWorkflowId.value && activeWorkflowId.value !== 'default'
       ? activeWorkflowId.value
       : undefined
-    const [cfg, enabledMap] = await Promise.all([
+    const [cfg, enabledMap, agentMap] = await Promise.all([
       rpc<WorkflowConfig>('workflow.getFullConfig', { workflowId: wfParam }),
       rpc<Record<string, boolean>>('workflow.getPhaseEnabledMap', { workflowId: wfParam }),
+      rpc<Record<string, { agent?: string, model?: string }>>('workflow.getPhaseAgentMap', { workflowId: wfParam }),
     ])
     config.value = cfg
     if (enabledMap) phaseEnabledMap.value = enabledMap
+    if (agentMap) phaseAgentMap.value = agentMap
   } catch (err) {
     console.error('Failed to load workflow config:', err)
   } finally {
@@ -249,11 +360,15 @@ async function loadRawYaml() {
 onMounted(async () => {
   await Promise.all([loadWorkflowList(), loadRequirementPhases()])
   await loadConfig()
+  fetchModels()
 })
 
 // ── Panel ──
 
 function selectPhase(phase: PhaseConfig, stageId: string, stageName: string, isRequirement = false) {
+  agentDropdownOpen.value = false
+  modelDropdownOpen.value = false
+  modelSearchQuery.value = ''
   panelTarget.value = { type: 'phase', phase, stageId, stageName, isRequirement }
   loadPhaseSkill(phase)
 }
@@ -285,6 +400,38 @@ function getGatePhases(gate: string): { phase: PhaseConfig, stageId: string, sta
   for (const stage of config.value?.stages ?? []) {
     for (const phase of stage.phases) {
       if (phase.entry_gate === gate || phase.completion_check === gate)
+        result.push({ phase, stageId: stage.id, stageName: stage.name })
+    }
+  }
+  return result
+}
+
+function getLastMandatoryPhaseId(stage: StageConfig): string | undefined {
+  for (let i = stage.phases.length - 1; i >= 0; i--) {
+    if (!stage.phases[i].optional)
+      return stage.phases[i].id
+  }
+  return undefined
+}
+
+function carriesStageGate(phase: PhaseConfig, stageId: string): boolean {
+  const stage = (config.value?.stages ?? []).find(s => s.id === stageId)
+  if (!stage?.gate) return false
+  return getLastMandatoryPhaseId(stage) === phase.id
+}
+
+function getStageGateForPhase(phase: PhaseConfig, stageId: string): string | undefined {
+  const stage = (config.value?.stages ?? []).find(s => s.id === stageId)
+  if (!stage?.gate) return undefined
+  if (getLastMandatoryPhaseId(stage) !== phase.id) return undefined
+  return stage.gate
+}
+
+function getGuardrailPhases(guardrailId: string): { phase: PhaseConfig, stageId: string, stageName: string }[] {
+  const result: { phase: PhaseConfig, stageId: string, stageName: string }[] = []
+  for (const stage of config.value?.stages ?? []) {
+    for (const phase of stage.phases) {
+      if (phase.guardrails?.includes(guardrailId))
         result.push({ phase, stageId: stage.id, stageName: stage.name })
     }
   }
@@ -543,12 +690,23 @@ function toggleYaml() {
                         <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
                         <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
                       </div>
+                      <!-- Agent/Model override indicator -->
+                      <div v-if="phaseAgentMap[phase.id]?.agent || phaseAgentMap[phase.id]?.model" class="flex items-center gap-2 text-[10px] mb-1.5">
+                        <span v-if="phaseAgentMap[phase.id]?.agent" class="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                          <div class="i-carbon-bot w-2.5 h-2.5 opacity-70" />
+                          {{ getAgentLabel(phaseAgentMap[phase.id].agent!) }}
+                        </span>
+                        <span v-if="phaseAgentMap[phase.id]?.model" class="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 font-mono truncate max-w-[120px]">
+                          <div class="i-carbon-machine-learning-model w-2.5 h-2.5 opacity-70" />
+                          {{ phaseAgentMap[phase.id].model }}
+                        </span>
+                      </div>
                       <div v-if="phase.skill" class="text-[11px] text-gray-400 font-mono truncate flex items-center gap-1">
                         <div class="i-carbon-document w-3 h-3 shrink-0 opacity-50" />
                         {{ phase.skill }}
                       </div>
-                      <!-- Inline gate/check summary -->
-                      <div v-if="phase.completion_check || phase.entry_gate" class="mt-1.5 flex flex-col gap-0.5">
+                      <!-- Inline injection summary -->
+                      <div v-if="phase.completion_check || phase.entry_gate || carriesStageGate(phase, stage.id) || phase.guardrails?.length" class="mt-1.5 flex flex-col gap-0.5">
                         <div v-if="phase.entry_gate" class="text-[10px] text-gray-400 flex items-center gap-1">
                           <div class="i-carbon-locked w-2.5 h-2.5 opacity-60" />
                           入口: {{ phase.entry_gate }}
@@ -556,6 +714,14 @@ function toggleYaml() {
                         <div v-if="phase.completion_check" class="text-[10px] text-gray-400 flex items-center gap-1">
                           <div class="i-carbon-task-complete w-2.5 h-2.5 opacity-60" />
                           完成: {{ phase.completion_check }}
+                        </div>
+                        <div v-if="carriesStageGate(phase, stage.id)" class="text-[10px] text-amber-500 dark:text-amber-400 flex items-center gap-1">
+                          <div class="i-carbon-flag w-2.5 h-2.5 opacity-70" />
+                          Stage 门禁: {{ stage.gate }}
+                        </div>
+                        <div v-for="gId in phase.guardrails" :key="gId" class="text-[10px] flex items-center gap-1" :class="resolveGuardrail(gId)?.severity === 'hard' ? 'text-red-400 dark:text-red-400' : 'text-amber-400 dark:text-amber-400'">
+                          <div class="i-carbon-shield-check w-2.5 h-2.5 opacity-70" />
+                          护栏: {{ gId }}
                         </div>
                       </div>
                     </div>
@@ -657,9 +823,19 @@ function toggleYaml() {
                   <span
                     class="pill"
                     :class="guard.severity === 'hard' ? 'pill--red' : 'pill--amber'"
-                  >{{ guard.severity }}</span>
+                  >{{ guard.severity === 'hard' ? '强制' : '建议' }}</span>
+                  <span class="text-[10px] text-gray-400 ml-auto">{{ getGuardrailPhases(String(gKey)).length }} 处注入</span>
                 </div>
                 <p class="text-[12px] text-gray-500 dark:text-gray-400 leading-relaxed">{{ guard.description }}</p>
+                <div v-if="getGuardrailPhases(String(gKey)).length" class="mt-1.5 flex items-center gap-1 flex-wrap">
+                  <span class="text-[10px] text-gray-400">注入到:</span>
+                  <span
+                    v-for="item in getGuardrailPhases(String(gKey))"
+                    :key="item.phase.id"
+                    class="pill pill--green text-[9px] cursor-pointer hover:opacity-80"
+                    @click="selectPhase(item.phase, item.stageId, item.stageName)"
+                  >{{ item.stageName }} / {{ item.phase.name }}</span>
+                </div>
               </div>
               <p v-if="!config.guardrail_definitions || !Object.keys(config.guardrail_definitions).length" class="empty-hint">暂无护栏规则</p>
             </div>
@@ -785,6 +961,151 @@ function toggleYaml() {
               </div>
             </section>
 
+            <!-- Agent / Model override -->
+            <section>
+              <h3 class="panel-title">Agent / 模型</h3>
+              <p class="text-[11px] text-gray-400 dark:text-gray-500 -mt-1 mb-3">
+                为此节点单独指定 Agent 和模型，留空则使用全局配置
+              </p>
+              <div class="space-y-3">
+                <!-- Agent dropdown -->
+                <div>
+                  <label class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1.5 block">Agent</label>
+                  <div class="relative" ref="agentDropdownRef">
+                    <button
+                      type="button"
+                      class="phase-select-trigger"
+                      :class="agentDropdownOpen && 'phase-select-trigger--active'"
+                      @click="agentDropdownOpen = !agentDropdownOpen"
+                    >
+                      <div class="i-carbon-bot w-3.5 h-3.5 text-gray-400 dark:text-gray-500 shrink-0" />
+                      <span class="flex-1 min-w-0 truncate text-left" :class="getPhaseAgent(panelTarget.phase.id) ? 'text-gray-800 dark:text-gray-100' : 'text-gray-400 dark:text-gray-500'">
+                        {{ getPhaseAgent(panelTarget.phase.id) ? getAgentLabel(getPhaseAgent(panelTarget.phase.id)) : '使用全局配置' }}
+                      </span>
+                      <div
+                        class="i-carbon-chevron-down w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 transition-transform duration-200"
+                        :class="agentDropdownOpen && 'rotate-180'"
+                      />
+                    </button>
+                    <Transition name="dropdown">
+                      <div v-if="agentDropdownOpen" class="phase-select-panel">
+                        <div class="phase-select-options">
+                          <button
+                            type="button"
+                            class="phase-select-option"
+                            :class="!getPhaseAgent(panelTarget.phase.id) && 'phase-select-option--selected'"
+                            @click="selectPhaseAgentOption(panelTarget.phase.id, '')"
+                          >
+                            <div class="i-carbon-settings w-3.5 h-3.5 text-gray-400 shrink-0" />
+                            <span class="flex-1 text-gray-500 dark:text-gray-400">使用全局配置</span>
+                            <div v-if="!getPhaseAgent(panelTarget.phase.id)" class="i-carbon-checkmark w-3.5 h-3.5 text-indigo-500" />
+                          </button>
+                          <button
+                            v-for="p in agentProviders"
+                            :key="p.value"
+                            type="button"
+                            class="phase-select-option"
+                            :class="getPhaseAgent(panelTarget.phase.id) === p.value && 'phase-select-option--selected'"
+                            @click="selectPhaseAgentOption(panelTarget.phase.id, p.value)"
+                          >
+                            <span class="flex-1 text-[12px] text-gray-800 dark:text-gray-100">{{ p.label }}</span>
+                            <div v-if="getPhaseAgent(panelTarget.phase.id) === p.value" class="i-carbon-checkmark w-3.5 h-3.5 text-indigo-500" />
+                          </button>
+                        </div>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+                <!-- Model dropdown -->
+                <div>
+                  <label class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1.5 block">模型</label>
+                  <div class="relative" ref="modelDropdownRef">
+                    <!-- Loading state -->
+                    <div
+                      v-if="loadingModels && availableModels.length === 0"
+                      class="phase-select-trigger cursor-default"
+                    >
+                      <div class="i-carbon-circle-dash w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 animate-spin" />
+                      <span class="flex-1 text-left text-gray-400 dark:text-gray-500 text-[12px]">加载模型列表...</span>
+                    </div>
+                    <!-- Dropdown trigger -->
+                    <button
+                      v-else
+                      type="button"
+                      class="phase-select-trigger"
+                      :class="modelDropdownOpen && 'phase-select-trigger--active'"
+                      @click="modelDropdownOpen = !modelDropdownOpen; if (!modelDropdownOpen) modelSearchQuery = ''"
+                    >
+                      <div class="i-carbon-machine-learning-model w-3.5 h-3.5 text-gray-400 dark:text-gray-500 shrink-0" />
+                      <span class="flex-1 min-w-0 truncate text-left" :class="getPhaseModel(panelTarget.phase.id) ? 'text-gray-800 dark:text-gray-100' : 'text-gray-400 dark:text-gray-500'">
+                        {{ getPhaseModel(panelTarget.phase.id) ? getModelLabel(getPhaseModel(panelTarget.phase.id)) : '使用全局配置' }}
+                      </span>
+                      <div
+                        class="i-carbon-chevron-down w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 transition-transform duration-200"
+                        :class="modelDropdownOpen && 'rotate-180'"
+                      />
+                    </button>
+                    <Transition name="dropdown">
+                      <div v-if="modelDropdownOpen" class="phase-select-panel">
+                        <!-- Search -->
+                        <div v-if="availableModels.length > 3" class="phase-select-search-wrap">
+                          <div class="i-carbon-search w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0" />
+                          <input
+                            v-model="modelSearchQuery"
+                            type="text"
+                            class="phase-select-search"
+                            placeholder="搜索模型..."
+                            @click.stop
+                          >
+                        </div>
+                        <div class="phase-select-options">
+                          <button
+                            type="button"
+                            class="phase-select-option"
+                            :class="!getPhaseModel(panelTarget.phase.id) && 'phase-select-option--selected'"
+                            @click="selectPhaseModelOption(panelTarget.phase.id, '')"
+                          >
+                            <div class="i-carbon-settings w-3.5 h-3.5 text-gray-400 shrink-0" />
+                            <span class="flex-1 text-gray-500 dark:text-gray-400">使用全局配置</span>
+                            <div v-if="!getPhaseModel(panelTarget.phase.id)" class="i-carbon-checkmark w-3.5 h-3.5 text-indigo-500" />
+                          </button>
+                          <button
+                            v-for="m in filteredModels"
+                            :key="m.id"
+                            type="button"
+                            class="phase-select-option"
+                            :class="getPhaseModel(panelTarget.phase.id) === m.id && 'phase-select-option--selected'"
+                            @click="selectPhaseModelOption(panelTarget.phase.id, m.id)"
+                          >
+                            <div class="flex-1 min-w-0">
+                              <div class="text-[12px] text-gray-800 dark:text-gray-100 font-mono truncate">{{ m.id }}</div>
+                              <div v-if="m.label" class="text-[10px] text-gray-400 dark:text-gray-500 truncate mt-0.5">{{ m.label }}</div>
+                            </div>
+                            <div v-if="getPhaseModel(panelTarget.phase.id) === m.id" class="i-carbon-checkmark w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                          </button>
+                          <div v-if="filteredModels.length === 0 && modelSearchQuery" class="px-3 py-3 text-center text-[11px] text-gray-400 dark:text-gray-500">
+                            未找到匹配的模型
+                          </div>
+                        </div>
+                        <!-- Custom input footer -->
+                        <div class="phase-select-footer">
+                          <div class="i-carbon-edit w-3 h-3 text-gray-400 shrink-0" />
+                          <input
+                            :value="getPhaseModel(panelTarget.phase.id)"
+                            type="text"
+                            placeholder="自定义输入模型名..."
+                            class="flex-1 bg-transparent border-none outline-none text-[11px] text-gray-600 dark:text-gray-300 placeholder-gray-400 dark:placeholder-gray-600"
+                            @change="(e: Event) => { if (panelTarget?.type === 'phase') selectPhaseModelOption(panelTarget.phase.id, (e.target as HTMLInputElement).value) }"
+                            @click.stop
+                          >
+                        </div>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <!-- Flow control flags -->
             <section>
               <h3 class="panel-title">流程控制</h3>
@@ -807,7 +1128,7 @@ function toggleYaml() {
             </section>
 
             <!-- Gate / checks with descriptions -->
-            <section v-if="panelTarget.phase.entry_gate || panelTarget.phase.completion_check || panelTarget.phase.loop_target">
+            <section v-if="panelTarget.phase.entry_gate || panelTarget.phase.completion_check || panelTarget.phase.loop_target || getStageGateForPhase(panelTarget.phase, panelTarget.stageId)">
               <h3 class="panel-title">门禁与条件</h3>
               <div class="space-y-2">
                 <div
@@ -839,6 +1160,22 @@ function toggleYaml() {
                   </div>
                   <code class="condition-code">{{ panelTarget.phase.completion_check }}</code>
                   <p class="condition-desc">{{ describeCondition(panelTarget.phase.completion_check) }}</p>
+                </div>
+                <div
+                  v-if="getStageGateForPhase(panelTarget.phase, panelTarget.stageId)"
+                  class="condition-block condition-block--stage-gate condition-block--clickable"
+                  @click="selectGate(getStageGateForPhase(panelTarget.phase, panelTarget.stageId)!, panelTarget.stageId, panelTarget.stageName, stageIdxById(panelTarget.stageId))"
+                >
+                  <div class="flex items-center justify-between">
+                    <div class="condition-label condition-label--stage-gate">
+                      <div class="i-carbon-flag w-3 h-3" />
+                      Stage 完成门禁
+                    </div>
+                    <div class="i-carbon-chevron-right w-3 h-3 text-gray-300 dark:text-gray-600" />
+                  </div>
+                  <code class="condition-code">{{ getStageGateForPhase(panelTarget.phase, panelTarget.stageId) }}</code>
+                  <p class="condition-desc">作为「{{ panelTarget.stageName }}」阶段最后一个必选步骤，该门禁条件会注入到 Agent 提示词中</p>
+                  <p class="condition-desc">{{ describeCondition(getStageGateForPhase(panelTarget.phase, panelTarget.stageId)!) }}</p>
                 </div>
                 <div v-if="panelTarget.phase.loop_target" class="condition-block">
                   <div class="condition-label">
@@ -874,23 +1211,37 @@ function toggleYaml() {
               </div>
             </section>
 
-            <!-- Guardrails with full definitions -->
+            <!-- Guardrails (injected into Agent prompt) -->
             <section v-if="panelTarget.phase.guardrails?.length">
-              <h3 class="panel-title">护栏规则</h3>
-              <div class="space-y-2">
-                <div v-for="gId in panelTarget.phase.guardrails" :key="gId" class="guardrail-block">
-                  <div class="flex items-center gap-2 mb-1">
-                    <div class="i-carbon-shield-check w-3.5 h-3.5 shrink-0" :class="resolveGuardrail(gId)?.severity === 'hard' ? 'text-red-500' : 'text-amber-500'" />
-                    <span class="text-[12px] font-mono font-medium text-gray-700 dark:text-gray-200">{{ gId }}</span>
-                    <span
-                      v-if="resolveGuardrail(gId)"
-                      class="pill text-[9px]"
-                      :class="resolveGuardrail(gId)!.severity === 'hard' ? 'pill--red' : 'pill--amber'"
-                    >{{ resolveGuardrail(gId)!.severity }}</span>
+              <h3 class="panel-title">护栏规则注入</h3>
+              <p class="text-[11px] text-gray-400 mb-2 leading-relaxed">以下护栏规则会注入到该阶段的 Agent 提示词中，约束 Agent 行为。</p>
+              <div class="guardrail-inject-section">
+                <div class="guardrail-inject-header">
+                  <div class="flex items-center gap-2">
+                    <div class="i-carbon-shield-check w-3.5 h-3.5 text-rose-400" />
+                    <span class="text-[12px] font-medium text-gray-600 dark:text-gray-300">注入 {{ panelTarget.phase.guardrails.length }} 条护栏</span>
                   </div>
-                  <p v-if="resolveGuardrail(gId)?.description" class="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed pl-5.5">
-                    {{ resolveGuardrail(gId)!.description }}
-                  </p>
+                </div>
+                <div class="p-3 space-y-2">
+                  <div v-for="gId in panelTarget.phase.guardrails" :key="gId" class="guardrail-inject-item">
+                    <div class="flex items-center gap-2 mb-1">
+                      <div
+                        class="w-5 h-5 rounded-md flex items-center justify-center shrink-0"
+                        :class="resolveGuardrail(gId)?.severity === 'hard' ? 'bg-red-50 dark:bg-red-500/10' : 'bg-amber-50 dark:bg-amber-500/10'"
+                      >
+                        <div class="i-carbon-shield-check w-3 h-3" :class="resolveGuardrail(gId)?.severity === 'hard' ? 'text-red-500' : 'text-amber-500'" />
+                      </div>
+                      <span class="text-[12px] font-mono font-medium text-gray-700 dark:text-gray-200">{{ gId }}</span>
+                      <span
+                        v-if="resolveGuardrail(gId)"
+                        class="pill text-[9px]"
+                        :class="resolveGuardrail(gId)!.severity === 'hard' ? 'pill--red' : 'pill--amber'"
+                      >{{ resolveGuardrail(gId)!.severity === 'hard' ? '强制' : '建议' }}</span>
+                    </div>
+                    <p v-if="resolveGuardrail(gId)?.description" class="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed pl-7">
+                      {{ resolveGuardrail(gId)!.description }}
+                    </p>
+                  </div>
                 </div>
               </div>
             </section>
@@ -1231,12 +1582,20 @@ function toggleYaml() {
                     <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
                     <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
                   </div>
-                  <div v-if="phase.completion_check || phase.entry_gate" class="mt-1.5 space-y-0.5">
+                  <div v-if="phase.completion_check || phase.entry_gate || carriesStageGate(phase, panelTarget.stage.id) || phase.guardrails?.length" class="mt-1.5 space-y-0.5">
                     <div v-if="phase.entry_gate" class="text-[10px] text-gray-400">
                       <span class="font-medium">入口门禁:</span> {{ describeCondition(phase.entry_gate) }}
                     </div>
                     <div v-if="phase.completion_check" class="text-[10px] text-gray-400">
                       <span class="font-medium">完成条件:</span> {{ describeCondition(phase.completion_check) }}
+                    </div>
+                    <div v-if="carriesStageGate(phase, panelTarget.stage.id)" class="text-[10px] text-amber-500 dark:text-amber-400 flex items-center gap-1">
+                      <div class="i-carbon-flag w-2.5 h-2.5" />
+                      <span class="font-medium">承载 Stage 门禁</span>
+                    </div>
+                    <div v-if="phase.guardrails?.length" class="text-[10px] flex items-center gap-1" :class="phase.guardrails.some(g => resolveGuardrail(g)?.severity === 'hard') ? 'text-red-400 dark:text-red-400' : 'text-amber-400 dark:text-amber-400'">
+                      <div class="i-carbon-shield-check w-2.5 h-2.5" />
+                      <span class="font-medium">护栏注入:</span> {{ phase.guardrails.join(', ') }}
                     </div>
                   </div>
                 </div>
@@ -1273,7 +1632,6 @@ function toggleYaml() {
 .phase-badge--cli { background: rgba(16, 185, 129, 0.1); color: #059669; }
 :is(.dark) .phase-badge--api { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
 :is(.dark) .phase-badge--cli { background: rgba(16, 185, 129, 0.15); color: #34d399; }
-
 /* ── Pills ── */
 .pill { font-size: 11px; padding: 1px 7px; border-radius: 5px; font-weight: 500; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
 .pill--gray { background: #f3f4f6; color: #6b7280; }
@@ -1344,6 +1702,71 @@ function toggleYaml() {
 .panel-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: baseline; }
 .panel-k { font-size: 12px; font-weight: 500; color: #9ca3af; }
 
+/* ── Phase agent/model dropdown ── */
+.phase-select-trigger {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 6px 10px; border-radius: 8px; font-size: 12px;
+  background: #fafafa; border: 1px solid #e5e7eb;
+  cursor: pointer; transition: all 0.15s;
+}
+.phase-select-trigger:hover { border-color: #d1d5db; background: #f5f5f5; }
+.phase-select-trigger--active {
+  border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1); background: white;
+}
+:is(.dark) .phase-select-trigger { background: rgba(255, 255, 255, 0.04); border-color: rgba(255, 255, 255, 0.08); }
+:is(.dark) .phase-select-trigger:hover { border-color: rgba(255, 255, 255, 0.12); background: rgba(255, 255, 255, 0.06); }
+:is(.dark) .phase-select-trigger--active {
+  border-color: #818cf8; box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.1); background: rgba(255, 255, 255, 0.06);
+}
+
+.phase-select-panel {
+  position: absolute; z-index: 50; top: calc(100% + 4px); left: 0; right: 0;
+  background: white; border: 1px solid #e5e7eb; border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
+  overflow: hidden;
+}
+:is(.dark) .phase-select-panel {
+  background: #2c2c30; border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.phase-select-search-wrap {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px;
+  border-bottom: 1px solid #f3f4f6;
+}
+:is(.dark) .phase-select-search-wrap { border-bottom-color: rgba(255, 255, 255, 0.06); }
+.phase-select-search {
+  flex: 1; background: transparent; border: none; outline: none;
+  font-size: 12px; color: #1f2937;
+}
+.phase-select-search::placeholder { color: #9ca3af; }
+:is(.dark) .phase-select-search { color: #e5e7eb; }
+:is(.dark) .phase-select-search::placeholder { color: #6b7280; }
+
+.phase-select-options {
+  max-height: 200px; overflow-y: auto; padding: 3px;
+  scrollbar-width: thin; scrollbar-color: rgba(0, 0, 0, 0.1) transparent;
+}
+:is(.dark) .phase-select-options { scrollbar-color: rgba(255, 255, 255, 0.1) transparent; }
+
+.phase-select-option {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 6px 8px; border-radius: 7px; text-align: left;
+  font-size: 12px; cursor: pointer; transition: all 0.1s;
+}
+.phase-select-option:hover { background: #f3f4f6; }
+.phase-select-option--selected { background: #eef2ff; }
+.phase-select-option--selected:hover { background: #e0e7ff; }
+:is(.dark) .phase-select-option:hover { background: rgba(255, 255, 255, 0.06); }
+:is(.dark) .phase-select-option--selected { background: rgba(99, 102, 241, 0.08); }
+:is(.dark) .phase-select-option--selected:hover { background: rgba(99, 102, 241, 0.12); }
+
+.phase-select-footer {
+  display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+  border-top: 1px solid #f3f4f6; font-size: 11px;
+}
+:is(.dark) .phase-select-footer { border-top-color: rgba(255, 255, 255, 0.06); }
+
 /* ── Gate block (in stage card) ── */
 .gate-block {
   padding: 8px;
@@ -1365,6 +1788,10 @@ function toggleYaml() {
 .condition-block--clickable { cursor: pointer; transition: all 0.15s; }
 .condition-block--clickable:hover { border-color: rgba(245, 158, 11, 0.3); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04); }
 :is(.dark) .condition-block--clickable:hover { border-color: rgba(245, 158, 11, 0.25); }
+.condition-block--stage-gate { background: linear-gradient(135deg, rgba(245, 158, 11, 0.04), rgba(217, 119, 6, 0.02)); border-color: rgba(245, 158, 11, 0.15); }
+:is(.dark) .condition-block--stage-gate { background: linear-gradient(135deg, rgba(245, 158, 11, 0.06), rgba(217, 119, 6, 0.03)); border-color: rgba(245, 158, 11, 0.2); }
+.condition-label--stage-gate { color: #d97706; }
+:is(.dark) .condition-label--stage-gate { color: #fbbf24; }
 .condition-label { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: #6b7280; margin-bottom: 4px; }
 :is(.dark) .condition-label { color: #9ca3af; }
 .condition-code { display: block; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 12px; color: #4f46e5; font-weight: 500; margin-bottom: 2px; }
@@ -1384,9 +1811,39 @@ function toggleYaml() {
   border-color: rgba(245, 158, 11, 0.15);
 }
 
-/* ── Guardrail block ── */
-.guardrail-block { padding: 10px 12px; border-radius: 10px; background: #fafafa; border: 1px solid rgba(0, 0, 0, 0.04); }
-:is(.dark) .guardrail-block { background: rgba(255, 255, 255, 0.02); border-color: rgba(255, 255, 255, 0.04); }
+/* ── Guardrail injection section ── */
+.guardrail-inject-section {
+  border-radius: 14px;
+  border: 1px solid rgba(239, 68, 68, 0.12);
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.02), rgba(245, 158, 11, 0.01));
+  overflow: hidden;
+}
+:is(.dark) .guardrail-inject-section {
+  border-color: rgba(239, 68, 68, 0.18);
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.04), rgba(245, 158, 11, 0.02));
+}
+.guardrail-inject-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(239, 68, 68, 0.08);
+  background: rgba(239, 68, 68, 0.03);
+}
+:is(.dark) .guardrail-inject-header {
+  border-bottom-color: rgba(239, 68, 68, 0.12);
+  background: rgba(239, 68, 68, 0.05);
+}
+.guardrail-inject-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(0, 0, 0, 0.03);
+}
+:is(.dark) .guardrail-inject-item {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: rgba(255, 255, 255, 0.04);
+}
 
 /* ── Detail Panel (overlay) ── */
 .detail-panel {
@@ -1564,4 +2021,10 @@ function toggleYaml() {
   color: #e5e7eb;
   background: rgba(255, 255, 255, 0.04);
 }
+
+/* ── Dropdown transition ── */
+.dropdown-enter-active { transition: opacity 0.15s ease, transform 0.15s ease; }
+.dropdown-leave-active { transition: opacity 0.1s ease, transform 0.1s ease; }
+.dropdown-enter-from { opacity: 0; transform: translateY(-4px); }
+.dropdown-leave-to { opacity: 0; transform: translateY(-4px); }
 </style>

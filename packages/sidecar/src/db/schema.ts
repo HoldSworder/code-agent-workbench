@@ -132,4 +132,45 @@ export function applySchema(db: Database.Database): void {
   if (!taskCols2.some(c => c.name === 'workflow_id')) {
     db.exec(`ALTER TABLE repo_tasks ADD COLUMN workflow_id TEXT`)
   }
+
+  // Fix stale default: old schema created tables with phase_status DEFAULT 'running'.
+  // SQLite cannot ALTER column defaults, so we rebuild the table with correct defaults.
+  // Wrapped in a transaction to avoid partial state on interruption.
+  const dfltCheck = db.prepare(
+    `SELECT dflt_value FROM pragma_table_info('repo_tasks') WHERE name = 'phase_status'`,
+  ).get() as { dflt_value: string | null } | undefined
+  if (dfltCheck && dfltCheck.dflt_value !== null && dfltCheck.dflt_value !== `'pending'`) {
+    db.pragma('foreign_keys = OFF')
+    db.transaction(() => {
+      db.exec(`DROP TABLE IF EXISTS repo_tasks_new`)
+      db.exec(`
+        CREATE TABLE repo_tasks_new (
+          id TEXT PRIMARY KEY,
+          requirement_id TEXT NOT NULL REFERENCES requirements(id),
+          repo_id TEXT NOT NULL REFERENCES repos(id),
+          branch_name TEXT NOT NULL,
+          change_id TEXT NOT NULL,
+          current_stage TEXT NOT NULL DEFAULT 'planning',
+          current_phase TEXT NOT NULL DEFAULT 'task-breakdown',
+          phase_status TEXT NOT NULL DEFAULT 'pending',
+          openspec_path TEXT NOT NULL,
+          worktree_path TEXT NOT NULL,
+          workflow_id TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO repo_tasks_new SELECT
+          id, requirement_id, repo_id, branch_name, change_id,
+          current_stage, current_phase, phase_status,
+          openspec_path, worktree_path, workflow_id,
+          created_at, updated_at
+        FROM repo_tasks;
+        DROP TABLE repo_tasks;
+        ALTER TABLE repo_tasks_new RENAME TO repo_tasks;
+        CREATE INDEX IF NOT EXISTS idx_repo_tasks_requirement ON repo_tasks(requirement_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_tasks_repo ON repo_tasks(repo_id);
+      `)
+    })()
+    db.pragma('foreign_keys = ON')
+  }
 }

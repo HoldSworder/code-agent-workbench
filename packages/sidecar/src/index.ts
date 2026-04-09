@@ -127,11 +127,14 @@ const engine = new WorkflowEngine({
   workflowYaml,
   cliType: currentCliType(),
   resolveProvider: (providerType, options) => {
-    const provider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
-    const model = settingsRepo.get('agent.model') ?? undefined
+    const globalProvider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
+    const globalModel = settingsRepo.get('agent.model') ?? undefined
     const binaryPath = settingsRepo.get('agent.binaryPath') ?? undefined
     const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
     const proxyUrl = proxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
+
+    const provider = options?.agentOverride ?? globalProvider
+    const model = options?.modelOverride ?? globalModel
 
     if (proxyUrl) {
       process.env.HTTP_PROXY = proxyUrl
@@ -158,6 +161,13 @@ const engine = new WorkflowEngine({
           model,
           binaryPath,
           resumeSessionId: options?.resumeSessionId,
+          proxyUrl,
+          sniProxyPatch,
+        })
+      case 'codex':
+        return new ExternalCliProvider({
+          type: 'codex',
+          model,
           proxyUrl,
           sniProxyPatch,
         })

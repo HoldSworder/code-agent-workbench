@@ -157,7 +157,13 @@ const requirementById = computed(() =>
   Object.fromEntries(requirementsStore.requirements.map(r => [r.id, r])),
 )
 
-const ACTIVE_STATUSES = new Set(['pending', 'running', 'waiting_input', 'waiting_confirm', 'waiting_event', 'failed'])
+const ACTIVE_STATUSES = new Set(['running', 'waiting_input', 'waiting_confirm', 'waiting_event', 'failed'])
+
+const pendingTasks = computed(() =>
+  tasksStore.tasks
+    .filter(t => t.phase_status === 'pending')
+    .sort((a, b) => normalizeTime(b.updated_at) - normalizeTime(a.updated_at)),
+)
 
 const activeTasks = computed(() =>
   tasksStore.tasks
@@ -167,7 +173,7 @@ const activeTasks = computed(() =>
 
 const historyTasks = computed(() =>
   tasksStore.tasks
-    .filter(t => !ACTIVE_STATUSES.has(t.phase_status))
+    .filter(t => t.phase_status !== 'pending' && !ACTIVE_STATUSES.has(t.phase_status))
     .sort((a, b) => normalizeTime(b.updated_at) - normalizeTime(a.updated_at)),
 )
 
@@ -367,19 +373,87 @@ function sessionProviderLabel(provider: string): string {
   return providerLabel[provider] ?? provider
 }
 
-// ── Terminal panel ──
+// ── Terminal panel (multi-tab) ──
 
+interface TerminalTab {
+  id: string
+  label: string
+  sessionId?: string
+}
+
+let terminalIdCounter = 0
+
+const terminalTabs = ref<TerminalTab[]>([])
+const activeTerminalId = ref<string | null>(null)
 const showTerminal = ref(false)
 const terminalHeight = ref(320)
 const isDraggingResize = ref(false)
-const terminalRef = ref<InstanceType<typeof CursorTerminal>>()
+const terminalRefs = ref<Record<string, InstanceType<typeof CursorTerminal>>>({})
 
 const repoLocalPath = computed(() =>
   reposStore.repos.find(r => r.id === repoId.value)?.local_path ?? '',
 )
 
+function setTerminalRef(id: string, el: any) {
+  if (el) terminalRefs.value[id] = el
+  else delete terminalRefs.value[id]
+}
+
+function addTerminalTab() {
+  terminalIdCounter++
+  const tab: TerminalTab = {
+    id: `term-${terminalIdCounter}`,
+    label: `Agent ${terminalIdCounter}`,
+  }
+  terminalTabs.value = [...terminalTabs.value, tab]
+  activeTerminalId.value = tab.id
+  if (!showTerminal.value) showTerminal.value = true
+}
+
+function closeTerminalTab(id: string) {
+  const ref = terminalRefs.value[id]
+  if (ref) {
+    ref.dispose()
+    delete terminalRefs.value[id]
+  }
+  terminalTabs.value = terminalTabs.value.filter(t => t.id !== id)
+  if (activeTerminalId.value === id) {
+    activeTerminalId.value = terminalTabs.value[terminalTabs.value.length - 1]?.id ?? null
+  }
+  if (terminalTabs.value.length === 0) {
+    showTerminal.value = false
+  }
+}
+
+function switchTerminalTab(id: string) {
+  activeTerminalId.value = id
+}
+
+function resumeSession(session: SessionSummary) {
+  terminalIdCounter++
+  const shortId = session.sessionId.length > 8
+    ? session.sessionId.slice(0, 8)
+    : session.sessionId
+  const tab: TerminalTab = {
+    id: `term-${terminalIdCounter}`,
+    label: `Resume ${shortId}`,
+    sessionId: session.sessionId,
+  }
+  terminalTabs.value = [...terminalTabs.value, tab]
+  activeTerminalId.value = tab.id
+  showTerminal.value = true
+}
+
 function toggleTerminal() {
-  showTerminal.value = !showTerminal.value
+  if (showTerminal.value) {
+    showTerminal.value = false
+  }
+  else if (terminalTabs.value.length > 0) {
+    showTerminal.value = true
+  }
+  else {
+    addTerminalTab()
+  }
 }
 
 function onResizeStart(e: MouseEvent) {
@@ -505,6 +579,42 @@ async function retryTask(taskId: string) {
         </div>
 
         <div class="space-y-6">
+          <!-- Pending tasks — workflow not yet selected -->
+          <section v-if="pendingTasks.length > 0">
+            <div class="flex items-center gap-2 mb-3">
+              <div class="w-2 h-2 rounded-full bg-slate-400 dark:bg-slate-500" />
+              <h3 class="text-[12px] font-semibold text-gray-600 dark:text-gray-300">未开始</h3>
+              <span class="text-[11px] text-gray-400 bg-gray-100 dark:bg-white/5 px-1.5 py-0.5 rounded-md tabular-nums">
+                {{ pendingTasks.length }}
+              </span>
+            </div>
+
+            <div class="space-y-2">
+              <div
+                v-for="task in pendingTasks"
+                :key="task.id"
+                class="group bg-white dark:bg-[#28282c] rounded-xl p-3.5 shadow-sm shadow-black/[0.04] dark:shadow-none border border-dashed border-gray-300 dark:border-gray-600 transition-all duration-150 cursor-pointer hover:border-indigo-400 dark:hover:border-indigo-500 hover:shadow-md hover:shadow-indigo-500/[0.06]"
+                @click="handleTaskClick(task)"
+              >
+                <div class="flex items-start gap-3">
+                  <div class="mt-1 shrink-0 w-8 h-8 rounded-lg bg-slate-100 dark:bg-slate-500/10 flex items-center justify-center">
+                    <div class="i-carbon-flow w-4 h-4 text-slate-400 dark:text-slate-500" />
+                  </div>
+                  <div class="flex-1 min-w-0">
+                    <p class="text-[13px] font-medium text-gray-800 dark:text-gray-100 truncate mb-1">
+                      {{ requirementTitle(task.requirement_id) }}
+                    </p>
+                    <div class="flex items-center gap-2">
+                      <span class="text-[11px] text-slate-500 dark:text-slate-400">点击选择工作流</span>
+                      <span class="text-[11px] text-gray-400 font-mono truncate">{{ task.branch_name }}</span>
+                    </div>
+                  </div>
+                  <div class="i-carbon-play-filled w-4 h-4 text-indigo-500 shrink-0 mt-2 opacity-40 group-hover:opacity-100 transition-opacity" />
+                </div>
+              </div>
+            </div>
+          </section>
+
           <!-- Active tasks -->
           <section v-if="activeTasks.length > 0">
             <div class="flex items-center gap-2 mb-3">
@@ -519,10 +629,7 @@ async function retryTask(taskId: string) {
               <div
                 v-for="task in activeTasks"
                 :key="task.id"
-                class="group bg-white dark:bg-[#28282c] rounded-xl p-3.5 shadow-sm shadow-black/[0.04] dark:shadow-none border transition-all duration-150 cursor-pointer hover:shadow-md hover:shadow-black/[0.06]"
-                :class="task.phase_status === 'pending'
-                  ? 'border-dashed border-gray-300 dark:border-gray-600 hover:border-indigo-400 dark:hover:border-indigo-500'
-                  : 'border-gray-100 dark:border-white/[0.04] hover:border-gray-200 dark:hover:border-white/[0.08]'"
+                class="group bg-white dark:bg-[#28282c] rounded-xl p-3.5 shadow-sm shadow-black/[0.04] dark:shadow-none border border-gray-100 dark:border-white/[0.04] transition-all duration-150 cursor-pointer hover:shadow-md hover:shadow-black/[0.06] hover:border-gray-200 dark:hover:border-white/[0.08]"
                 @click="handleTaskClick(task)"
               >
                 <div class="flex items-start gap-3">
@@ -541,12 +648,7 @@ async function retryTask(taskId: string) {
                         class="shrink-0 px-2 py-0.5 rounded-md text-[10px] font-medium"
                         :class="statusConfig[task.phase_status]?.badgeClass"
                       >
-                        <template v-if="task.phase_status === 'pending'">
-                          待启动 · 点击选择工作流
-                        </template>
-                        <template v-else>
-                          {{ stageNameMap[task.current_phase] ? `${stageNameMap[task.current_phase]} · ` : '' }}{{ phaseNameMap[task.current_phase] ?? task.current_phase }} · {{ statusConfig[task.phase_status]?.label ?? task.phase_status }}
-                        </template>
+                        {{ stageNameMap[task.current_phase] ? `${stageNameMap[task.current_phase]} · ` : '' }}{{ phaseNameMap[task.current_phase] ?? task.current_phase }} · {{ statusConfig[task.phase_status]?.label ?? task.phase_status }}
                       </span>
                     </div>
                     <div class="flex items-center gap-3 text-[11px] text-gray-400">
@@ -554,14 +656,7 @@ async function retryTask(taskId: string) {
                       <span class="shrink-0 tabular-nums">{{ timeAgo(task.updated_at) }}</span>
                     </div>
                   </div>
-                  <div
-                    v-if="task.phase_status === 'pending'"
-                    class="i-carbon-play-filled w-4 h-4 text-indigo-500 shrink-0 mt-1 opacity-60 group-hover:opacity-100 transition-opacity"
-                  />
-                  <div
-                    v-else
-                    class="i-carbon-chevron-right w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 mt-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                  />
+                  <div class="i-carbon-chevron-right w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0 mt-1 opacity-0 group-hover:opacity-100 transition-opacity" />
                 </div>
 
                 <div
@@ -705,6 +800,14 @@ async function retryTask(taskId: string) {
                 <span class="tabular-nums text-gray-400 dark:text-gray-500">{{ formatDate(session.modifiedAt) }}</span>
                 <span class="text-gray-400 dark:text-gray-600">·</span>
                 <span class="tabular-nums text-gray-400 dark:text-gray-500">{{ timeAgo(session.modifiedAt) }}</span>
+                <button
+                  class="ml-auto flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium text-indigo-500 dark:text-indigo-400 opacity-0 group-hover:opacity-100 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-all"
+                  title="恢复此对话"
+                  @click.stop="resumeSession(session)"
+                >
+                  <div class="i-carbon-play w-3 h-3" />
+                  恢复对话
+                </button>
               </div>
             </div>
           </div>
@@ -733,9 +836,9 @@ async function retryTask(taskId: string) {
       </div>
       </div>
 
-      <!-- Terminal panel -->
+      <!-- Terminal panel (multi-tab) -->
       <div
-        v-if="showTerminal && repoLocalPath"
+        v-if="showTerminal && repoLocalPath && terminalTabs.length > 0"
         class="shrink-0 border-t border-gray-200 dark:border-white/[0.06]"
         :style="{ height: `${terminalHeight}px` }"
       >
@@ -748,12 +851,52 @@ async function retryTask(taskId: string) {
           <div class="w-8 h-0.5 rounded-full bg-gray-300 dark:bg-white/10 group-hover:bg-indigo-400 transition-colors" />
         </div>
 
-        <div class="h-[calc(100%-4px)]">
-          <CursorTerminal
-            ref="terminalRef"
-            :repo-path="repoLocalPath"
-            :visible="showTerminal"
-          />
+        <!-- Tab bar -->
+        <div class="flex items-center h-8 bg-[#1e1e22] border-b border-white/[0.06] px-1 gap-0.5 shrink-0 overflow-x-auto">
+          <button
+            v-for="tab in terminalTabs"
+            :key="tab.id"
+            class="group/tab flex items-center gap-1.5 px-2.5 h-6 rounded text-[11px] font-mono transition-all duration-100 shrink-0 max-w-[160px]"
+            :class="activeTerminalId === tab.id
+              ? 'bg-white/10 text-gray-200'
+              : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'"
+            @click="switchTerminalTab(tab.id)"
+          >
+            <div
+              class="w-1.5 h-1.5 rounded-full shrink-0"
+              :class="activeTerminalId === tab.id ? 'bg-emerald-500' : 'bg-gray-600'"
+            />
+            <span class="truncate">{{ tab.label }}</span>
+            <div
+              class="i-carbon-close w-3 h-3 shrink-0 opacity-0 group-hover/tab:opacity-70 hover:!opacity-100 transition-opacity"
+              @click.stop="closeTerminalTab(tab.id)"
+            />
+          </button>
+
+          <button
+            class="flex items-center justify-center w-6 h-6 rounded text-gray-500 hover:text-gray-300 hover:bg-white/5 transition-colors shrink-0 ml-0.5"
+            title="新建终端"
+            @click="addTerminalTab"
+          >
+            <div class="i-carbon-add w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <!-- Terminal instances -->
+        <div class="h-[calc(100%-4px-32px)] relative">
+          <div
+            v-for="tab in terminalTabs"
+            :key="tab.id"
+            class="absolute inset-0"
+            :class="activeTerminalId === tab.id ? 'z-10 visible' : 'z-0 invisible'"
+          >
+            <CursorTerminal
+              :ref="(el: any) => setTerminalRef(tab.id, el)"
+              :repo-path="repoLocalPath"
+              :visible="showTerminal && activeTerminalId === tab.id"
+              :session-id="tab.sessionId"
+            />
+          </div>
         </div>
       </div>
     </div>

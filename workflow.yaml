@@ -205,7 +205,7 @@ stages:
 
       - id: codex-cross-review-planning
         name: Codex 交叉 Review
-        provider: external-cli
+        provider: codex
         skill: skills/frontend/codex-cross-review-planning.md
         optional: true
         requires_confirm: true
@@ -252,7 +252,7 @@ stages:
 
       - id: codex-cross-review-dev
         name: Codex 交叉 Review
-        provider: external-cli
+        provider: codex
         skill: skills/frontend/codex-cross-review-dev.md
         optional: true
         requires_confirm: true

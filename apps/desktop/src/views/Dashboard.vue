@@ -614,15 +614,21 @@ async function retryTask(taskId: string) {
                       <div class="i-carbon-folder-details w-3 h-3 text-gray-400 opacity-60 shrink-0" />
                       <span class="text-gray-600 dark:text-gray-300 truncate">{{ task.repoName }}</span>
                       <span class="text-gray-300 dark:text-gray-600">·</span>
-                      <span class="truncate" :class="phaseStatusClass(task.phase_status)">
-                        {{ allPhaseNameMap[task.current_phase] ?? task.current_phase }}
-                        ({{ phaseStatusLabels[task.phase_status] || task.phase_status }})
-                      </span>
-                      <div
-                        v-if="task.phase_status === 'waiting_confirm' || task.phase_status === 'waiting_input'"
-                        class="w-1.5 h-1.5 rounded-full animate-pulse shrink-0"
-                        :class="task.phase_status === 'waiting_input' ? 'bg-orange-400' : 'bg-amber-400'"
-                      />
+                      <template v-if="task.phase_status === 'pending'">
+                        <span class="text-slate-500 dark:text-slate-400 truncate">待选择工作流</span>
+                        <div class="i-carbon-play-filled w-2.5 h-2.5 text-indigo-500 opacity-60 shrink-0" />
+                      </template>
+                      <template v-else>
+                        <span class="truncate" :class="phaseStatusClass(task.phase_status)">
+                          {{ allPhaseNameMap[task.current_phase] ?? task.current_phase }}
+                          ({{ phaseStatusLabels[task.phase_status] || task.phase_status }})
+                        </span>
+                        <div
+                          v-if="task.phase_status === 'waiting_confirm' || task.phase_status === 'waiting_input'"
+                          class="w-1.5 h-1.5 rounded-full animate-pulse shrink-0"
+                          :class="task.phase_status === 'waiting_input' ? 'bg-orange-400' : 'bg-amber-400'"
+                        />
+                      </template>
                       <button
                         v-if="task.phase_status === 'failed' || task.phase_status === 'cancelled'"
                         class="ml-auto flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-500/30 transition-colors text-[10px] shrink-0"
@@ -1162,7 +1168,8 @@ async function retryTask(taskId: string) {
                           'bg-amber-50/50 dark:bg-amber-500/5': task.phase_status === 'waiting_confirm',
                           'bg-orange-50/50 dark:bg-orange-500/5': task.phase_status === 'waiting_input',
                           'bg-red-50/50 dark:bg-red-500/5': task.phase_status === 'failed',
-                          'bg-gray-50/50 dark:bg-white/[0.02]': !['waiting_confirm', 'waiting_input', 'failed'].includes(task.phase_status),
+                          'bg-slate-50/80 dark:bg-slate-500/5 border-dashed': task.phase_status === 'pending',
+                          'bg-gray-50/50 dark:bg-white/[0.02]': !['waiting_confirm', 'waiting_input', 'failed', 'pending'].includes(task.phase_status),
                         }"
                       >
                         <div class="flex-1 min-w-0">
@@ -1171,18 +1178,26 @@ async function retryTask(taskId: string) {
                             <span class="text-[13px] font-medium text-gray-700 dark:text-gray-200 truncate">{{ task.repoName }}</span>
                           </div>
                           <div class="flex items-center gap-2 pl-5.5">
-                            <span
-                              class="text-[11px] font-medium"
-                              :class="phaseStatusClass(task.phase_status)"
-                            >
-                              {{ allPhaseNameMap[task.current_phase] ?? task.current_phase }}
-                              · {{ phaseStatusLabels[task.phase_status] || task.phase_status }}
-                            </span>
-                            <div
-                              v-if="task.phase_status === 'waiting_confirm' || task.phase_status === 'waiting_input'"
-                              class="w-1.5 h-1.5 rounded-full animate-pulse shrink-0"
-                              :class="task.phase_status === 'waiting_input' ? 'bg-orange-400' : 'bg-amber-400'"
-                            />
+                            <template v-if="task.phase_status === 'pending'">
+                              <span class="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                                待选择工作流
+                              </span>
+                              <div class="i-carbon-play-filled w-3 h-3 text-indigo-500 opacity-60" />
+                            </template>
+                            <template v-else>
+                              <span
+                                class="text-[11px] font-medium"
+                                :class="phaseStatusClass(task.phase_status)"
+                              >
+                                {{ allPhaseNameMap[task.current_phase] ?? task.current_phase }}
+                                · {{ phaseStatusLabels[task.phase_status] || task.phase_status }}
+                              </span>
+                              <div
+                                v-if="task.phase_status === 'waiting_confirm' || task.phase_status === 'waiting_input'"
+                                class="w-1.5 h-1.5 rounded-full animate-pulse shrink-0"
+                                :class="task.phase_status === 'waiting_input' ? 'bg-orange-400' : 'bg-amber-400'"
+                              />
+                            </template>
                           </div>
                         </div>
                         <div class="i-carbon-chevron-right w-3.5 h-3.5 text-gray-300 dark:text-gray-600 shrink-0" />

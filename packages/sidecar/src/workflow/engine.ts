@@ -10,7 +10,7 @@ function elog(msg: string) {
 import type Database from 'better-sqlite3'
 import type { AgentProvider, PhaseResult } from '../providers/types'
 import { buildPromptFromContext } from '../providers/cli.provider'
-import { parseWorkflow, findPhaseById, findPhaseInStages, flattenPhases } from './parser'
+import { parseWorkflow, findPhaseById, findPhaseInStages, flattenPhases, getLastMandatoryPhaseId } from './parser'
 import type { GateCheck, GateDefinition, PhaseConfig, StageConfig, WorkflowConfig } from './parser'
 import { buildPhaseContext } from './context-builder'
 import { RepoTaskRepository } from '../db/repositories/repo-task.repo'
@@ -27,6 +27,10 @@ import type { McpServerConfig } from '../mcp/config-writer'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
+  /** Phase 级别覆盖的 agent 类型（如 cursor-cli / claude-code / codex） */
+  agentOverride?: string
+  /** Phase 级别覆盖的模型名 */
+  modelOverride?: string
 }
 
 export interface WorkflowEngineOptions {
@@ -339,6 +343,41 @@ export class WorkflowEngine {
     this.settingsRepo.set(`phase.${phaseId}.enabled`, enabled ? 'true' : 'false')
   }
 
+  setPhaseAgent(phaseId: string, agent?: string | null, model?: string | null): void {
+    if (agent)
+      this.settingsRepo.set(`phase.${phaseId}.agent`, agent)
+    else
+      this.settingsRepo.delete(`phase.${phaseId}.agent`)
+
+    if (model)
+      this.settingsRepo.set(`phase.${phaseId}.model`, model)
+    else
+      this.settingsRepo.delete(`phase.${phaseId}.model`)
+  }
+
+  getPhaseAgentConfig(phaseId: string): { agent?: string, model?: string } {
+    const agent = this.settingsRepo.get(`phase.${phaseId}.agent`) ?? undefined
+    const model = this.settingsRepo.get(`phase.${phaseId}.model`) ?? undefined
+    return { agent, model }
+  }
+
+  getPhaseAgentMap(workflowId?: string | null): Record<string, { agent?: string, model?: string }> {
+    const wf = this.getWorkflowConfig(workflowId)
+    const result: Record<string, { agent?: string, model?: string }> = {}
+    const collectPhases = (phases: { id: string }[]) => {
+      for (const phase of phases) {
+        const cfg = this.getPhaseAgentConfig(phase.id)
+        if (cfg.agent || cfg.model)
+          result[phase.id] = cfg
+      }
+    }
+    for (const stage of wf.stages)
+      collectPhases(stage.phases)
+    if (wf.requirement_phases)
+      collectPhases(wf.requirement_phases)
+    return result
+  }
+
   getPhaseEnabledMap(workflowId?: string | null): Record<string, boolean> {
     const wf = this.getWorkflowConfig(workflowId)
     const result: Record<string, boolean> = {}
@@ -515,6 +554,11 @@ export class WorkflowEngine {
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
 
+    if (task.current_stage === '_requirements') {
+      await this.executeRequirementPhase(repoTaskId, task.current_phase, feedback)
+      return
+    }
+
     const wf = this.resolveConfigForTask(repoTaskId)
     const found = findPhaseById(wf.stages, task.current_phase)
     if (!found)
@@ -538,6 +582,11 @@ export class WorkflowEngine {
     const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
+
+    if (task.current_stage === '_requirements') {
+      await this.executeRequirementPhase(repoTaskId, task.current_phase, '用户已确认，请完成本阶段所有产出。')
+      return
+    }
 
     const wf = this.resolveConfigForTask(repoTaskId)
     const found = findPhaseById(wf.stages, task.current_phase)
@@ -728,13 +777,23 @@ export class WorkflowEngine {
     return this.resolveSkillContent(skillPath)
   }
 
-  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, phases: { id: string, name: string, suspendable?: boolean }[] }[] {
+  getStagesAndPhases(workflowId?: string | null): { id: string, name: string, gate?: string, stageGatePhaseId?: string, phases: { id: string, name: string, suspendable?: boolean, carriesStageGate?: boolean }[] }[] {
     const wf = this.getWorkflowConfig(workflowId)
-    return wf.stages.map(s => ({
-      id: s.id,
-      name: s.name,
-      phases: s.phases.map(p => ({ id: p.id, name: p.name, suspendable: p.suspendable || undefined })),
-    }))
+    return wf.stages.map((s) => {
+      const gatePhaseId = s.gate ? getLastMandatoryPhaseId(s) : undefined
+      return {
+        id: s.id,
+        name: s.name,
+        gate: s.gate,
+        stageGatePhaseId: gatePhaseId,
+        phases: s.phases.map(p => ({
+          id: p.id,
+          name: p.name,
+          suspendable: p.suspendable || undefined,
+          carriesStageGate: gatePhaseId === p.id || undefined,
+        })),
+      }
+    })
   }
 
   getRequirementPhases(): { id: string, name: string, optional?: boolean, skippable?: boolean }[] {
@@ -759,6 +818,14 @@ export class WorkflowEngine {
     const virtualStage: StageConfig = { id: '_requirements', name: '需求收集', phases: reqPhases }
     this.taskRepo.updatePhase(repoTaskId, '_requirements', phaseId, 'running')
     await this.executePhase(repoTaskId, phase, virtualStage, userMessage)
+
+    const task = this.taskRepo.findById(repoTaskId)
+    if (task && task.current_stage === '_requirements') {
+      const interactiveStatuses = ['waiting_input', 'waiting_confirm']
+      if (!interactiveStatuses.includes(task.phase_status)) {
+        this.taskRepo.updatePhase(repoTaskId, 'planning', 'task-breakdown', 'pending')
+      }
+    }
   }
 
   async cancelCurrentAgent(repoTaskId: string): Promise<void> {
@@ -803,6 +870,11 @@ export class WorkflowEngine {
       gateDefinitions: wf.gate_definitions,
     }
 
+    const stageTyped = stage as StageConfig
+    const shouldInjectGate = stageTyped.gate
+      && getLastMandatoryPhaseId(stageTyped) === phase.id
+    const effectiveGate = shouldInjectGate ? stageTyped.gate : undefined
+
     const context = buildPhaseContext(
       phase,
       stage.id,
@@ -816,7 +888,7 @@ export class WorkflowEngine {
       undefined,
       false,
       { title: '<需求标题>', description: '<需求描述>' },
-      (stage as StageConfig).gate,
+      effectiveGate,
     )
 
     const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
@@ -859,6 +931,11 @@ export class WorkflowEngine {
       gateDefinitions: wf.gate_definitions,
     }
 
+    const stageTyped = stage as StageConfig
+    const shouldInjectGate = stageTyped.gate
+      && getLastMandatoryPhaseId(stageTyped) === phase.id
+    const effectiveGate = shouldInjectGate ? stageTyped.gate : undefined
+
     const context = buildPhaseContext(
       phase,
       stage.id,
@@ -872,7 +949,7 @@ export class WorkflowEngine {
       history.length > 0 ? history : undefined,
       false,
       reqInfo,
-      (stage as StageConfig).gate,
+      effectiveGate,
     )
 
     const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
@@ -935,6 +1012,10 @@ export class WorkflowEngine {
         gateDefinitions: wf.gate_definitions,
       }
 
+      const shouldInjectStageGate = stage.gate
+        && getLastMandatoryPhaseId(stage) === phase.id
+      const effectiveStageGate = shouldInjectStageGate ? stage.gate : undefined
+
       const context = isResume
         ? buildPhaseContext(
             phase,
@@ -949,7 +1030,7 @@ export class WorkflowEngine {
             undefined,
             true,
             reqInfo,
-            stage.gate,
+            effectiveStageGate,
           )
         : buildPhaseContext(
             phase,
@@ -964,7 +1045,7 @@ export class WorkflowEngine {
             history.length > 0 ? history : undefined,
             false,
             reqInfo,
-            stage.gate,
+            effectiveStageGate,
           )
 
       const agentRun = this.runRepo.create({
@@ -974,8 +1055,11 @@ export class WorkflowEngine {
       })
       agentRunId = agentRun.id
 
+      const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
       const provider = this.resolveProvider(phase.provider, {
         resumeSessionId: previousSessionId ?? undefined,
+        agentOverride: phaseAgentCfg.agent,
+        modelOverride: phaseAgentCfg.model,
       })
       this.activeProviders.set(repoTaskId, provider)
       this.liveOutputs.set(repoTaskId, '')

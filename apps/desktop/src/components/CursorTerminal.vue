@@ -10,6 +10,7 @@ import '@xterm/xterm/css/xterm.css'
 const props = defineProps<{
   repoPath: string
   visible: boolean
+  sessionId?: string
 }>()
 
 const emit = defineEmits<{
@@ -126,7 +127,10 @@ async function spawnCursorAgent() {
 
 function sendCursorAgentCommand() {
   if (!pty || status.value !== 'running') return
-  pty.write(`agent --workspace "${props.repoPath}"\r`)
+  let cmd = `agent --workspace "${props.repoPath}"`
+  if (props.sessionId)
+    cmd += ` --resume ${props.sessionId}`
+  pty.write(`${cmd}\r`)
 }
 
 function getDefaultShell(): string {
@@ -162,8 +166,13 @@ watch(() => props.visible, (visible) => {
   if (visible && !term) {
     nextTick(() => spawnCursorAgent())
   }
-  if (visible && fitAddon) {
-    nextTick(() => fitAddon?.fit())
+  else if (visible && fitAddon && term) {
+    nextTick(() => {
+      fitAddon?.fit()
+      if (pty && status.value === 'running') {
+        pty.resize(term!.cols, term!.rows)
+      }
+    })
   }
 })
 

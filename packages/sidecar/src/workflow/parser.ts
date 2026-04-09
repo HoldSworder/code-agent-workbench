@@ -46,7 +46,7 @@ const TriggerMappingEntrySchema = z.object({
 const PhaseSchema = z.object({
   id: z.string(),
   name: z.string(),
-  provider: z.enum(['api', 'external-cli']),
+  provider: z.enum(['api', 'external-cli', 'codex']),
   skill: z.string().optional(),
   invoke_skills: z.array(z.string()).optional(),
   invoke_commands: z.array(z.string()).optional(),
@@ -181,6 +181,18 @@ export function findPhaseById(
       if (stage.phases[pi].id === phaseId)
         return { stage, phase: stage.phases[pi], stageIdx: si, phaseIdx: pi }
     }
+  }
+  return undefined
+}
+
+/**
+ * 获取 Stage 中最后一个必选（非 optional）Phase 的 id。
+ * Stage gate 仅应注入到此 Phase 的提示词中，避免误导其他 Phase 的 Agent。
+ */
+export function getLastMandatoryPhaseId(stage: StageConfig): string | undefined {
+  for (let i = stage.phases.length - 1; i >= 0; i--) {
+    if (!stage.phases[i].optional)
+      return stage.phases[i].id
   }
   return undefined
 }

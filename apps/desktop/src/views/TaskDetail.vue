@@ -24,6 +24,7 @@ interface RepoTask {
   phase_status: string
   openspec_path: string
   worktree_path: string
+  workflow_id: string | null
   created_at: string
   updated_at: string
 }
@@ -41,6 +42,47 @@ const messages = ref<ChatMessage[]>([])
 const chatInput = ref('')
 const liveOutput = ref('')
 const chatContainer = ref<HTMLElement>()
+
+// ── Workflow selection for pending tasks ──
+
+interface WorkflowInfo {
+  id: string
+  name: string
+  description: string
+}
+
+const availableWorkflows = ref<WorkflowInfo[]>([])
+const selectedWorkflowId = ref('')
+const startingWorkflow = ref(false)
+
+const isPending = computed(() => task.value?.phase_status === 'pending')
+
+async function startWithWorkflow() {
+  if (!task.value || !selectedWorkflowId.value) return
+  startingWorkflow.value = true
+  try {
+    await rpc('workflow.start', {
+      repoTaskId: task.value.id,
+      workflowId: selectedWorkflowId.value,
+    })
+    await new Promise(r => setTimeout(r, 300))
+    const t = await rpc<RepoTask>('task.get', { id: taskId })
+    if (t) {
+      task.value = t
+      viewingPhaseId.value = t.current_phase
+    }
+    const phasesRes = await rpc<{ stages: WorkflowStage[] }>('workflow.phases', { workflowId: selectedWorkflowId.value })
+    if (phasesRes?.stages) workflowStages.value = phasesRes.stages
+    await refreshMessages()
+    if (t?.phase_status === 'running') startPolling()
+  }
+  catch (err) {
+    console.error('Failed to start workflow:', err)
+  }
+  finally {
+    startingWorkflow.value = false
+  }
+}
 
 interface WorkflowPhase {
   id: string
@@ -375,17 +417,24 @@ async function refreshMessages() {
 }
 
 onMounted(async () => {
-  const [t, phasesRes] = await Promise.all([
+  const [t, phasesRes, wfRes] = await Promise.all([
     rpc<RepoTask>('task.get', { id: taskId }),
     rpc<{ stages: WorkflowStage[] }>('workflow.phases'),
+    rpc<{ workflows: WorkflowInfo[] }>('workflow.listAll'),
   ])
   if (t) {
     task.value = t
     viewingPhaseId.value = t.current_phase
   }
   if (phasesRes?.stages) workflowStages.value = phasesRes.stages
-  await refreshMessages()
-  if (isRunning.value) startPolling()
+  if (wfRes?.workflows) {
+    availableWorkflows.value = wfRes.workflows
+    selectedWorkflowId.value = wfRes.workflows[0]?.id ?? ''
+  }
+  if (!isPending.value) {
+    await refreshMessages()
+    if (isRunning.value) startPolling()
+  }
 })
 
 onUnmounted(() => stopPolling())
@@ -747,12 +796,16 @@ async function handleCancel() {
             'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400': task.phase_status === 'running',
             'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400': task.phase_status === 'completed',
             'bg-gray-100 text-gray-600 dark:bg-gray-500/10 dark:text-gray-400': task.phase_status === 'suspended',
-            'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-500': task.phase_status === 'cancelled' || task.phase_status === 'pending',
+            'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-500': task.phase_status === 'cancelled',
+            'bg-slate-100 text-slate-500 dark:bg-slate-500/10 dark:text-slate-400 border border-dashed border-slate-300 dark:border-slate-600': task.phase_status === 'pending',
           }"
         >
           <template v-if="task.phase_status === 'completed'">
             <div class="i-carbon-checkmark-filled w-3 h-3 inline-block mr-0.5 align-[-2px]" />
             全部完成
+          </template>
+          <template v-else-if="task.phase_status === 'pending'">
+            待选择工作流
           </template>
           <template v-else>
             {{ displayPhase }} · {{ displayStatus }}
@@ -763,7 +816,7 @@ async function handleCancel() {
 
       <!-- Reset / Rollback button -->
       <button
-        v-if="task && !isRunning"
+        v-if="task && !isRunning && !isPending"
         class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium transition-colors"
         :class="isViewingPastPhase
           ? 'text-amber-500 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-500/10'
@@ -777,7 +830,7 @@ async function handleCancel() {
 
       <!-- Prompt preview button -->
       <button
-        v-if="task"
+        v-if="task && !isPending"
         class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium text-gray-400 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-colors"
         title="预览该阶段的 Agent 提示词"
         @click="previewPhasePrompt"
@@ -787,7 +840,7 @@ async function handleCancel() {
       </button>
 
       <!-- Tab toggle -->
-      <div class="flex bg-gray-100 dark:bg-white/5 rounded-lg p-0.5">
+      <div v-if="!isPending" class="flex bg-gray-100 dark:bg-white/5 rounded-lg p-0.5">
         <button
           class="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12px] font-medium transition-all duration-150"
           :class="activeTab === 'chat'
@@ -823,7 +876,7 @@ async function handleCancel() {
 
     <!-- Stage & Phase stepper (two rows) -->
     <div
-      v-if="workflowStages.length > 0 && task"
+      v-if="workflowStages.length > 0 && task && !isPending"
       class="border-b border-gray-100 dark:border-white/[0.03] bg-gray-50/50 dark:bg-[#1a1a1e]/50 py-3 px-5 space-y-2.5"
     >
       <!-- Row 1: Stage pills -->
@@ -906,8 +959,68 @@ async function handleCancel() {
 
     <!-- Content area -->
     <div class="flex-1 overflow-hidden">
+      <!-- Pending: Workflow selection -->
+      <div v-if="isPending" class="flex flex-col items-center justify-center h-full">
+        <div class="w-full max-w-md px-6">
+          <div class="flex flex-col items-center mb-8">
+            <div class="w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 flex items-center justify-center mb-4">
+              <div class="i-carbon-flow w-7 h-7 text-indigo-500" />
+            </div>
+            <h2 class="text-[16px] font-semibold text-gray-800 dark:text-gray-100 mb-1.5">选择工作流</h2>
+            <p class="text-[13px] text-gray-400 text-center leading-relaxed">
+              任务已创建，请选择一套工作流来驱动执行
+            </p>
+          </div>
+
+          <div class="space-y-2 mb-6">
+            <label
+              v-for="wf in availableWorkflows"
+              :key="wf.id"
+              class="flex items-start gap-3 px-4 py-3.5 rounded-xl cursor-pointer transition-all duration-150"
+              :class="selectedWorkflowId === wf.id
+                ? 'bg-indigo-50 dark:bg-indigo-500/10 border-2 border-indigo-400 dark:border-indigo-500/40 shadow-sm shadow-indigo-500/10'
+                : 'bg-white dark:bg-[#28282c] border-2 border-gray-100 dark:border-white/[0.06] hover:border-indigo-200 dark:hover:border-indigo-500/20'"
+              @click.prevent="selectedWorkflowId = wf.id"
+            >
+              <input
+                type="radio"
+                :checked="selectedWorkflowId === wf.id"
+                class="mt-0.5 w-4 h-4 text-indigo-600 focus:ring-indigo-500/20 cursor-pointer"
+              >
+              <div class="flex-1 min-w-0">
+                <div class="text-[13px] font-semibold text-gray-800 dark:text-gray-100">{{ wf.name }}</div>
+                <div v-if="wf.description" class="text-[12px] text-gray-400 mt-1 leading-relaxed line-clamp-2">{{ wf.description }}</div>
+              </div>
+            </label>
+          </div>
+
+          <div v-if="availableWorkflows.length === 0" class="text-center py-8 text-gray-400 mb-6">
+            <div class="i-carbon-flow w-8 h-8 mx-auto mb-2 opacity-30" />
+            <p class="text-[13px]">暂无可用工作流</p>
+          </div>
+
+          <div class="flex justify-center gap-3">
+            <button
+              class="px-5 py-2.5 rounded-xl text-[13px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+              @click="router.push(`/repo/${repoId}`)"
+            >
+              返回
+            </button>
+            <button
+              class="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
+              :disabled="!selectedWorkflowId || startingWorkflow"
+              @click="startWithWorkflow"
+            >
+              <div v-if="startingWorkflow" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+              <div v-else class="i-carbon-play-filled w-4 h-4" />
+              {{ startingWorkflow ? '启动中...' : '启动工作流' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- Chat tab — full width -->
-      <div v-show="activeTab === 'chat'" class="flex flex-col h-full">
+      <div v-show="activeTab === 'chat' && !isPending" class="flex flex-col h-full">
         <div ref="chatContainer" class="flex-1 overflow-y-auto px-6 py-4">
           <div class="max-w-5xl mx-auto space-y-3">
             <template v-for="group in messageGroups" :key="group.phaseId">
@@ -1198,7 +1311,7 @@ async function handleCancel() {
       </div>
 
       <!-- Sessions tab — agent runs + transcript (Turn-based, inspired by claude-replay) -->
-      <div v-show="activeTab === 'sessions'" class="flex h-full">
+      <div v-show="activeTab === 'sessions' && !isPending" class="flex h-full">
         <!-- Run list sidebar -->
         <div class="w-72 border-r border-gray-200 dark:border-white/5 overflow-y-auto bg-[#fafafa] dark:bg-[#1e1e22] flex flex-col">
           <div class="px-3 py-2.5 border-b border-gray-100 dark:border-white/[0.03] flex items-center justify-between">
@@ -1430,7 +1543,7 @@ async function handleCancel() {
       </div>
 
       <!-- Files tab — changed files + diff -->
-      <div v-show="activeTab === 'files'" class="flex h-full">
+      <div v-show="activeTab === 'files' && !isPending" class="flex h-full">
         <!-- File list sidebar -->
         <div class="w-72 border-r border-gray-200 dark:border-white/5 overflow-y-auto bg-[#fafafa] dark:bg-[#1e1e22] flex flex-col">
           <!-- Summary header -->

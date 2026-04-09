@@ -15,6 +15,8 @@ let buffer = ''
 
 export const sidecarReady = ref(false)
 
+const mockInstalledSkills = new Map<string, { slug: string, displayName: string, description: string }>()
+
 function mockRpc<T>(method: string, params: Record<string, any>): T {
   switch (method) {
     case 'requirement.list':
@@ -226,18 +228,65 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'mcp.delete':
     case 'mcp.setBindings':
       return { ok: true } as T
-    case 'skill.scan':
-      return { skills: [
+    case 'skill.scan': {
+      const baseSkills = [
         { id: '/mock/vue', name: 'vue', description: 'Vue.js progressive JavaScript framework.', type: 'skill', dirName: 'vue', realDir: '/mock/vue', skillMdPath: '/mock/vue/SKILL.md', envs: { claude: { installed: true }, codex: { installed: true }, cursor: { installed: true } } },
         { id: '/mock/antfu', name: 'antfu', description: 'Anthony Fu\'s {Opinionated} preferences and best practices.', type: 'skill', dirName: 'antfu', realDir: '/mock/antfu', skillMdPath: '/mock/antfu/SKILL.md', envs: { claude: { installed: true, isSymlink: true }, codex: { installed: false }, cursor: { installed: false } } },
         { id: '/mock/dev-workflow', name: 'dev-workflow', description: '前端需求研发工作流编排。', type: 'skill', dirName: 'dev-workflow', realDir: '/mock/dev-workflow', skillMdPath: '/mock/SKILL.md', plugin: { name: 'fe-specflow', displayName: '前端 Specflow 研发工作流', version: '0.0.1', author: 'wenli' }, envs: { claude: { installed: false }, codex: { installed: false }, cursor: { installed: false } } },
         { id: '/mock/fe-sdd', name: 'fe-sdd', description: 'Spec-Driven 门禁：先澄清再落盘。', type: 'command', dirName: 'fe-sdd', realDir: '/mock/fe-sdd.md', skillMdPath: '/mock/fe-sdd.md', plugin: { name: 'fe-specflow', displayName: '前端 Specflow 研发工作流', version: '0.0.1', author: 'wenli' }, envs: { claude: { installed: false }, codex: { installed: false }, cursor: { installed: false } } },
-      ], envLabels: { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor' } } as T
+      ]
+      for (const [slug, meta] of mockInstalledSkills) {
+        if (!baseSkills.some(s => s.dirName === slug)) {
+          baseSkills.push({
+            id: slug, name: meta.displayName || slug, description: meta.description || '',
+            type: 'skill', dirName: slug, realDir: `/mock/store/${slug}`, skillMdPath: `/mock/store/${slug}/SKILL.md`,
+            envs: { claude: { installed: true }, codex: { installed: false }, cursor: { installed: false } },
+          })
+        }
+      }
+      return { skills: baseSkills, envLabels: { claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor' } } as T
+    }
     case 'skill.readContent':
       return { content: '---\nname: mock-skill\ndescription: Mock skill content\n---\n\n# Mock Skill\n\nThis is mock content for development.' } as T
     case 'skill.enable':
     case 'skill.disable':
       return { ok: true } as T
+    case 'skillStore.list': {
+      const isSkillsSh = (params.apiBase as string)?.includes('skills.sh')
+      return {
+        items: isSkillsSh
+          ? [
+              { slug: 'frontend-design', displayName: 'frontend-design', summary: 'From anthropics/skills', tags: [], stats: { downloads: 0, installs: 214080, versions: 0, stars: 0 }, highlighted: false, createdAt: 0, updatedAt: 0, latestVersion: null, source: 'anthropics/skills', installed: mockInstalledSkills.has('frontend-design') },
+              { slug: 'find-skills', displayName: 'find-skills', summary: 'From vercel-labs/skills', tags: [], stats: { downloads: 0, installs: 731151, versions: 0, stars: 0 }, highlighted: false, createdAt: 0, updatedAt: 0, latestVersion: null, source: 'vercel-labs/skills', installed: mockInstalledSkills.has('find-skills') },
+            ]
+          : [
+              { slug: 'example-skill', displayName: 'Example Skill', summary: 'A mock store skill for development', tags: ['mock'], stats: { downloads: 100, installs: 50, versions: 3, stars: 10 }, highlighted: false, createdAt: Date.now(), updatedAt: Date.now(), latestVersion: { version: '1.0.0', createdAt: Date.now(), changelog: 'Initial release' }, installed: mockInstalledSkills.has('example-skill') },
+            ],
+        nextCursor: null,
+      } as T
+    }
+    case 'skillStore.search':
+      return {
+        items: [
+          { slug: `search-${params.query}`, displayName: `Search: ${params.query}`, summary: 'Mock remote search result', tags: [], stats: { downloads: 0, installs: 5, versions: 0, stars: 0 }, highlighted: false, createdAt: 0, updatedAt: 0, latestVersion: null, source: 'mock-user/mock-repo' },
+        ],
+        nextCursor: null,
+      } as T
+    case 'skillStore.detail':
+      return {
+        skill: { slug: params.slug, displayName: params.slug, summary: params.source ? `From ${params.source}` : 'Mock skill detail', tags: [], stats: { downloads: 0, installs: 0, versions: 0, stars: 0 }, highlighted: false, createdAt: 0, updatedAt: 0, latestVersion: params.source ? null : { version: '1.0.0', createdAt: Date.now(), changelog: 'Mock changelog' }, source: params.source },
+        latestVersion: params.source ? { version: 'latest', createdAt: 0, changelog: '', files: [{ path: 'SKILL.md', size: 128, storageKey: '', sha256: '', contentType: 'text/markdown' }] } : { version: '1.0.0', createdAt: Date.now(), changelog: 'Mock changelog', files: [{ path: 'SKILL.md', size: 128, storageKey: '', sha256: '', contentType: 'text/markdown' }] },
+        owner: { handle: params.source?.split('/')[0] || 'mock-user', displayName: params.source || 'Mock User', image: '' },
+        isStarred: false,
+        installed: mockInstalledSkills.has(params.slug),
+        readme: params.source ? `# ${params.slug}\n\nSkill from ${params.source}` : '',
+      } as T
+    case 'skillStore.install':
+      mockInstalledSkills.set(params.slug, { slug: params.slug, displayName: params.slug, description: '' })
+      return { installed: true, dirName: params.slug, path: `/mock/${params.slug}`, fileCount: 1 } as T
+    case 'skillStore.uninstall':
+      mockInstalledSkills.delete(params.slug)
+      return { removed: true } as T
     case 'task.get':
       return {
         id: params.id,

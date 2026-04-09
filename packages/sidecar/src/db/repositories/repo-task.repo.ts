@@ -37,9 +37,10 @@ export class RepoTaskRepository {
         `
       INSERT INTO repo_tasks (
         id, requirement_id, repo_id, branch_name, change_id,
+        current_stage, current_phase, phase_status,
         openspec_path, worktree_path, workflow_id
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'planning', 'task-breakdown', 'pending', ?, ?, ?)
     `,
       )
       .run(
