@@ -2,6 +2,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
 import { rpc } from '../composables/use-sidecar'
+import { useModelList } from '../composables/use-model-list'
 
 // ── Types ──
 
@@ -135,11 +136,14 @@ const phaseEnabledMap = ref<Record<string, boolean>>({})
 
 // ── Phase-level agent/model overrides ──
 
-interface ModelOption { id: string, label: string }
-
 const phaseAgentMap = ref<Record<string, { agent?: string, model?: string }>>({})
-const availableModels = ref<ModelOption[]>([])
-const loadingModels = ref(false)
+
+const activePhaseProvider = computed(() => {
+  if (panelTarget.value?.type !== 'phase') return ''
+  return getPhaseAgent(panelTarget.value.phase.id)
+})
+
+const { models: availableModels, loading: loadingModels, fetchModels } = useModelList(activePhaseProvider)
 
 const agentProviders = [
   { value: 'cursor-cli', label: 'Cursor CLI' },
@@ -183,20 +187,6 @@ function onDropdownDocClick(e: MouseEvent) {
 onMounted(() => document.addEventListener('click', onDropdownDocClick, true))
 onUnmounted(() => document.removeEventListener('click', onDropdownDocClick, true))
 
-async function fetchModels() {
-  loadingModels.value = true
-  try {
-    const res = await rpc<{ models: ModelOption[] }>('agent.listModels')
-    availableModels.value = res?.models ?? []
-  }
-  catch {
-    availableModels.value = []
-  }
-  finally {
-    loadingModels.value = false
-  }
-}
-
 function getPhaseAgent(phaseId: string): string {
   return phaseAgentMap.value[phaseId]?.agent ?? ''
 }
@@ -232,8 +222,11 @@ async function setPhaseAgent(phaseId: string, agent: string | null, model: strin
 }
 
 function selectPhaseAgentOption(phaseId: string, value: string) {
-  setPhaseAgent(phaseId, value || null, getPhaseModel(phaseId) || null)
+  const prevAgent = getPhaseAgent(phaseId)
+  const keepModel = prevAgent === value ? getPhaseModel(phaseId) : null
+  setPhaseAgent(phaseId, value || null, keepModel)
   agentDropdownOpen.value = false
+  fetchModels(value || undefined)
 }
 
 function selectPhaseModelOption(phaseId: string, value: string) {
@@ -371,6 +364,8 @@ function selectPhase(phase: PhaseConfig, stageId: string, stageName: string, isR
   modelSearchQuery.value = ''
   panelTarget.value = { type: 'phase', phase, stageId, stageName, isRequirement }
   loadPhaseSkill(phase)
+  const phaseAgent = getPhaseAgent(phase.id)
+  fetchModels(phaseAgent || undefined)
 }
 
 function selectStage(stage: StageConfig, stageIdx: number) {

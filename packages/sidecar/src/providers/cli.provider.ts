@@ -281,10 +281,10 @@ export class ExternalCliProvider implements AgentProvider {
         return { args, stdinData: prompt }
       }
       case 'codex': {
-        const args = ['-p', prompt, '--output-format', 'json']
+        const args = ['exec', '-', '--full-auto', '-C', cwd]
         if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
-        return { args, stdinData: null }
+        return { args, stdinData: prompt }
       }
     }
   }

@@ -570,30 +570,85 @@ export function registerMethods(
       .filter(m => m.id && m.id !== 'Available models')
   }
 
-  server.register('agent.listModels', async () => {
-    const provider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
+  const defaultBinaries: Record<string, string> = {
+    'cursor-cli': 'agent',
+    'claude-code': 'claude',
+    'codex': 'codex',
+  }
 
-    let binary: string
-    let args: string[]
-    switch (provider) {
-      case 'cursor-cli':
-        binary = settingsRepo.get('agent.binaryPath') ?? 'agent'
-        args = ['--list-models']
-        break
-      case 'claude-code':
-        binary = settingsRepo.get('agent.binaryPath') ?? 'claude'
-        args = ['--list-models']
-        break
-      case 'codex':
-        binary = settingsRepo.get('agent.binaryPath') ?? 'codex'
-        args = ['--list-models']
-        break
-      default:
-        return { models: [] }
+  function resolveBinary(provider: string): string | null {
+    const fallback = defaultBinaries[provider]
+    if (!fallback) return null
+    const globalProvider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
+    if (provider === globalProvider) {
+      return settingsRepo.get('agent.binaryPath') || fallback
     }
+    return fallback
+  }
+
+  function fetchCodexModels(binary: string): Promise<{ id: string, label: string }[]> {
+    return new Promise((resolve, reject) => {
+      const child = spawnChild(binary, ['app-server'], {
+        env: buildModelListEnv(),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: false,
+      })
+
+      let buf = ''
+      let initDone = false
+      const timer = setTimeout(() => {
+        child.kill('SIGTERM')
+        reject(new Error('codex app-server timeout'))
+      }, 15_000)
+
+      child.stdout?.on('data', (d) => {
+        buf += String(d)
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const msg = JSON.parse(line)
+            if (!initDone && msg.id === 0 && msg.result) {
+              initDone = true
+              child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method: 'model/list', id: 1, params: {} }) + '\n')
+            }
+            else if (msg.id === 1) {
+              clearTimeout(timer)
+              child.kill('SIGTERM')
+              const data: any[] = msg.result?.data ?? []
+              resolve(data.filter((m: any) => !m.hidden).map((m: any) => ({
+                id: m.id,
+                label: m.displayName || m.description || '',
+              })))
+            }
+          }
+          catch { /* ignore non-JSON lines */ }
+        }
+      })
+      child.on('error', (err) => { clearTimeout(timer); reject(err) })
+      child.on('close', () => { clearTimeout(timer); resolve([]) })
+
+      child.stdin?.write(JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'initialize',
+        id: 0,
+        params: { clientInfo: { name: 'code-agent', version: '1.0' }, capabilities: {} },
+      }) + '\n')
+    })
+  }
+
+  server.register('agent.listModels', async (params?: { provider?: string }) => {
+    const provider = params?.provider || settingsRepo.get('agent.provider') || 'cursor-cli'
+    const binary = resolveBinary(provider)
+    if (!binary) return { models: [] }
 
     try {
-      const stdout = await spawnListModels(binary, args)
+      if (provider === 'codex') {
+        const models = await fetchCodexModels(binary)
+        return { models }
+      }
+      const stdout = await spawnListModels(binary, ['--list-models'])
       const models = parseModelList(stdout)
       return { models }
     }

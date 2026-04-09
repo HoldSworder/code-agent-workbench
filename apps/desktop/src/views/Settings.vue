@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { useReposStore } from '../stores/repos'
 import { rpc } from '../composables/use-sidecar'
+import { useModelList } from '../composables/use-model-list'
 
 const router = useRouter()
 
@@ -22,11 +23,10 @@ const agentApiKey = ref('')
 const agentBaseUrl = ref('https://api.openai.com/v1')
 const agentModel = ref('')
 const agentBinaryPath = ref('')
-interface ModelOption { id: string, label: string }
-const availableModels = ref<ModelOption[]>([])
-const loadingModels = ref(false)
 const saving = ref(false)
 const customModelInput = ref(false)
+
+const { models: availableModels, loading: loadingModels, fetchModels, refreshModels } = useModelList(agentProvider)
 
 const isApiMode = computed(() => agentProvider.value === 'custom-api')
 const isCliMode = computed(() => ['cursor-cli', 'claude-code', 'codex'].includes(agentProvider.value))
@@ -53,35 +53,19 @@ async function loadSettings() {
     if (all['agent.baseUrl']) agentBaseUrl.value = all['agent.baseUrl']
     proxyEnabled.value = all['proxy.enabled'] === 'true'
     if (all['proxy.url']) proxyUrl.value = all['proxy.url']
-    // non-blocking: fetch models in background (can take 20+ seconds)
-    fetchModels()
-  }
-  catch { /* sidecar may not be ready */ }
-}
-
-async function fetchModels() {
-  loadingModels.value = true
-  try {
-    const res = await rpc<{ models: ModelOption[] }>('agent.listModels')
-    availableModels.value = res.models ?? []
+    await fetchModels()
     if (agentModel.value && availableModels.value.length > 0) {
       const exists = availableModels.value.some(m => m.id === agentModel.value)
       if (!exists) customModelInput.value = true
     }
   }
-  catch {
-    availableModels.value = []
-  }
-  finally {
-    loadingModels.value = false
-  }
+  catch { /* sidecar may not be ready */ }
 }
 
-watch(agentProvider, () => {
+watch(agentProvider, async () => {
   agentModel.value = ''
-  availableModels.value = []
   customModelInput.value = false
-  fetchModels()
+  await fetchModels()
 })
 
 watch(agentModel, (v) => {
@@ -399,7 +383,7 @@ onUnmounted(() => document.removeEventListener('click', onDocClick, true))
                     class="settings-icon-btn disabled:opacity-30"
                     :disabled="loadingModels"
                     title="刷新模型列表"
-                    @click="fetchModels"
+                    @click="refreshModels()"
                   >
                     <div class="i-carbon-renew w-4 h-4" :class="loadingModels && 'animate-spin'" />
                   </button>
