@@ -40,6 +40,7 @@ interface ChatMessage {
 const task = ref<RepoTask | null>(null)
 const messages = ref<ChatMessage[]>([])
 const chatInput = ref('')
+const chatInputEl = ref<HTMLInputElement>()
 const liveOutput = ref('')
 const chatContainer = ref<HTMLElement>()
 
@@ -689,6 +690,8 @@ function onKeydownEnter(e: KeyboardEvent) {
 
 async function handleFeedback() {
   activeTab.value = 'chat'
+  await nextTick()
+  chatInputEl.value?.focus()
 }
 
 const expandedPrompts = ref<Set<string>>(new Set())
@@ -1352,6 +1355,7 @@ async function handleCancel() {
         <div class="border-t border-gray-200 dark:border-white/5 p-4 bg-white/60 dark:bg-[#1e1e22]/60 backdrop-blur-sm">
           <div class="max-w-5xl mx-auto flex gap-2">
             <input
+              ref="chatInputEl"
               v-model="chatInput"
               type="text"
               placeholder="输入反馈或指令..."
