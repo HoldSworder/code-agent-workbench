@@ -82,7 +82,7 @@ async function confirmStartWithWorkflow() {
     })
     showWorkflowPicker.value = false
     await tasksStore.fetchByRepo(repoId.value)
-    router.push(`/repo/${repoId.value}/task/${taskId}`)
+    router.push(`/repo/${repoId.value}/task/${taskId}?workflowId=${selectedWorkflowId.value}`)
   }
   catch (err) {
     console.error('Failed to start workflow:', err)

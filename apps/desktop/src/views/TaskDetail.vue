@@ -55,7 +55,8 @@ const availableWorkflows = ref<WorkflowInfo[]>([])
 const selectedWorkflowId = ref('')
 const startingWorkflow = ref(false)
 
-const isPending = computed(() => task.value?.phase_status === 'pending')
+const workflowJustStarted = ref(false)
+const isPending = computed(() => task.value?.phase_status === 'pending' && !workflowJustStarted.value)
 
 async function startWithWorkflow() {
   if (!task.value || !selectedWorkflowId.value) return
@@ -325,6 +326,46 @@ const loadingRuns = ref(false)
 const loadingTranscript = ref(false)
 const expandedBlocks = ref<Set<string>>(new Set())
 
+const agentProviderLabels: Record<string, string> = {
+  'cursor-cli': 'Cursor CLI',
+  'claude-code': 'Claude Code',
+  'codex': 'Codex',
+  'external-cli': 'CLI',
+  'api': 'API',
+}
+
+const promptRunMap = computed<Map<string, AgentRun>>(() => {
+  const map = new Map<string, AgentRun>()
+  if (!agentRuns.value.length) return map
+  const runsByPhase = new Map<string, AgentRun[]>()
+  for (const run of agentRuns.value) {
+    const arr = runsByPhase.get(run.phase_id) ?? []
+    arr.push(run)
+    runsByPhase.set(run.phase_id, arr)
+  }
+  for (const [, runs] of runsByPhase)
+    runs.sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime())
+
+  for (const msg of messages.value) {
+    if (msg.role !== 'prompt') continue
+    const phaseRuns = runsByPhase.get(msg.phase_id)
+    if (!phaseRuns?.length) continue
+    const msgTime = new Date(normalizeTime(msg.created_at)).getTime()
+    let best = phaseRuns[0]
+    let bestDiff = Infinity
+    for (const run of phaseRuns) {
+      const diff = Math.abs(new Date(normalizeTime(run.started_at)).getTime() - msgTime)
+      if (diff < bestDiff) { bestDiff = diff; best = run }
+    }
+    map.set(msg.id, best)
+  }
+  return map
+})
+
+function findRunForPrompt(msg: ChatMessage): AgentRun | undefined {
+  return promptRunMap.value.get(msg.id)
+}
+
 function normalizeTime(iso: string) {
   return iso.includes('T') || iso.includes('Z') ? iso : `${iso.replace(' ', 'T')}Z`
 }
@@ -417,9 +458,16 @@ async function refreshMessages() {
 }
 
 onMounted(async () => {
+  const startedWorkflowId = route.query.workflowId as string | undefined
+
+  if (startedWorkflowId) {
+    workflowJustStarted.value = true
+    router.replace({ query: {} })
+  }
+
   const [t, phasesRes, wfRes] = await Promise.all([
     rpc<RepoTask>('task.get', { id: taskId }),
-    rpc<{ stages: WorkflowStage[] }>('workflow.phases'),
+    rpc<{ stages: WorkflowStage[] }>('workflow.phases', startedWorkflowId ? { workflowId: startedWorkflowId } : undefined),
     rpc<{ workflows: WorkflowInfo[] }>('workflow.listAll'),
   ])
   if (t) {
@@ -431,6 +479,16 @@ onMounted(async () => {
     availableWorkflows.value = wfRes.workflows
     selectedWorkflowId.value = wfRes.workflows[0]?.id ?? ''
   }
+
+  if (startedWorkflowId && t?.phase_status === 'pending') {
+    await new Promise(r => setTimeout(r, 500))
+    const refreshed = await rpc<RepoTask>('task.get', { id: taskId })
+    if (refreshed) {
+      task.value = refreshed
+      viewingPhaseId.value = refreshed.current_phase
+    }
+  }
+
   if (!isPending.value) {
     await refreshMessages()
     if (isRunning.value) startPolling()
@@ -1066,6 +1124,17 @@ async function handleCancel() {
                       />
                       <div class="i-carbon-send-alt w-3.5 h-3.5 text-violet-500" />
                       <span class="text-[12px] font-medium text-violet-600 dark:text-violet-400">发送给 Agent 的提示词</span>
+                      <!-- Agent / Model badge -->
+                      <span v-if="findRunForPrompt(msg)" class="inline-flex items-center gap-1.5 shrink-0">
+                        <span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-violet-100/60 dark:bg-violet-500/10 text-[10px] font-medium text-violet-500 dark:text-violet-400">
+                          <div class="i-carbon-bot w-2.5 h-2.5" />
+                          {{ agentProviderLabels[findRunForPrompt(msg)!.provider] ?? findRunForPrompt(msg)!.provider }}
+                        </span>
+                        <span v-if="findRunForPrompt(msg)!.model" class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-violet-100/60 dark:bg-violet-500/10 text-[10px] font-mono text-violet-500 dark:text-violet-400 max-w-[140px] truncate">
+                          <div class="i-carbon-machine-learning-model w-2.5 h-2.5 shrink-0" />
+                          {{ findRunForPrompt(msg)!.model }}
+                        </span>
+                      </span>
                       <span class="text-[11px] text-gray-400 dark:text-gray-500 truncate flex-1">
                         {{ truncateText(msg.content.replace(/\n/g, ' '), 60) }}
                       </span>
