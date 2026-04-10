@@ -9,6 +9,11 @@ export interface Requirement {
   source: string
   source_url: string | null
   doc_url: string | null
+  fetch_error: string | null
+  fetch_output: string | null
+  fetch_prompt: string | null
+  fetch_cli_type: string | null
+  fetch_model: string | null
   status: string
   mode: string
   created_at: string
@@ -39,10 +44,25 @@ export const useRequirementsStore = defineStore('requirements', () => {
     return req
   }
 
+  async function refreshOne(id: string) {
+    const req = await rpc<Requirement>('requirement.get', { id })
+    if (!req) return
+    const idx = requirements.value.findIndex(r => r.id === id)
+    if (idx >= 0) requirements.value[idx] = req
+    else requirements.value.unshift(req)
+  }
+
   async function remove(id: string) {
     await rpc<{ ok: boolean }>('requirement.delete', { id })
     requirements.value = requirements.value.filter(r => r.id !== id)
   }
 
-  return { requirements, loading, fetchAll, create, remove }
+  async function updateMode(id: string, mode: 'workflow' | 'orchestrator') {
+    const req = await rpc<Requirement>('requirement.update', { id, data: { mode } })
+    if (!req) return
+    const idx = requirements.value.findIndex(r => r.id === id)
+    if (idx >= 0) requirements.value[idx] = req
+  }
+
+  return { requirements, loading, fetchAll, create, refreshOne, remove, updateMode }
 })

@@ -1,18 +1,24 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRequirementsStore } from '../stores/requirements'
 import { useReposStore } from '../stores/repos'
 import { useTasksStore } from '../stores/tasks'
+import { useOrchestratorStore } from '../stores/orchestrator'
 import { rpc } from '../composables/use-sidecar'
 import type { RepoTask } from '../stores/tasks'
 
 interface ReqPhase { id: string, name: string, optional?: boolean, skippable?: boolean }
 interface WorkflowPhase { id: string, name: string }
 interface WorkflowStage { id: string, name: string, phases: WorkflowPhase[] }
+interface ReqSession { sessionId: string, filePath: string, provider: string, modifiedAt: string, sizeBytes: number, firstTurnPreview: string | null }
+interface ToolCall { tool_use_id: string, name: string, input: Record<string, unknown>, result: string | null, is_error: boolean }
+interface TranscriptBlock { kind: 'text' | 'thinking' | 'tool_use', text: string, tool_call: ToolCall | null }
+interface TranscriptTurn { index: number, user_text: string, blocks: TranscriptBlock[], timestamp: string }
 
 const requirementsStore = useRequirementsStore()
 const reposStore = useReposStore()
 const tasksStore = useTasksStore()
+const orchestratorStore = useOrchestratorStore()
 
 const taskMap = ref<Record<string, (RepoTask & { repoName: string })[]>>({})
 
@@ -57,7 +63,7 @@ onMounted(async () => {
     if (res?.stages)
       workflowStages.value = res.stages
   })
-  await Promise.all([requirementsStore.fetchAll(), reposStore.fetchAll(), loadMcpData()])
+  await Promise.all([requirementsStore.fetchAll(), reposStore.fetchAll(), loadMcpData(), orchestratorStore.fetchStatus()])
   await refreshTaskMap()
 })
 
@@ -68,6 +74,9 @@ const sourceBadge: Record<string, { label: string, class: string }> = {
 }
 
 const statusBadge: Record<string, { label: string, class: string }> = {
+  fetching: { label: '获取中', class: 'bg-violet-50 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400' },
+  fetch_failed: { label: '获取失败', class: 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400' },
+  pending: { label: '待编排', class: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400' },
   draft: { label: '草稿', class: 'bg-gray-100 text-gray-500 dark:bg-gray-500/10 dark:text-gray-400' },
   active: { label: '进行中', class: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400' },
   suspended: { label: '已挂起', class: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400' },
@@ -76,6 +85,8 @@ const statusBadge: Record<string, { label: string, class: string }> = {
 }
 
 const statusGroupOrder = [
+  { key: 'fetching', icon: 'i-carbon-ai-status', dot: 'bg-violet-500' },
+  { key: 'pending', icon: 'i-carbon-pending', dot: 'bg-blue-500' },
   { key: 'draft', icon: 'i-carbon-document-blank', dot: 'bg-gray-400' },
   { key: 'active', icon: 'i-carbon-in-progress', dot: 'bg-indigo-500' },
   { key: 'suspended', icon: 'i-carbon-pause-outline', dot: 'bg-amber-500' },
@@ -95,6 +106,9 @@ function getReqSortTime(reqId: string, createdAt: string): number {
 }
 
 function deriveEffectiveStatus(req: { id: string, status: string }): string {
+  if (req.status === 'fetching' || req.status === 'fetch_failed')
+    return req.status
+
   const tasks = taskMap.value[req.id] ?? []
   if (tasks.length === 0) return req.status
 
@@ -251,7 +265,7 @@ async function submitRequirement() {
     })
   }
   else {
-    await requirementsStore.create({
+    const req = await requirementsStore.create({
       description: feishuParsed.value
         ? `飞书项目 ${feishuParsed.value.projectKey} #${feishuParsed.value.workItemId} (${feishuParsed.value.workItemType})`
         : '',
@@ -260,17 +274,25 @@ async function submitRequirement() {
       mode: requirementMode.value,
     })
 
-    if (createMcpSelectedIds.value.size > 0) {
+    const mcpIds = [...createMcpSelectedIds.value]
+
+    if (mcpIds.length > 0) {
       const firstPhase = requirementPhases.value.find(p => !p.optional)
       if (firstPhase) {
         await rpc('mcp.setBindings', {
           stageId: '_requirements',
           phaseId: firstPhase.id,
-          mcpServerIds: [...createMcpSelectedIds.value],
+          mcpServerIds: mcpIds,
         })
         await loadMcpData()
       }
     }
+
+    await rpc('requirement.startFetch', {
+      requirementId: req.id,
+      mcpServerIds: mcpIds.length > 0 ? mcpIds : undefined,
+    })
+    await requirementsStore.refreshOne(req.id)
   }
 
   showDialog.value = false
@@ -339,6 +361,30 @@ async function startReqCollection(reqId: string) {
     })
   }
   await refreshTaskMap()
+}
+
+async function retryRequirementFetch(reqId: string) {
+  const bindings = mcpBindings.value.filter(b => b.stage_id === '_requirements')
+  const mcpIds = bindings.map(b => b.mcp_server_id)
+  await rpc('requirement.retryFetch', {
+    requirementId: reqId,
+    mcpServerIds: mcpIds.length > 0 ? mcpIds : undefined,
+  })
+  await requirementsStore.refreshOne(reqId)
+}
+
+const orchestratorDispatching = ref(false)
+async function dispatchToOrchestrator(reqId: string) {
+  orchestratorDispatching.value = true
+  try {
+    await requirementsStore.updateMode(reqId, 'orchestrator')
+    if (!orchestratorStore.status?.running)
+      await orchestratorStore.start()
+    await requirementsStore.refreshOne(reqId)
+  }
+  finally {
+    orchestratorDispatching.value = false
+  }
 }
 
 // ── 需求收集 MCP 选择弹窗 ──
@@ -467,6 +513,47 @@ function openReqDetail(reqId: string) {
   selectedReqId.value = reqId
 }
 
+// ── 需求获取实时输出 ──
+const reqLiveOutput = ref('')
+let reqPollTimer: ReturnType<typeof setInterval> | null = null
+
+function stopReqOutputPoll() {
+  if (reqPollTimer) { clearInterval(reqPollTimer); reqPollTimer = null }
+}
+
+function startReqOutputPoll(reqId: string) {
+  stopReqOutputPoll()
+  reqPollTimer = setInterval(async () => {
+    try {
+      const { output } = await rpc<{ output: string }>('requirement.getLiveOutput', { requirementId: reqId })
+      reqLiveOutput.value = output
+    }
+    catch {}
+    await requirementsStore.refreshOne(reqId)
+    const req = requirementsStore.requirements.find(r => r.id === reqId)
+    if (!req || req.status !== 'fetching') {
+      stopReqOutputPoll()
+    }
+  }, 1500)
+}
+
+watch(selectedReqId, (id) => {
+  stopReqOutputPoll()
+  reqLiveOutput.value = ''
+  if (!id) return
+  const req = requirementsStore.requirements.find(r => r.id === id)
+  if (req?.status === 'fetching') startReqOutputPoll(id)
+})
+
+watch(() => requirementsStore.requirements.find(r => r.id === selectedReqId.value)?.status, (newStatus, oldStatus) => {
+  if (!selectedReqId.value) return
+  if (newStatus === 'fetching' && oldStatus !== 'fetching') {
+    startReqOutputPoll(selectedReqId.value)
+  }
+})
+
+onUnmounted(() => stopReqOutputPoll())
+
 // ── 重试失败的任务 ──
 
 async function retryTask(taskId: string) {
@@ -490,6 +577,98 @@ async function retryTask(taskId: string) {
     tasksStore.finishRetry(taskId)
     await refreshTaskMap()
   }
+}
+
+// ── 会话详情弹窗 ──
+const showReqSessionModal = ref(false)
+const reqSessionModalReqId = ref<string | null>(null)
+const reqSessionModalSessions = ref<ReqSession[]>([])
+const reqSessionModalLoading = ref(false)
+const reqSessionModalTranscript = ref<TranscriptTurn[]>([])
+const reqSessionModalTranscriptLoading = ref(false)
+const reqSessionModalSelectedId = ref<string | null>(null)
+const reqSessionModalFilePath = ref<string | null>(null)
+const reqSessionExpandedBlocks = ref(new Set<string>())
+
+async function openReqSessionModal(reqId: string) {
+  reqSessionModalReqId.value = reqId
+  reqSessionModalSessions.value = []
+  reqSessionModalTranscript.value = []
+  reqSessionModalSelectedId.value = null
+  reqSessionModalFilePath.value = null
+  showReqSessionModal.value = true
+  reqSessionModalLoading.value = true
+  try {
+    const res = await rpc<{ items: ReqSession[] }>('requirement.listSessions', { requirementId: reqId })
+    reqSessionModalSessions.value = res?.items ?? []
+  }
+  catch { reqSessionModalSessions.value = [] }
+  finally { reqSessionModalLoading.value = false }
+}
+
+async function openReqSessionTranscript(session: ReqSession) {
+  reqSessionModalSelectedId.value = session.sessionId
+  reqSessionModalFilePath.value = session.filePath
+  reqSessionModalTranscriptLoading.value = true
+  reqSessionExpandedBlocks.value = new Set()
+  try {
+    const res = await rpc<{ turns: TranscriptTurn[], format: string, filePath: string | null }>('requirement.sessionTranscript', { sessionId: session.sessionId })
+    reqSessionModalTranscript.value = res?.turns ?? []
+    if (res?.filePath) reqSessionModalFilePath.value = res.filePath
+  }
+  catch { reqSessionModalTranscript.value = [] }
+  finally { reqSessionModalTranscriptLoading.value = false }
+}
+
+function closeReqSessionModal() {
+  showReqSessionModal.value = false
+  reqSessionModalReqId.value = null
+}
+
+function toggleReqBlock(key: string) {
+  const s = reqSessionExpandedBlocks.value
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  reqSessionExpandedBlocks.value = new Set(s)
+}
+
+function reqSessionProviderLabel(p: string): string {
+  return { 'cursor': 'Cursor', 'claude-code': 'Claude Code', 'codex': 'Codex' }[p] ?? p
+}
+
+function reqFormatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function reqTimeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return '刚刚'
+  if (mins < 60) return `${mins} 分钟前`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours} 小时前`
+  const days = Math.floor(hours / 24)
+  return `${days} 天前`
+}
+
+function reqTruncateText(text: string, maxLen = 200): string {
+  return text.length <= maxLen ? text : `${text.slice(0, maxLen)}…`
+}
+
+function reqToolSummary(tc: ToolCall): string {
+  const inp = tc.input
+  if (tc.name === 'Read' || tc.name === 'read_file') return String(inp.path ?? inp.file_path ?? '')
+  if (tc.name === 'Write' || tc.name === 'write_to_file') return String(inp.path ?? inp.file_path ?? '')
+  if (tc.name === 'Bash' || tc.name === 'execute_command') return String(inp.command ?? '').slice(0, 80)
+  if (tc.name === 'Shell') return String(inp.command ?? '').slice(0, 80)
+  if (tc.name === 'Grep') return String(inp.pattern ?? '')
+  return Object.values(inp).map(String).join(' ').slice(0, 60)
+}
+
+function reqFormatToolInput(input: Record<string, unknown>): string {
+  return JSON.stringify(input, null, 2)
 }
 </script>
 
@@ -596,14 +775,33 @@ async function retryTask(taskId: string) {
                 </a>
               </div>
 
-              <!-- 获取飞书需求 -->
+              <!-- 获取飞书需求状态 -->
+              <div v-if="req.status === 'fetching'" class="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400 text-[11px] font-medium">
+                <div class="i-carbon-circle-dash w-3 h-3 animate-spin" />
+                正在获取飞书需求...
+              </div>
+              <div v-else-if="req.status === 'fetch_failed'" class="mt-2 space-y-1">
+                <div class="w-full flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-50 dark:bg-red-500/10 text-red-500 dark:text-red-400 text-[10px]">
+                  <div class="i-carbon-warning w-3 h-3 shrink-0" />
+                  <span class="truncate">{{ req.fetch_error || '获取失败' }}</span>
+                </div>
+                <button
+                  class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md bg-violet-600 text-white text-[11px] font-medium hover:bg-violet-500 transition-all duration-150 active:scale-[0.97]"
+                  @click.stop="retryRequirementFetch(req.id)"
+                >
+                  <div class="i-carbon-restart w-3 h-3" />
+                  重试获取
+                </button>
+              </div>
+
+              <!-- 对话记录入口 -->
               <button
-                v-if="req.source === 'feishu' && req.status === 'draft' && (taskMap[req.id] ?? []).length > 0"
-                class="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md bg-violet-600 text-white text-[11px] font-medium hover:bg-violet-500 shadow-sm shadow-violet-600/20 transition-all duration-150 active:scale-[0.97]"
-                @click.stop="mcpServers.length > 0 ? openMcpPicker(req.id) : startReqCollection(req.id)"
+                v-if="req.source === 'feishu' && req.fetch_output"
+                class="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1 rounded-md text-[10px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-50 dark:hover:bg-white/3 transition-colors"
+                @click.stop="openReqSessionModal(req.id)"
               >
-                <div class="i-carbon-ai-status w-3 h-3" />
-                获取飞书需求
+                <div class="i-carbon-chat w-3 h-3" />
+                查看对话记录
               </button>
 
               <!-- 关联任务 -->
@@ -661,7 +859,7 @@ async function retryTask(taskId: string) {
                   </div>
                 </div>
                 <button
-                  v-if="reposStore.repos.length > (taskMap[req.id] ?? []).length"
+                  v-if="reposStore.repos.length > (taskMap[req.id] ?? []).length && !['fetching', 'fetch_failed'].includes(req.status)"
                   class="mt-1.5 flex items-center gap-1 text-[11px] text-indigo-500 hover:text-indigo-600 transition-colors"
                   @click.stop="openDispatchDialog(req.id)"
                 >
@@ -674,7 +872,7 @@ async function retryTask(taskId: string) {
               <div v-else class="mt-2.5 pt-2.5 border-t border-gray-100 dark:border-white/5 flex items-center justify-between">
                 <span class="text-[11px] text-gray-300 dark:text-gray-600">暂无任务</span>
                 <button
-                  v-if="reposStore.repos.length > 0"
+                  v-if="reposStore.repos.length > 0 && !['fetching', 'fetch_failed'].includes(req.status)"
                   class="flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600 text-white text-[11px] font-medium hover:bg-indigo-500 transition-all duration-150 active:scale-[0.97]"
                   @click.stop="openDispatchDialog(req.id)"
                 >
@@ -1145,6 +1343,130 @@ async function retryTask(taskId: string) {
 
               <!-- 面板主体 -->
               <div class="flex-1 overflow-y-auto">
+                <!-- 执行模式切换 -->
+                <div v-if="selectedReq.status === 'draft'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
+                  <div class="text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">执行模式</div>
+                  <div class="flex gap-2">
+                    <button
+                      class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all text-center"
+                      :class="selectedReq.mode === 'workflow'
+                        ? 'border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-400'
+                        : 'border-gray-200 text-gray-500 hover:bg-gray-50 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5'"
+                      @click="requirementsStore.updateMode(selectedReq.id, 'workflow')"
+                    >
+                      <div class="i-carbon-flow w-4 h-4 mx-auto mb-1 opacity-60" />
+                      流水线
+                    </button>
+                    <button
+                      class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all text-center"
+                      :class="selectedReq.mode === 'orchestrator'
+                        ? 'border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-400'
+                        : 'border-gray-200 text-gray-500 hover:bg-gray-50 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5'"
+                      @click="requirementsStore.updateMode(selectedReq.id, 'orchestrator')"
+                    >
+                      <div class="i-carbon-group w-4 h-4 mx-auto mb-1 opacity-60" />
+                      多 Agent 编排
+                    </button>
+                  </div>
+                  <button
+                    class="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-150 active:scale-[0.98] disabled:opacity-50 bg-violet-600 text-white hover:bg-violet-500 shadow-sm shadow-violet-600/20"
+                    :disabled="orchestratorDispatching"
+                    @click="dispatchToOrchestrator(selectedReq.id)"
+                  >
+                    <div v-if="orchestratorDispatching" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+                    <div v-else class="i-carbon-send-alt w-4 h-4" />
+                    派发给多 Agent 编排
+                  </button>
+                </div>
+                <!-- pending: 已派发到编排，等待处理 -->
+                <div v-else-if="selectedReq.status === 'pending' && selectedReq.mode === 'orchestrator'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
+                  <div class="flex items-center gap-2 mb-2">
+                    <span class="text-[11px] text-gray-400">执行模式:</span>
+                    <span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400">
+                      多 Agent 编排
+                    </span>
+                  </div>
+                  <div class="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-blue-50/80 dark:bg-blue-500/5 border border-blue-200/60 dark:border-blue-500/10">
+                    <div class="i-carbon-circle-dash w-4 h-4 text-blue-500 animate-spin shrink-0" />
+                    <span class="text-[12px] font-medium text-blue-600 dark:text-blue-400">已派发，等待 Leader 分析分配...</span>
+                  </div>
+                </div>
+                <!-- 非 draft/pending 状态只读显示 -->
+                <div v-else class="px-6 py-3 border-b border-gray-100 dark:border-white/5 flex items-center gap-2">
+                  <span class="text-[11px] text-gray-400">执行模式:</span>
+                  <span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400">
+                    {{ selectedReq.mode === 'orchestrator' ? '多 Agent 编排' : '流水线' }}
+                  </span>
+                </div>
+
+                <!-- 获取进度 / 获取结果 -->
+                <div v-if="selectedReq.status === 'fetching' || selectedReq.status === 'fetch_failed' || selectedReq.fetch_output" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
+                  <!-- 标题栏 -->
+                  <div class="flex items-center gap-2 mb-3">
+                    <template v-if="selectedReq.status === 'fetching'">
+                      <div class="i-carbon-circle-dash w-4 h-4 text-violet-500 animate-spin" />
+                      <h3 class="text-[12px] font-semibold text-violet-600 dark:text-violet-400 uppercase tracking-wider">正在获取飞书需求...</h3>
+                    </template>
+                    <template v-else-if="selectedReq.status === 'fetch_failed'">
+                      <div class="i-carbon-warning w-4 h-4 text-red-500" />
+                      <h3 class="text-[12px] font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">获取失败</h3>
+                    </template>
+                    <template v-else>
+                      <div class="i-carbon-checkmark w-4 h-4 text-emerald-500" />
+                      <h3 class="text-[12px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">获取记录</h3>
+                    </template>
+                  </div>
+
+                  <!-- CLI / 模型 标签 -->
+                  <div v-if="selectedReq.fetch_cli_type || selectedReq.fetch_model" class="flex items-center gap-2 mb-3 flex-wrap">
+                    <span v-if="selectedReq.fetch_cli_type" class="px-2 py-0.5 rounded-md text-[10px] font-medium bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400">
+                      {{ { 'cursor-cli': 'Cursor', 'claude-code': 'Claude Code', 'codex': 'Codex' }[selectedReq.fetch_cli_type] ?? selectedReq.fetch_cli_type }}
+                    </span>
+                    <span v-if="selectedReq.fetch_model" class="px-2 py-0.5 rounded-md text-[10px] font-medium bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400">
+                      {{ selectedReq.fetch_model }}
+                    </span>
+                  </div>
+
+                  <!-- 输入提示词 -->
+                  <details v-if="selectedReq.fetch_prompt" class="group mb-3">
+                    <summary class="cursor-pointer text-[11px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors select-none flex items-center gap-1.5">
+                      <div class="i-carbon-document w-3 h-3" />
+                      查看输入提示词
+                    </summary>
+                    <div class="mt-2 rounded-lg bg-gray-50 dark:bg-white/3 border border-gray-100 dark:border-white/5 p-4 max-h-80 overflow-y-auto">
+                      <pre class="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed whitespace-pre-wrap font-mono">{{ selectedReq.fetch_prompt }}</pre>
+                    </div>
+                  </details>
+
+                  <!-- 错误信息 -->
+                  <p v-if="selectedReq.status === 'fetch_failed' && selectedReq.fetch_error" class="text-[12px] text-red-500 dark:text-red-400 mb-3 whitespace-pre-wrap">{{ selectedReq.fetch_error }}</p>
+
+                  <!-- 输出内容 -->
+                  <div v-if="selectedReq.status === 'fetching' && reqLiveOutput" class="rounded-lg bg-gray-900 dark:bg-gray-950 p-4 max-h-80 overflow-y-auto">
+                    <pre class="text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap font-mono">{{ reqLiveOutput }}</pre>
+                  </div>
+                  <div v-else-if="selectedReq.status === 'fetching' && !reqLiveOutput" class="text-[12px] text-gray-400">等待 Agent 输出...</div>
+                  <details v-else-if="selectedReq.fetch_output" class="group">
+                    <summary class="cursor-pointer text-[11px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors select-none">
+                      {{ selectedReq.status === 'fetch_failed' ? '查看获取输出' : '展开获取过程' }}
+                    </summary>
+                    <div class="mt-2 rounded-lg bg-gray-900 dark:bg-gray-950 p-4 max-h-80 overflow-y-auto">
+                      <pre class="text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap font-mono">{{ selectedReq.fetch_output }}</pre>
+                    </div>
+                  </details>
+
+                  <!-- 重试按钮 -->
+                  <button
+                    v-if="selectedReq.status === 'fetch_failed'"
+                    class="mt-3 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 text-white text-[12px] font-medium hover:bg-violet-500 transition-all duration-150 active:scale-[0.97]"
+                    @click="retryRequirementFetch(selectedReq.id)"
+                  >
+                    <div class="i-carbon-restart w-3.5 h-3.5" />
+                    重试获取
+                  </button>
+                </div>
+
+                <!-- 对话历史 -->
                 <!-- 描述 -->
                 <div v-if="selectedReq.description" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
                   <h3 class="text-[12px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">描述</h3>
@@ -1173,6 +1495,7 @@ async function retryTask(taskId: string) {
                     >
                       <div class="i-carbon-document w-3.5 h-3.5 text-blue-500" />
                       <span class="text-[12px] text-blue-600 dark:text-blue-400">需求文档</span>
+                      <span class="text-[11px] text-gray-400 truncate ml-auto font-mono">{{ selectedReq.doc_url.replace(/https?:\/\//, '').slice(0, 40) }}...</span>
                     </a>
                   </div>
                 </div>
@@ -1185,7 +1508,7 @@ async function retryTask(taskId: string) {
                       <span v-if="selectedReqTasks.length" class="ml-1">({{ selectedReqTasks.length }})</span>
                     </h3>
                     <button
-                      v-if="reposStore.repos.length > selectedReqTasks.length"
+                      v-if="selectedReq?.mode !== 'orchestrator' && reposStore.repos.length > selectedReqTasks.length && !['fetching', 'fetch_failed'].includes(selectedReq?.status ?? '')"
                       class="flex items-center gap-1 text-[11px] text-indigo-500 hover:text-indigo-600 transition-colors"
                       @click="openDispatchDialog(selectedReqId!); selectedReqId = null"
                     >
@@ -1254,7 +1577,7 @@ async function retryTask(taskId: string) {
                     <div class="i-carbon-task w-8 h-8 mx-auto mb-2 opacity-30" />
                     <p class="text-[12px]">暂无关联任务</p>
                     <button
-                      v-if="reposStore.repos.length > 0"
+                      v-if="selectedReq?.mode !== 'orchestrator' && reposStore.repos.length > 0 && !['fetching', 'fetch_failed'].includes(selectedReq?.status ?? '')"
                       class="mt-3 flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 text-white text-[12px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97] mx-auto"
                       @click="openDispatchDialog(selectedReqId!); selectedReqId = null"
                     >
@@ -1268,12 +1591,12 @@ async function retryTask(taskId: string) {
               <!-- 面板底栏 -->
               <div class="shrink-0 flex items-center gap-2 px-6 py-3 border-t border-gray-100 dark:border-white/5 bg-gray-50/50 dark:bg-white/[0.01]">
                 <button
-                  v-if="selectedReq.source === 'feishu' && selectedReq.status === 'draft' && selectedReqTasks.length > 0"
-                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-600 text-white text-[12px] font-medium hover:bg-violet-500 shadow-sm shadow-violet-600/20 transition-all duration-150 active:scale-[0.97]"
-                  @click="mcpServers.length > 0 ? openMcpPicker(selectedReqId!) : startReqCollection(selectedReqId!); selectedReqId = null"
+                  v-if="selectedReq.source === 'feishu' && selectedReq.fetch_output"
+                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                  @click="openReqSessionModal(selectedReq.id)"
                 >
-                  <div class="i-carbon-ai-status w-3.5 h-3.5" />
-                  获取飞书需求
+                  <div class="i-carbon-chat w-3.5 h-3.5" />
+                  对话记录
                 </button>
                 <div class="flex-1" />
                 <button
@@ -1289,5 +1612,186 @@ async function retryTask(taskId: string) {
         </div>
       </Transition>
     </Teleport>
+    <!-- ── 需求会话详情弹窗 ── -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="showReqSessionModal" class="fixed inset-0 z-50 flex">
+          <div class="absolute inset-0 bg-black/40 backdrop-blur-[2px]" @click="closeReqSessionModal" />
+          <div class="relative ml-auto w-full max-w-3xl h-full bg-white dark:bg-[#1e1e22] shadow-2xl flex flex-col">
+            <!-- Header -->
+            <div class="flex items-center gap-3 px-5 py-3 border-b border-gray-200 dark:border-white/5 shrink-0">
+              <button class="p-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-white/5 transition-colors" @click="closeReqSessionModal">
+                <div class="i-carbon-close w-4 h-4 text-gray-400" />
+              </button>
+              <div class="flex-1 min-w-0">
+                <h2 class="text-[14px] font-semibold">Agent 对话记录</h2>
+                <p class="text-[11px] text-gray-400 mt-0.5">需求获取过程中的所有 Agent 会话</p>
+              </div>
+            </div>
+
+            <!-- Body -->
+            <div class="flex-1 overflow-y-auto">
+              <!-- Loading -->
+              <div v-if="reqSessionModalLoading" class="flex items-center justify-center py-12 text-[12px] text-gray-400">
+                <div class="i-carbon-circle-dash w-4 h-4 animate-spin mr-2" />
+                扫描会话文件...
+              </div>
+
+              <!-- Session list + transcript -->
+              <div v-else-if="reqSessionModalSessions.length > 0" class="flex h-full">
+                <!-- Left: session list -->
+                <div class="w-72 shrink-0 border-r border-gray-100 dark:border-white/5 overflow-y-auto p-3 space-y-2">
+                  <div
+                    v-for="session in reqSessionModalSessions"
+                    :key="session.sessionId"
+                    class="group p-3 rounded-xl border cursor-pointer transition-all"
+                    :class="reqSessionModalSelectedId === session.sessionId
+                      ? 'bg-violet-50 dark:bg-violet-500/10 border-violet-200 dark:border-violet-500/20'
+                      : 'bg-white dark:bg-[#28282c] border-gray-100 dark:border-white/[0.04] hover:border-gray-200 dark:hover:border-white/[0.1]'"
+                    @click="openReqSessionTranscript(session)"
+                  >
+                    <div class="flex items-center gap-2 mb-1.5">
+                      <div class="i-carbon-chat w-3.5 h-3.5 text-indigo-500 dark:text-indigo-400 shrink-0" />
+                      <span class="text-[11px] font-mono text-gray-500 dark:text-gray-400 truncate">{{ session.sessionId.slice(0, 12) }}</span>
+                    </div>
+                    <p v-if="session.firstTurnPreview" class="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed line-clamp-2 mb-2">{{ session.firstTurnPreview }}</p>
+                    <div class="flex items-center gap-2 text-[10px] text-gray-400">
+                      <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-white/5 font-medium">{{ reqSessionProviderLabel(session.provider) }}</span>
+                      <span>{{ reqFormatFileSize(session.sizeBytes) }}</span>
+                      <span>{{ reqTimeAgo(session.modifiedAt) }}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Right: transcript -->
+                <div class="flex-1 overflow-y-auto">
+                  <div v-if="!reqSessionModalSelectedId" class="flex items-center justify-center h-full text-gray-300 dark:text-gray-600 text-[13px]">
+                    <div class="text-center">
+                      <div class="i-carbon-chat w-10 h-10 mx-auto mb-2 opacity-30" />
+                      <p>选择一个会话查看详情</p>
+                    </div>
+                  </div>
+                  <div v-else-if="reqSessionModalTranscriptLoading" class="flex items-center justify-center h-full text-[13px] text-gray-400">
+                    <div class="i-carbon-circle-dash w-5 h-5 animate-spin mr-2" />
+                    加载会话数据...
+                  </div>
+                  <div v-else-if="reqSessionModalTranscript.length > 0" class="p-4 space-y-4">
+                    <div v-for="turn in reqSessionModalTranscript" :key="turn.index" class="turn-group">
+                      <!-- User message -->
+                      <div v-if="turn.user_text" class="mb-3">
+                        <div class="flex items-center gap-2 mb-1.5">
+                          <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-400">Turn {{ turn.index }}</span>
+                          <span v-if="turn.timestamp" class="text-[10px] text-gray-400 tabular-nums">{{ turn.timestamp }}</span>
+                        </div>
+                        <div class="rounded-xl px-4 py-3 bg-indigo-50/50 dark:bg-indigo-500/[0.04] border border-indigo-100 dark:border-indigo-500/10">
+                          <p class="text-[13px] leading-relaxed text-gray-700 dark:text-gray-200 whitespace-pre-wrap">{{ turn.user_text }}</p>
+                        </div>
+                      </div>
+                      <div v-else class="flex items-center gap-2 mb-2">
+                        <span class="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400">Turn {{ turn.index }}</span>
+                      </div>
+
+                      <!-- Assistant blocks -->
+                      <div class="space-y-2 pl-3 border-l-2 border-emerald-200 dark:border-emerald-500/20">
+                        <template v-for="(block, bIdx) in turn.blocks" :key="bIdx">
+                          <!-- Text -->
+                          <div v-if="block.kind === 'text'" class="rounded-xl px-4 py-3 bg-white dark:bg-[#28282c] border border-gray-100 dark:border-white/[0.04] shadow-sm shadow-black/[0.02] dark:shadow-none">
+                            <p class="text-[13px] leading-relaxed text-gray-700 dark:text-gray-200 whitespace-pre-wrap">{{ block.text }}</p>
+                          </div>
+
+                          <!-- Thinking -->
+                          <div v-else-if="block.kind === 'thinking'" class="rounded-lg overflow-hidden border border-purple-200/50 dark:border-purple-500/10">
+                            <button
+                              class="w-full flex items-center gap-2 px-3 py-2 text-left bg-purple-50/50 dark:bg-purple-500/[0.03] hover:bg-purple-50 dark:hover:bg-purple-500/5 transition-colors"
+                              @click="toggleReqBlock(`think-${turn.index}-${bIdx}`)"
+                            >
+                              <div class="i-carbon-chevron-right w-3 h-3 text-gray-400 transition-transform duration-150" :class="reqSessionExpandedBlocks.has(`think-${turn.index}-${bIdx}`) && 'rotate-90'" />
+                              <div class="i-carbon-idea w-3.5 h-3.5 text-purple-500" />
+                              <span class="text-[12px] font-medium text-purple-600 dark:text-purple-400">Thinking</span>
+                              <span class="text-[11px] text-gray-400 truncate flex-1">{{ reqTruncateText(block.text, 80) }}</span>
+                            </button>
+                            <div v-if="reqSessionExpandedBlocks.has(`think-${turn.index}-${bIdx}`)" class="px-4 py-3 bg-purple-50/30 dark:bg-purple-500/[0.02]">
+                              <p class="text-[12px] leading-relaxed text-gray-600 dark:text-gray-400 whitespace-pre-wrap">{{ block.text }}</p>
+                            </div>
+                          </div>
+
+                          <!-- Tool use -->
+                          <div v-else-if="block.kind === 'tool_use' && block.tool_call" class="rounded-lg overflow-hidden border" :class="block.tool_call.is_error ? 'border-red-200 dark:border-red-500/15' : 'border-gray-200 dark:border-white/[0.06]'">
+                            <button
+                              class="w-full flex items-center gap-2 px-3 py-2 text-left transition-colors"
+                              :class="block.tool_call.is_error ? 'bg-red-50/50 dark:bg-red-500/[0.03]' : 'bg-gray-50 dark:bg-[#1a1a1e] hover:bg-gray-100 dark:hover:bg-white/5'"
+                              @click="toggleReqBlock(`tool-${turn.index}-${bIdx}`)"
+                            >
+                              <div class="i-carbon-chevron-right w-3 h-3 text-gray-400 transition-transform duration-150" :class="reqSessionExpandedBlocks.has(`tool-${turn.index}-${bIdx}`) && 'rotate-90'" />
+                              <div class="w-3.5 h-3.5" :class="block.tool_call.is_error ? 'i-carbon-warning-alt text-red-500' : 'i-carbon-terminal text-blue-500'" />
+                              <span class="text-[12px] font-medium" :class="block.tool_call.is_error ? 'text-red-600 dark:text-red-400' : 'text-blue-600 dark:text-blue-400'">{{ block.tool_call.name }}</span>
+                              <span class="text-[11px] text-gray-400 truncate flex-1 font-mono">{{ reqToolSummary(block.tool_call) }}</span>
+                              <span v-if="block.tool_call.result !== null" class="shrink-0">
+                                <div v-if="block.tool_call.is_error" class="i-carbon-close-filled w-3 h-3 text-red-400" />
+                                <div v-else class="i-carbon-checkmark-filled w-3 h-3 text-emerald-400" />
+                              </span>
+                            </button>
+                            <div v-if="reqSessionExpandedBlocks.has(`tool-${turn.index}-${bIdx}`)" class="border-t border-gray-100 dark:border-white/[0.04]">
+                              <div class="px-3 py-2 bg-[#fafafa] dark:bg-[#161618]">
+                                <div class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1">Input</div>
+                                <pre class="text-[11px] font-mono text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-all leading-relaxed max-h-60 overflow-y-auto">{{ reqFormatToolInput(block.tool_call.input) }}</pre>
+                              </div>
+                              <div v-if="block.tool_call.result !== null" class="px-3 py-2 border-t border-gray-100 dark:border-white/[0.04]" :class="block.tool_call.is_error ? 'bg-red-50/30 dark:bg-red-500/[0.02]' : 'bg-emerald-50/30 dark:bg-emerald-500/[0.02]'">
+                                <div class="text-[10px] font-bold uppercase tracking-wider mb-1" :class="block.tool_call.is_error ? 'text-red-400' : 'text-emerald-500'">{{ block.tool_call.is_error ? 'Error' : 'Result' }}</div>
+                                <pre class="text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-60 overflow-y-auto" :class="block.tool_call.is_error ? 'text-red-600 dark:text-red-400' : 'text-gray-600 dark:text-gray-400'">{{ block.tool_call.result }}</pre>
+                              </div>
+                            </div>
+                          </div>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else class="flex items-center justify-center h-full text-gray-300 dark:text-gray-600 text-[13px]">
+                    <div class="text-center">
+                      <div class="i-carbon-data-base w-10 h-10 mx-auto mb-2 opacity-30" />
+                      <p>无法解析此会话文件</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Empty -->
+              <div v-else class="flex flex-col items-center justify-center py-12 text-gray-300 dark:text-gray-600">
+                <div class="i-carbon-data-base w-8 h-8 mb-2 opacity-30" />
+                <p class="text-[13px]">未找到该需求的 Agent 会话文件</p>
+              </div>
+            </div>
+
+            <!-- Footer -->
+            <div v-if="reqSessionModalFilePath" class="shrink-0 px-5 py-2 border-t border-gray-100 dark:border-white/[0.03] text-[10px] font-mono text-gray-400 dark:text-gray-600 truncate">
+              {{ reqSessionModalFilePath }}
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
+
+<style scoped>
+.modal-enter-active,
+.modal-leave-active {
+  transition: opacity 0.2s ease;
+}
+.modal-enter-active > div:last-child,
+.modal-leave-active > div:last-child {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+.modal-enter-from > div:last-child {
+  transform: translateX(40px);
+  opacity: 0;
+}
+.modal-leave-to > div:last-child {
+  transform: translateX(40px);
+  opacity: 0;
+}
+</style>

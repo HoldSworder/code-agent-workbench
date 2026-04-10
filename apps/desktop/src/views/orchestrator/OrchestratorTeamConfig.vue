@@ -3,11 +3,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useOrchestratorStore } from '../../stores/orchestrator'
 import type { RoleInput, TeamConfigInput } from '../../stores/orchestrator'
 import OrchestratorRoleEditor from './OrchestratorRoleEditor.vue'
+import AgencyAgentBrowser from './AgencyAgentBrowser.vue'
 
 const store = useOrchestratorStore()
 
 const editingRoleId = ref<string | null>(null)
 const showAddRole = ref(false)
+const showAgencyBrowser = ref(false)
 const newRoleId = ref('')
 const saving = ref(false)
 const saveMessage = ref('')
@@ -83,6 +85,26 @@ function addRole() {
   newRoleId.value = ''
   showAddRole.value = false
   editingRoleId.value = id
+}
+
+function handleAgencyImport(roleId: string, description: string, promptTemplate: string) {
+  if (!store.teamConfig) return
+  const id = roleId.toLowerCase().replace(/[^a-z0-9_-]/g, '_')
+  if (id in store.teamConfig.roles) {
+    saveMessage.value = `角色 "${id}" 已存在，请先删除或重命名`
+    showAgencyBrowser.value = false
+    return
+  }
+
+  store.teamConfig.roles[id] = {
+    description,
+    provider: 'claude-code',
+    model: '',
+    prompt_template: promptTemplate,
+  }
+  showAgencyBrowser.value = false
+  editingRoleId.value = id
+  saveConfig()
 }
 
 async function saveConfig() {
@@ -224,13 +246,22 @@ async function saveGeneralSettings() {
             <h3 class="cfg-card-title">Agent 角色 ({{ roles.length }})</h3>
             <p class="cfg-card-desc">定义团队中各 Agent 的职责、CLI 工具和模型</p>
           </div>
-          <button
-            class="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-500/10 dark:text-indigo-400 dark:hover:bg-indigo-500/20 transition-all"
-            @click="showAddRole = true; editingRoleId = null"
-          >
-            <div class="i-carbon-add w-3 h-3" />
-            添加角色
-          </button>
+          <div class="flex items-center gap-2">
+            <button
+              class="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium rounded-lg bg-violet-50 text-violet-600 hover:bg-violet-100 dark:bg-violet-500/10 dark:text-violet-400 dark:hover:bg-violet-500/20 transition-all"
+              @click="showAgencyBrowser = true; editingRoleId = null; showAddRole = false"
+            >
+              <div class="i-carbon-catalog w-3 h-3" />
+              从 Agency 导入
+            </button>
+            <button
+              class="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-500/10 dark:text-indigo-400 dark:hover:bg-indigo-500/20 transition-all"
+              @click="showAddRole = true; editingRoleId = null"
+            >
+              <div class="i-carbon-add w-3 h-3" />
+              添加角色
+            </button>
+          </div>
         </div>
         <div class="cfg-card-body">
           <!-- 添加新角色 -->
@@ -285,7 +316,7 @@ async function saveGeneralSettings() {
                 class="cfg-role-item"
                 @click="startEdit(r.id)"
               >
-                <div class="flex items-center gap-2.5">
+                <div class="flex-1 min-w-0 flex items-center gap-2.5">
                   <div
                     class="w-8 h-8 rounded-lg flex items-center justify-center shrink-0"
                     :class="r.id === 'leader' ? 'bg-amber-50 dark:bg-amber-500/10' : 'bg-gray-100 dark:bg-white/[0.04]'"
@@ -294,7 +325,7 @@ async function saveGeneralSettings() {
                   </div>
                   <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2">
-                      <span class="text-[13px] font-medium text-gray-800 dark:text-gray-200">{{ r.id }}</span>
+                      <span class="text-[13px] font-medium text-gray-800 dark:text-gray-200 truncate">{{ r.id }}</span>
                       <span
                         v-if="r.id === 'leader'"
                         class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400"
@@ -307,8 +338,8 @@ async function saveGeneralSettings() {
                     </p>
                   </div>
                 </div>
-                <div class="flex items-center gap-1.5">
-                  <span class="px-2 py-1 rounded-lg text-[10px] font-medium bg-gray-100 dark:bg-white/[0.04] text-gray-500 dark:text-gray-400">
+                <div class="shrink-0 flex items-center gap-1.5">
+                  <span class="px-2 py-1 rounded-lg text-[10px] font-medium bg-gray-100 dark:bg-white/[0.04] text-gray-500 dark:text-gray-400 whitespace-nowrap">
                     {{ r.provider }}
                   </span>
                   <span v-if="r.model" class="px-2 py-1 rounded-lg text-[10px] font-mono bg-gray-100 dark:bg-white/[0.04] text-gray-500 dark:text-gray-400 max-w-32 truncate">
@@ -322,6 +353,14 @@ async function saveGeneralSettings() {
         </div>
       </section>
     </div>
+
+    <Teleport to="body">
+      <AgencyAgentBrowser
+        v-if="showAgencyBrowser"
+        @import="handleAgencyImport"
+        @close="showAgencyBrowser = false"
+      />
+    </Teleport>
   </div>
 </template>
 

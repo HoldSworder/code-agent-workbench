@@ -34,6 +34,8 @@ export interface PhaseContext {
   changeId?: string
   requirementTitle?: string
   requirementDescription?: string
+  requirementDocUrl?: string
+  requirementSourceUrl?: string
 }
 
 export interface PhaseResult {

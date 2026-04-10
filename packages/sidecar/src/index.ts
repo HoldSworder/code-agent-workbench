@@ -237,7 +237,10 @@ const rpcServer = new RpcServer()
 registerMethods(rpcServer, db, engine, workflowPath)
 
 // 配置 RPC 始终可用（即使 team.yaml 不存在也能创建）
-registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator)
+registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator, () => {
+  const enabled = settingsRepo.get('proxy.enabled') === 'true'
+  return enabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
+})
 
 if (orchestrator)
   registerOrchestratorMethods(rpcServer, orchestrator)

@@ -7,7 +7,8 @@ import { MessageRepository } from '../db/repositories/message.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { spawn as spawnChild } from 'node:child_process'
-import { resolve, dirname } from 'node:path'
+import { resolve, dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { existsSync, writeFileSync } from 'node:fs'
 import { stringify as yamlStringify } from 'yaml'
@@ -102,9 +103,26 @@ export function registerMethods(
 
   // ── Requirement CRUD ──
   server.register('requirement.list', async () => reqRepo.findAll())
-  server.register('requirement.create', async (params) => reqRepo.create(params))
+  server.register('requirement.create', async (params) => {
+    const req = reqRepo.create(params)
+    if (req.mode === 'orchestrator' && req.source === 'manual')
+      reqRepo.updateStatus(req.id, 'pending')
+    return reqRepo.findById(req.id)!
+  })
   server.register('requirement.get', async ({ id }) => reqRepo.findById(id))
+  server.register('requirement.update', async ({ id, data }: { id: string, data: { title?: string, description?: string, doc_url?: string | null, mode?: string } }) => {
+    const before = reqRepo.findById(id)
+    reqRepo.update(id, data)
+    if (data.mode === 'orchestrator' && before?.status === 'draft') {
+      reqRepo.updateStatus(id, 'pending')
+    }
+    else if (data.mode === 'workflow' && before?.status === 'pending') {
+      reqRepo.updateStatus(id, 'draft')
+    }
+    return reqRepo.findById(id)
+  })
   server.register('requirement.delete', async ({ id }) => {
+    await engine.cancelRequirementFetch(id).catch(() => {})
     const tasks = taskRepo.findByRequirementId(id)
     for (const task of tasks) {
       await engine.cancelCurrentAgent(task.id).catch(() => {})
@@ -112,6 +130,46 @@ export function registerMethods(
     taskRepo.deleteByRequirementId(id)
     reqRepo.delete(id)
     return { ok: true }
+  })
+
+  server.register('requirement.startFetch', async ({ requirementId, mcpServerIds }: { requirementId: string, mcpServerIds?: string[] }) => {
+    const req = reqRepo.findById(requirementId)
+    if (!req) throw new Error(`Requirement not found: ${requirementId}`)
+    if (req.source !== 'feishu' || !req.source_url)
+      throw new Error(`Requirement ${requirementId} is not a feishu requirement or has no source_url`)
+    reqRepo.updateStatus(requirementId, 'fetching')
+    reqRepo.updateFetchError(requirementId, null)
+    engine.startRequirementFetch(requirementId, mcpServerIds).catch((err) => {
+      process.stderr.write(`[workflow] startRequirementFetch failed for ${requirementId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
+
+  server.register('requirement.getLiveOutput', async ({ requirementId }: { requirementId: string }) => {
+    return { output: engine.getRequirementLiveOutput(requirementId) }
+  })
+
+  server.register('requirement.retryFetch', async ({ requirementId, mcpServerIds }: { requirementId: string, mcpServerIds?: string[] }) => {
+    const req = reqRepo.findById(requirementId)
+    if (!req || req.status !== 'fetch_failed')
+      throw new Error(`Requirement ${requirementId} is not in fetch_failed state`)
+    reqRepo.updateStatus(requirementId, 'fetching')
+    reqRepo.updateFetchError(requirementId, null)
+    engine.startRequirementFetch(requirementId, mcpServerIds).catch((err) => {
+      process.stderr.write(`[workflow] retryFetch failed for ${requirementId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
+
+  server.register('requirement.listSessions', async ({ requirementId }: { requirementId: string }) => {
+    const workDir = join(homedir(), '.code-agent', 'requirement-fetch', requirementId)
+    return { items: listSessionsForRepo(workDir) }
+  })
+
+  server.register('requirement.sessionTranscript', async ({ sessionId }: { sessionId: string }) => {
+    const data = readTranscript(sessionId)
+    if (!data) return { turns: [], format: 'unknown', filePath: null }
+    return { turns: data.turns, format: data.format, filePath: data.filePath }
   })
 
   // ── RepoTask ──

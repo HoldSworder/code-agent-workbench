@@ -368,6 +368,10 @@ export function buildPromptFromContext(context: PhaseContext, canReadFiles = tru
 
   if (context.requirementTitle) {
     let reqSection = `## 需求\n\n**${context.requirementTitle}**`
+    if (context.requirementSourceUrl)
+      reqSection += `\n\n> 飞书项目链接: ${context.requirementSourceUrl}`
+    if (context.requirementDocUrl)
+      reqSection += `\n\n> 飞书需求文档: ${context.requirementDocUrl}`
     if (context.requirementDescription)
       reqSection += `\n\n${context.requirementDescription}`
     sections.push(reqSection)
@@ -413,7 +417,14 @@ export function buildPromptFromContext(context: PhaseContext, canReadFiles = tru
   if (context.userMessage)
     sections.push(`---\n\n## 用户最新反馈\n${context.userMessage}`)
 
-  sections.push(`---\n\n## 上下文\n- 工作目录: ${context.repoPath}\n- OpenSpec: ${context.openspecPath}\n- 分支: ${context.branchName}\n- change-id: ${context.changeId ?? 'N/A'}`)
+  const ctxLines: string[] = []
+  if (context.openspecPath) ctxLines.push(`- OpenSpec: ${context.openspecPath}`)
+  if (context.branchName) ctxLines.push(`- 分支: ${context.branchName}`)
+  if (context.changeId) ctxLines.push(`- change-id: ${context.changeId}`)
+  if (ctxLines.length > 0) {
+    ctxLines.unshift(`- 工作目录: ${context.repoPath}`)
+    sections.push(`---\n\n## 上下文\n${ctxLines.join('\n')}`)
+  }
 
   return sections.join('\n\n')
 }

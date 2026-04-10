@@ -72,6 +72,8 @@ function resolveGates(
 export interface RequirementInfo {
   title: string
   description: string
+  docUrl?: string
+  sourceUrl?: string
 }
 
 /**
@@ -110,6 +112,8 @@ export function buildPhaseContext(
     changeId,
     requirementTitle: requirement?.title,
     requirementDescription: requirement?.description,
+    requirementDocUrl: requirement?.docUrl,
+    requirementSourceUrl: requirement?.sourceUrl,
     skillContent: leanMode ? '' : (phase.skill ? deps.resolveSkillContent(phase.skill) : ''),
     tools: phase.tools,
     mcpConfig: phase.mcp_config ?? undefined,

@@ -60,6 +60,23 @@ export interface TeamConfigInput {
   roles: Record<string, RoleInput>
 }
 
+export interface AgentCatalogItem {
+  path: string
+  category: string
+  filename: string
+}
+
+export interface AgentCatalog {
+  categories: Record<string, AgentCatalogItem[]>
+}
+
+export interface AgentPromptDetail {
+  name: string
+  description: string
+  emoji: string
+  prompt: string
+}
+
 export const useOrchestratorStore = defineStore('orchestrator', () => {
   const status = ref<OrchestratorStatus | null>(null)
   const runs = ref<OrchestratorRun[]>([])
@@ -147,6 +164,9 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     events.value = []
   }
 
+  const agencyCatalog = ref<AgentCatalog | null>(null)
+  const catalogLoading = ref(false)
+
   const configError = ref('')
 
   async function fetchTeamConfig() {
@@ -172,6 +192,20 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     await fetchTeamConfig()
   }
 
+  async function fetchAgencyCatalog() {
+    catalogLoading.value = true
+    try {
+      agencyCatalog.value = await rpc<AgentCatalog>('orchestrator.getAgencyCatalog')
+    }
+    finally {
+      catalogLoading.value = false
+    }
+  }
+
+  async function fetchAgentPrompt(path: string): Promise<AgentPromptDetail> {
+    return rpc<AgentPromptDetail>('orchestrator.getAgentPrompt', { path })
+  }
+
   return {
     status,
     runs,
@@ -182,6 +216,8 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     configError,
     loading,
     isRunning,
+    agencyCatalog,
+    catalogLoading,
     fetchStatus,
     start,
     stop,
@@ -195,5 +231,7 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     fetchTeamConfig,
     saveTeamConfig,
     createDefaultConfig,
+    fetchAgencyCatalog,
+    fetchAgentPrompt,
   }
 })

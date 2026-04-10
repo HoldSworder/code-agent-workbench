@@ -1,7 +1,7 @@
-import { existsSync, readdirSync, appendFileSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, appendFileSync, readFileSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 const LOG_FILE = join(tmpdir(), 'code-agent-engine.log')
 function elog(msg: string) {
@@ -19,6 +19,7 @@ import { MessageRepository } from '../db/repositories/message.repo'
 import { RequirementRepository } from '../db/repositories/requirement.repo'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
+import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { git, getHead, getMergeBase, resetHard } from '../git/operations'
@@ -55,8 +56,11 @@ export class WorkflowEngine {
   private repoRepo: RepoRepository
   private settingsRepo: SettingsRepository
   private cliType: string
+  private mcpServerRepo: McpServerRepository
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
+  private requirementLiveOutputs = new Map<string, string>()
+  private activeRequirementProviders = new Map<string, AgentProvider>()
   private activatedPhases = new Map<string, Set<string>>()
   private pendingAdvance = new Set<string>()
 
@@ -77,6 +81,7 @@ export class WorkflowEngine {
     this.reqRepo = new RequirementRepository(this.db)
     this.commitRepo = new PhaseCommitRepository(this.db)
     this.mcpBindingRepo = new McpBindingRepository(this.db)
+    this.mcpServerRepo = new McpServerRepository(this.db)
     this.repoRepo = new RepoRepository(this.db)
     this.settingsRepo = new SettingsRepository(this.db)
   }
@@ -920,6 +925,162 @@ export class WorkflowEngine {
     }))
   }
 
+  // ── Requirement-level fetch (no task required) ──
+
+  getRequirementLiveOutput(requirementId: string): string {
+    const live = this.requirementLiveOutputs.get(requirementId)
+    if (live !== undefined) return live
+    const req = this.reqRepo.findById(requirementId)
+    return req?.fetch_output ?? ''
+  }
+
+  async startRequirementFetch(requirementId: string, mcpServerIds?: string[]): Promise<void> {
+    const requirement = this.reqRepo.findById(requirementId)
+    if (!requirement)
+      throw new Error(`Requirement not found: ${requirementId}`)
+    if (requirement.source !== 'feishu' || !requirement.source_url)
+      throw new Error(`Requirement ${requirementId} is not a feishu requirement or has no source_url`)
+
+    const reqPhases = this.config.requirement_phases ?? []
+    const phase = reqPhases.find(p => p.id === 'feishu-requirement')
+    if (!phase)
+      throw new Error('feishu-requirement phase not found in workflow config')
+
+    // status 已由 RPC 层同步设置为 fetching，此处确保 liveOutput 初始化
+    this.requirementLiveOutputs.set(requirementId, '')
+
+    const baseDir = join(homedir(), '.code-agent', 'requirement-fetch')
+    const workDir = join(baseDir, requirementId)
+    try { mkdirSync(workDir, { recursive: true }) } catch {}
+
+    const configWriter = getConfigWriter(this.cliType)
+
+    try {
+      if (mcpServerIds?.length) {
+        const servers = mcpServerIds
+          .map(id => this.mcpServerRepo.findById(id))
+          .filter((s): s is NonNullable<typeof s> => !!s)
+
+        if (servers.length > 0) {
+          const serverConfigs: McpServerConfig[] = servers.map(s => ({
+            name: s.name,
+            transport: s.transport,
+            command: s.command,
+            args: JSON.parse(s.args),
+            env: JSON.parse(s.env),
+            url: s.url,
+            headers: JSON.parse(s.headers),
+          }))
+          configWriter.write(workDir, serverConfigs)
+          elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId}`)
+        }
+      }
+
+      const reqInfo = {
+        title: requirement.title,
+        description: requirement.description,
+        sourceUrl: requirement.source_url ?? undefined,
+        docUrl: requirement.doc_url ?? undefined,
+      }
+
+      const context = buildPhaseContext(
+        phase,
+        '_requirements',
+        '需求收集',
+        workDir,
+        '',
+        '',
+        '',
+        { resolveSkillContent: this.resolveSkillContent },
+        undefined,
+        undefined,
+        false,
+        reqInfo,
+        undefined,
+      )
+
+      const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
+      const effectiveCliType = phaseAgentCfg.agent ?? this.cliType
+      const provider = this.resolveProvider(phase.provider, {
+        agentOverride: phaseAgentCfg.agent,
+        modelOverride: phaseAgentCfg.model,
+      })
+      this.activeRequirementProviders.set(requirementId, provider)
+
+      const promptText = buildPromptFromContext(context, effectiveCliType !== 'codex')
+      this.reqRepo.updateFetchMeta(requirementId, {
+        prompt: promptText,
+        cliType: effectiveCliType,
+        model: provider.model ?? null,
+      })
+
+      const result = await provider.run(context, {
+        onChunk: (chunk) => {
+          const current = this.requirementLiveOutputs.get(requirementId) ?? ''
+          this.requirementLiveOutputs.set(requirementId, current + chunk)
+        },
+      })
+
+      this.activeRequirementProviders.delete(requirementId)
+
+      const fullOutput = this.requirementLiveOutputs.get(requirementId) ?? result.output ?? ''
+      this.reqRepo.updateFetchOutput(requirementId, fullOutput || null)
+
+      if (result.status === 'failed' || result.status === 'cancelled') {
+        this.reqRepo.updateFetchError(requirementId, result.error ?? `Agent ${result.status}`)
+        this.reqRepo.updateStatus(requirementId, 'fetch_failed')
+        elog(`startRequirementFetch: failed for ${requirementId}: ${result.error}`)
+        return
+      }
+
+      elog(`startRequirementFetch: fullOutput length=${fullOutput.length}, hasJSON=${fullOutput.includes('REQUIREMENT_DATA_JSON')}, hasYAML=${fullOutput.includes('REQUIREMENT_DATA')}`)
+      if (fullOutput) {
+        const parsed = this.parseRequirementDataBlock(fullOutput)
+        elog(`startRequirementFetch: parsed=${JSON.stringify(parsed)}`)
+        if (parsed) {
+          const updateData: { title?: string, description?: string, doc_url?: string | null } = {}
+          if (parsed.title) updateData.title = parsed.title
+          if (parsed.description) updateData.description = parsed.description
+          if (parsed.doc_url) updateData.doc_url = parsed.doc_url
+          elog(`startRequirementFetch: updateData=${JSON.stringify(updateData)}`)
+          if (Object.keys(updateData).length > 0) {
+            this.reqRepo.update(requirementId, updateData)
+            elog(`startRequirementFetch: updated requirement ${requirementId} with ${JSON.stringify(Object.keys(updateData))}`)
+          }
+        }
+      }
+
+      const finalReq = this.reqRepo.findById(requirementId)
+      const targetStatus = finalReq?.mode === 'orchestrator' ? 'pending' : 'draft'
+      this.reqRepo.updateStatus(requirementId, targetStatus)
+      elog(`startRequirementFetch: completed for ${requirementId}, status → ${targetStatus}`)
+    }
+    catch (err: unknown) {
+      this.activeRequirementProviders.delete(requirementId)
+      const errMsg = err instanceof Error ? err.message : String(err)
+      this.reqRepo.updateFetchError(requirementId, errMsg)
+      this.reqRepo.updateStatus(requirementId, 'fetch_failed')
+      elog(`startRequirementFetch: crashed for ${requirementId}: ${errMsg}`)
+    }
+    finally {
+      this.requirementLiveOutputs.delete(requirementId)
+    }
+  }
+
+  async cancelRequirementFetch(requirementId: string): Promise<void> {
+    const provider = this.activeRequirementProviders.get(requirementId)
+    if (provider) {
+      await provider.cancel()
+      this.activeRequirementProviders.delete(requirementId)
+    }
+    this.requirementLiveOutputs.delete(requirementId)
+    const req = this.reqRepo.findById(requirementId)
+    if (req && req.status === 'fetching') {
+      this.reqRepo.updateStatus(requirementId, 'fetch_failed')
+      this.reqRepo.updateFetchError(requirementId, '用户取消')
+    }
+  }
+
   async executeRequirementPhase(
     repoTaskId: string,
     phaseId: string,
@@ -936,11 +1097,89 @@ export class WorkflowEngine {
 
     const task = this.taskRepo.findById(repoTaskId)
     if (task && task.current_stage === '_requirements') {
+      this.extractAndSaveRequirementData(repoTaskId, phaseId)
+
       const interactiveStatuses = ['waiting_input', 'waiting_confirm']
       if (!interactiveStatuses.includes(task.phase_status)) {
         this.taskRepo.updatePhase(repoTaskId, 'planning', 'task-breakdown', 'pending')
       }
     }
+  }
+
+  /**
+   * 从需求获取阶段的 agent 输出中提取 <<REQUIREMENT_DATA>> 标记块，
+   * 解析 title / description / doc_url 并回写到 requirement 记录。
+   */
+  private extractAndSaveRequirementData(repoTaskId: string, phaseId: string): void {
+    const messages = this.msgRepo.findByTaskAndPhase(repoTaskId, phaseId)
+    const assistantMsg = messages.filter(m => m.role === 'assistant').pop()
+    if (!assistantMsg) return
+
+    const parsed = this.parseRequirementDataBlock(assistantMsg.content)
+    if (!parsed) return
+
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return
+
+    const updateData: { title?: string, description?: string, doc_url?: string | null } = {}
+    if (parsed.title) updateData.title = parsed.title
+    if (parsed.description) updateData.description = parsed.description
+    if (parsed.doc_url) updateData.doc_url = parsed.doc_url
+
+    if (Object.keys(updateData).length > 0) {
+      this.reqRepo.update(task.requirement_id, updateData)
+      elog(`extractAndSaveRequirementData: updated requirement ${task.requirement_id} with ${JSON.stringify(Object.keys(updateData))}`)
+    }
+  }
+
+  /**
+   * 解析 agent 输出中的结构化数据块。
+   * 优先匹配 JSON 格式（<<REQUIREMENT_DATA_JSON>>），回退到旧 YAML 格式（<<REQUIREMENT_DATA>>）。
+   */
+  private parseRequirementDataBlock(output: string): { title?: string, description?: string, doc_url?: string } | null {
+    // JSON 格式（推荐）
+    const jsonMatch = output.match(/<<REQUIREMENT_DATA_JSON>>([\s\S]*?)<<END_REQUIREMENT_DATA_JSON>>/)
+    if (jsonMatch) {
+      try {
+        const raw = jsonMatch[1].trim()
+        elog(`parseRequirementDataBlock: JSON raw (${raw.length} chars): ${raw.slice(0, 500)}`)
+        const data = JSON.parse(raw) as Record<string, unknown>
+        elog(`parseRequirementDataBlock: JSON parsed keys=${Object.keys(data)}, doc_url=${JSON.stringify(data.doc_url)}`)
+        const result: { title?: string, description?: string, doc_url?: string } = {}
+        if (typeof data.title === 'string' && data.title) result.title = data.title
+        if (typeof data.doc_url === 'string' && data.doc_url) result.doc_url = data.doc_url
+        if (typeof data.description === 'string' && data.description) result.description = data.description
+        return Object.keys(result).length > 0 ? result : null
+      }
+      catch (e) {
+        elog(`parseRequirementDataBlock: JSON parse failed: ${e}, falling back to YAML`)
+      }
+    }
+
+    // 旧 YAML 格式（向后兼容）
+    const yamlMatch = output.match(/<<REQUIREMENT_DATA>>([\s\S]*?)<<END_REQUIREMENT_DATA>>/)
+    if (!yamlMatch) return null
+
+    const block = yamlMatch[1]
+    const result: { title?: string, description?: string, doc_url?: string } = {}
+
+    const titleMatch = block.match(/^title:\s*(.+)$/m)
+    if (titleMatch) result.title = titleMatch[1].trim()
+
+    const docUrlMatch = block.match(/^doc_url:\s*(.+)$/m)
+      ?? block.match(/^doc_url:\s*\n\s*(https?:\/\/\S+)/m)
+    if (docUrlMatch) result.doc_url = docUrlMatch[1].trim()
+
+    const descMatch = block.match(/^description:\s*\|\s*\n([\s\S]*?)(?=\n\S|\n*$)/)
+    if (descMatch) {
+      result.description = descMatch[1].replace(/^ {2}/gm, '').trim()
+    }
+    else {
+      const simpleDescMatch = block.match(/^description:\s*(.+)$/m)
+      if (simpleDescMatch) result.description = simpleDescMatch[1].trim()
+    }
+
+    return Object.keys(result).length > 0 ? result : null
   }
 
   async cancelCurrentAgent(repoTaskId: string): Promise<void> {
@@ -1002,7 +1241,7 @@ export class WorkflowEngine {
       undefined,
       undefined,
       false,
-      { title: '<需求标题>', description: '<需求描述>' },
+      { title: '<需求标题>', description: '<需求描述>', docUrl: '<飞书文档URL>', sourceUrl: '<飞书项目链接>' },
       effectiveGate,
     )
 
@@ -1037,7 +1276,7 @@ export class WorkflowEngine {
       .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
 
     const reqInfo = requirement
-      ? { title: requirement.title, description: requirement.description }
+      ? { title: requirement.title, description: requirement.description, docUrl: requirement.doc_url ?? undefined, sourceUrl: requirement.source_url ?? undefined }
       : undefined
 
     const ctxDeps = {
@@ -1118,7 +1357,7 @@ export class WorkflowEngine {
         .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
 
       const reqInfo = requirement
-        ? { title: requirement.title, description: requirement.description }
+        ? { title: requirement.title, description: requirement.description, docUrl: requirement.doc_url ?? undefined, sourceUrl: requirement.source_url ?? undefined }
         : undefined
 
       const ctxDeps = {

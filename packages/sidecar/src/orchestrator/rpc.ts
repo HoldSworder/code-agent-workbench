@@ -4,6 +4,7 @@ import { stringify as yamlStringify } from 'yaml'
 import type { RpcServer } from '../rpc/server'
 import type { Orchestrator } from './orchestrator'
 import { parseTeamConfig } from './team-parser'
+import { fetchAgencyCatalog, fetchAgentPrompt } from './agency-agents'
 
 interface RoleInput {
   description: string
@@ -42,6 +43,7 @@ export function registerTeamConfigMethods(
   rpc: RpcServer,
   teamYamlPath: string,
   getOrchestrator: () => Orchestrator | null,
+  getProxyUrl?: () => string | undefined,
 ): void {
   rpc.register('orchestrator.getTeamConfig', async () => {
     const orchestrator = getOrchestrator()
@@ -114,6 +116,16 @@ export function registerTeamConfigMethods(
     catch {
       return { yaml: '' }
     }
+  })
+
+  rpc.register('orchestrator.getAgencyCatalog', async () => {
+    return fetchAgencyCatalog(getProxyUrl?.())
+  })
+
+  rpc.register('orchestrator.getAgentPrompt', async (params: { path: string }) => {
+    if (!params.path)
+      throw new Error('path is required')
+    return fetchAgentPrompt(params.path, getProxyUrl?.())
   })
 }
 

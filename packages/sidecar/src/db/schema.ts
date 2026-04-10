@@ -182,6 +182,27 @@ export function applySchema(db: Database.Database): void {
     db.exec(`ALTER TABLE requirements ADD COLUMN mode TEXT NOT NULL DEFAULT 'workflow'`)
   }
 
+  // Migration: add fetch_error / fetch_output columns to requirements for feishu auto-fetch
+  const reqCols3 = db.prepare(`PRAGMA table_info(requirements)`).all() as { name: string }[]
+  if (!reqCols3.some(c => c.name === 'fetch_error')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN fetch_error TEXT`)
+  }
+  if (!reqCols3.some(c => c.name === 'fetch_output')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN fetch_output TEXT`)
+  }
+
+  // Migration: add fetch_prompt / fetch_cli_type / fetch_model columns to requirements
+  const reqCols4 = db.prepare(`PRAGMA table_info(requirements)`).all() as { name: string }[]
+  if (!reqCols4.some(c => c.name === 'fetch_prompt')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN fetch_prompt TEXT`)
+  }
+  if (!reqCols4.some(c => c.name === 'fetch_cli_type')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN fetch_cli_type TEXT`)
+  }
+  if (!reqCols4.some(c => c.name === 'fetch_model')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN fetch_model TEXT`)
+  }
+
   // Fix stale default: old schema created tables with phase_status DEFAULT 'running'.
   // SQLite cannot ALTER column defaults, so we rebuild the table with correct defaults.
   // Wrapped in a transaction to avoid partial state on interruption.
