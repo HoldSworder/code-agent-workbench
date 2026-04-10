@@ -1,7 +1,6 @@
-import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
 import type Database from 'better-sqlite3'
 import type { AgentProvider, RunOptions } from '../providers/types'
+import type { CliProviderConfig } from '../providers/cli.provider'
 import { ExternalCliProvider } from '../providers/cli.provider'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { OrchestratorRepository } from './repository'
@@ -14,6 +13,7 @@ export interface OrchestratorOptions {
   teamYamlPath: string
   repoPath: string
   defaultBranch?: string
+  sniProxyPatch?: CliProviderConfig['sniProxyPatch']
   onChunk?: RunOptions['onChunk']
   onEvent?: (event: string, data?: unknown) => void
 }
@@ -133,27 +133,12 @@ export class Orchestrator {
       delete process.env.ALL_PROXY
     }
 
-    const sniProxyPatch = (() => {
-      if (!proxyUrl) return undefined
-      const projectRoot = resolve(__dirname, '..', '..', '..', '..')
-      const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
-      if (!existsSync(sniPatchPath)) return undefined
-      try {
-        const url = new URL(proxyUrl)
-        return { scriptPath: sniPatchPath, socks5Host: url.hostname || '127.0.0.1', socks5Port: Number(url.port) || 7890 }
-      }
-      catch {
-        const match = proxyUrl.match(/:(\d+)\s*$/)
-        return match ? { scriptPath: sniPatchPath, socks5Host: '127.0.0.1', socks5Port: Number(match[1]) } : undefined
-      }
-    })()
-
     return new ExternalCliProvider({
       type: provider as 'claude-code' | 'cursor-cli' | 'codex',
       model,
       binaryPath,
       proxyUrl,
-      sniProxyPatch,
+      sniProxyPatch: this.options.sniProxyPatch,
     })
   }
 }

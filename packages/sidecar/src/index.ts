@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline'
 import { resolve, dirname, join } from 'node:path'
-import { readFileSync, existsSync, readdirSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { getDb } from './db/connection'
@@ -18,11 +18,20 @@ import type { ConsultConfig } from './consult/types'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
-const projectRoot = resolve(__dirname, '../../..')
+
+function parseArg(name: string): string | undefined {
+  const flag = `--${name}`
+  const idx = process.argv.indexOf(flag)
+  return idx !== -1 && idx + 1 < process.argv.length ? process.argv[idx + 1] : undefined
+}
+
+const projectRoot = parseArg('project-root') ?? resolve(__dirname, '../../..')
 const workflowsDir = resolve(projectRoot, 'workflows')
 
-const dbPath = process.env.DB_PATH ?? resolve(__dirname, '..', 'code-agent.db')
-const workflowPath = process.env.WORKFLOW_PATH ?? resolve(process.cwd(), 'workflow.yaml')
+const dbPath = process.env.DB_PATH ?? parseArg('db-path') ?? resolve(projectRoot, 'data', 'code-agent.db')
+const workflowPath = process.env.WORKFLOW_PATH ?? resolve(projectRoot, 'workflow.yaml')
+
+try { mkdirSync(dirname(dbPath), { recursive: true }) } catch {}
 
 const db = getDb(dbPath)
 
@@ -219,12 +228,22 @@ try {
     const repoPath = settingsRepo.get('repo.path') ?? process.cwd()
     const defaultBranch = settingsRepo.get('repo.defaultBranch') ?? 'main'
 
+    const orchProxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
+    const orchProxyUrl = orchProxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
+    const orchSniPatch = (() => {
+      if (!orchProxyUrl || !existsSync(sniPatchPath)) return undefined
+      const socks5 = parseSocks5Config(orchProxyUrl)
+      if (!socks5) return undefined
+      return { scriptPath: sniPatchPath, socks5Host: socks5.host, socks5Port: socks5.port }
+    })()
+
     orchestrator = new Orchestrator({
       db,
       teamConfig,
       teamYamlPath,
       repoPath,
       defaultBranch,
+      sniProxyPatch: orchSniPatch,
       onEvent: (event, data) => {
         process.stderr.write(`orchestrator: ${event} ${JSON.stringify(data ?? {})}\n`)
       },

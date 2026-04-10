@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#312E81"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- Left bracket < -->
+  <path d="M408 320 L240 512 L408 704" fill="none" stroke="#FFFFFF" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Right bracket > -->
+  <path d="M616 320 L784 512 L616 704" fill="none" stroke="#FFFFFF" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Center agent dot -->
+  <circle cx="512" cy="512" r="52" fill="#FFFFFF"/>
+
+  <!-- Sparkle top -->
+  <path d="M512 268 L522 304 L558 314 L522 324 L512 360 L502 324 L466 314 L502 304 Z" fill="#C7D2FE"/>
+
+  <!-- Sparkle bottom-left -->
+  <path d="M330 732 L337 754 L359 761 L337 768 L330 790 L323 768 L301 761 L323 754 Z" fill="#C7D2FE" opacity="0.6"/>
+
+  <!-- Sparkle bottom-right -->
+  <path d="M694 732 L701 754 L723 761 L701 768 L694 790 L687 768 L665 761 L687 754 Z" fill="#C7D2FE" opacity="0.6"/>
+</svg>

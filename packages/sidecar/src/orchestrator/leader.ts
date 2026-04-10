@@ -145,7 +145,14 @@ export class LeaderLoop {
     repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
 
     this.executeLeader(req, run, leaderWorktree, leaderBranch).catch((err) => {
-      this.deps.onEvent?.('leader_execution_error', { error: String(err), runId: run.id })
+      const errMsg = err instanceof Error ? err.message : String(err)
+      this.deps.onEvent?.('leader_execution_error', { error: errMsg, runId: run.id })
+      try {
+        repo.updateRunStatus(run.id, 'failed')
+        repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({ reason: `Leader 意外错误: ${errMsg}` }))
+        repo.updateRequirementStatus(req.id, 'pending')
+      }
+      catch { /* DB might already be updated inside executeLeader */ }
     })
 
     return { runId: run.id }
