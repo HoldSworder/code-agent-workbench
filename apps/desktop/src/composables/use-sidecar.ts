@@ -388,7 +388,7 @@ export async function startSidecar(): Promise<void> {
   if (childProcess)
     return
 
-  const command = Command.create('node', [__SIDECAR_SCRIPT__])
+  const command = Command.sidecar('binaries/sidecar', ['--project-root', __PROJECT_ROOT__])
   command.stdout.on('data', (line: string) => {
     buffer += line
     const lines = buffer.split('\n')
@@ -415,11 +415,27 @@ export async function startSidecar(): Promise<void> {
   })
 
   command.stderr.on('data', (data: string) => {
+    console.warn('[sidecar:stderr]', data)
     if (data.includes('sidecar: ready'))
       sidecarReady.value = true
   })
 
-  childProcess = await command.spawn()
+  command.on('error', (err: string) => {
+    console.error('[sidecar:error]', err)
+  })
+
+  command.on('close', (data: { code: number | null, signal: number | null }) => {
+    console.warn('[sidecar:close]', data)
+    childProcess = null
+  })
+
+  try {
+    childProcess = await command.spawn()
+    console.log('[sidecar] spawned pid:', childProcess.pid)
+  }
+  catch (err) {
+    console.error('[sidecar] spawn failed:', err)
+  }
 }
 
 export async function rpc<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {

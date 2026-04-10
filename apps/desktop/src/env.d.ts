@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-declare const __SIDECAR_SCRIPT__: string
+declare const __PROJECT_ROOT__: string
 declare module '*.vue' {
   import type { DefineComponent } from 'vue'
   const component: DefineComponent<{}, {}, any>

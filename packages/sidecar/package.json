@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsup src/index.ts --format esm --target node20 --no-splitting --external better-sqlite3",
-    "build:bin": "tsup src/index.ts --format cjs --target node20 --no-splitting --shims --external better-sqlite3 && pkg dist/index.cjs --targets node22-macos-arm64 --output ../../apps/desktop/src-tauri/binaries/sidecar-aarch64-apple-darwin",
+    "build:sea": "bash scripts/build-sea.sh",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -20,7 +20,6 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.0",
-    "@yao-pkg/pkg": "^6.14.2",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",

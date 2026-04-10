@@ -10,10 +10,9 @@
       "identifier": "shell:allow-spawn",
       "allow": [
         {
-          "name": "node",
-          "cmd": "node",
-          "args": true,
-          "sidecar": false
+          "name": "binaries/sidecar",
+          "sidecar": true,
+          "args": true
         }
       ]
     },
@@ -21,10 +20,9 @@
       "identifier": "shell:allow-execute",
       "allow": [
         {
-          "name": "node",
-          "cmd": "node",
-          "args": true,
-          "sidecar": false
+          "name": "binaries/sidecar",
+          "sidecar": true,
+          "args": true
         }
       ]
     },

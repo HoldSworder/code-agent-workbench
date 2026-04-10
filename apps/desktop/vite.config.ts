@@ -5,13 +5,13 @@ import vue from '@vitejs/plugin-vue'
 import UnoCSS from 'unocss/vite'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const sidecarScript = path.resolve(__dirname, '../../packages/sidecar/dist/index.js')
+const projectRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
   plugins: [vue(), UnoCSS()],
   clearScreen: false,
   define: {
-    __SIDECAR_SCRIPT__: JSON.stringify(sidecarScript),
+    __PROJECT_ROOT__: JSON.stringify(projectRoot),
   },
   server: {
     port: 1420,
