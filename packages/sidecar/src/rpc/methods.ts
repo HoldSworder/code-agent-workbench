@@ -23,6 +23,8 @@ import { listRemoteSkills, searchRemoteSkills, getRemoteSkillDetail, installRemo
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import type { CreateMcpServerInput, UpdateMcpServerInput } from '../db/repositories/mcp-server.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
+import type { ConsultServer } from '../consult/server'
+import type { ConsultConfig } from '../consult/types'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -56,6 +58,8 @@ export function registerMethods(
   db: Database.Database,
   engine: WorkflowEngine,
   workflowPath?: string,
+  consultServer?: ConsultServer,
+  buildConsultConfig?: () => ConsultConfig,
 ): void {
   const repoRepo = new RepoRepository(db)
   const reqRepo = new RequirementRepository(db)
@@ -721,4 +725,31 @@ export function registerMethods(
       return { models: [] }
     }
   })
+
+  // ── Consultation mode ──
+  if (consultServer && buildConsultConfig) {
+    server.register('consult.start', async ({ port }: { port?: number } = {}) => {
+      const config = buildConsultConfig()
+      consultServer.updateConfig(config)
+      await consultServer.start(port ?? config.port)
+      return consultServer.getStatus()
+    })
+
+    server.register('consult.stop', async () => {
+      await consultServer.stop()
+      return { ok: true }
+    })
+
+    server.register('consult.status', async () => {
+      return consultServer.getStatus()
+    })
+
+    server.register('consult.listSessions', async () => {
+      return consultServer.listSessions()
+    })
+
+    server.register('consult.getSessionMessages', async ({ sessionId }: { sessionId: string }) => {
+      return consultServer.getSessionMessages(sessionId)
+    })
+  }
 }

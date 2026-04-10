@@ -70,6 +70,7 @@ export interface Assignment {
 
 export type OrchestratorEventType =
   | 'leader_started'
+  | 'leader_agent_error'
   | 'leader_output_invalid'
   | 'requirement_analyzed'
   | 'task_assigned'

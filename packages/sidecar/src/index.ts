@@ -13,6 +13,8 @@ import { registerOrchestratorMethods, registerTeamConfigMethods } from './orches
 import { ExternalCliProvider } from './providers/cli.provider'
 import { ApiProvider } from './providers/api.provider'
 import { SettingsRepository } from './db/repositories/settings.repo'
+import { ConsultServer } from './consult/server'
+import type { ConsultConfig } from './consult/types'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -233,8 +235,31 @@ catch (err) {
   process.stderr.write(`orchestrator: failed to load team.yaml: ${err}\n`)
 }
 
+// ── Consultation server (read-only WebUI for LAN access) ──
+
+function buildConsultConfig(): ConsultConfig {
+  const provider = (settingsRepo.get('consult.provider') ?? settingsRepo.get('agent.provider') ?? 'cursor-cli') as ConsultConfig['provider']
+  const model = settingsRepo.get('consult.model') ?? settingsRepo.get('agent.model') ?? undefined
+  const binaryPath = settingsRepo.get('consult.binaryPath') ?? settingsRepo.get('agent.binaryPath') ?? undefined
+  const port = Number(settingsRepo.get('consult.port')) || 3100
+  const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
+  const proxyUrl = proxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
+
+  const sniProxyPatch = (() => {
+    if (!proxyUrl || !existsSync(sniPatchPath)) return undefined
+    const socks5 = parseSocks5Config(proxyUrl)
+    if (!socks5) return undefined
+    return { scriptPath: sniPatchPath, socks5Host: socks5.host, socks5Port: socks5.port }
+  })()
+
+  return { provider, model, binaryPath, port, proxyUrl, sniProxyPatch }
+}
+
+const consultStaticDir = resolve(projectRoot, 'apps/consult/dist')
+const consultServer = new ConsultServer({ db, config: buildConsultConfig(), staticDir: consultStaticDir })
+
 const rpcServer = new RpcServer()
-registerMethods(rpcServer, db, engine, workflowPath)
+registerMethods(rpcServer, db, engine, workflowPath, consultServer, buildConsultConfig)
 
 // 配置 RPC 始终可用（即使 team.yaml 不存在也能创建）
 registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator, () => {

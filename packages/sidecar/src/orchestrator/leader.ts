@@ -116,6 +116,41 @@ export class LeaderLoop {
     }
   }
 
+  async dispatchRequirement(requirementId: string): Promise<{ runId: string } | { error: string }> {
+    const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
+    const req = repo.findRequirementForDispatch(requirementId)
+    if (!req) return { error: 'Requirement not found or not in pending state' }
+    if (!repo.claimRequirement(req.id)) return { error: 'Failed to claim requirement (concurrent dispatch?)' }
+
+    const run = repo.createRun({
+      requirement_id: req.id,
+      team_config: JSON.stringify(teamConfig),
+    })
+
+    const leaderWorktree = join(tmpdir(), `code-agent-leader-${randomUUID().slice(0, 8)}`)
+    const leaderBranch = `orchestrator/leader-${randomUUID().slice(0, 6)}`
+
+    try {
+      await createWorktree(repoPath, leaderWorktree, leaderBranch, defaultBranch)
+    }
+    catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      repo.updateRunStatus(run.id, 'failed')
+      repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({ reason: `Worktree creation failed: ${msg}` }))
+      repo.updateRequirementStatus(req.id, 'pending')
+      this.deps.onEvent?.('leader_worktree_failed', { error: msg })
+      return { error: `Git worktree 创建失败: ${msg}` }
+    }
+
+    repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
+
+    this.executeLeader(req, run, leaderWorktree, leaderBranch).catch((err) => {
+      this.deps.onEvent?.('leader_execution_error', { error: String(err), runId: run.id })
+    })
+
+    return { runId: run.id }
+  }
+
   private scheduleNext(delayMs: number): void {
     if (!this.running) return
     const { signal } = this.abortController!
@@ -151,10 +186,8 @@ export class LeaderLoop {
   private async processRequirement(
     req: { id: string, title: string, description: string },
   ): Promise<string | null> {
-    const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
-    const leaderRole = teamConfig.roles.leader
+    const { repo, teamConfig, repoPath, defaultBranch } = this.deps
 
-    // Create Leader worktree for code analysis (2B decision)
     const leaderWorktree = join(tmpdir(), `code-agent-leader-${randomUUID().slice(0, 8)}`)
     const leaderBranch = `orchestrator/leader-${randomUUID().slice(0, 6)}`
 
@@ -168,7 +201,25 @@ export class LeaderLoop {
       return null
     }
 
-    // Build Leader context
+    const run = repo.createRun({
+      requirement_id: req.id,
+      team_config: JSON.stringify(teamConfig),
+    })
+    repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
+
+    await this.executeLeader(req, run, leaderWorktree, leaderBranch)
+    return run.id
+  }
+
+  private async executeLeader(
+    req: { id: string, title: string, description: string },
+    run: { id: string },
+    leaderWorktree: string,
+    leaderBranch: string,
+  ): Promise<void> {
+    const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
+    const leaderRole = teamConfig.roles.leader
+
     const rejectFeedback = repo.getLastRejectFeedback(req.id)
     const leaderPrompt = buildLeaderPrompt(leaderRole, req, rejectFeedback)
 
@@ -187,25 +238,44 @@ export class LeaderLoop {
       requirementDescription: req.description,
     }
 
-    const run = repo.createRun({
-      requirement_id: req.id,
-      team_config: JSON.stringify(teamConfig),
-    })
-    repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
-
     let rawOutput = ''
+    let providerFailed = false
+    let providerError = ''
     try {
       const result = await provider.run(context, { onChunk })
       rawOutput = result.output ?? ''
       this.currentProvider = null
+
+      if (result.status === 'failed' || result.status === 'cancelled') {
+        providerFailed = true
+        providerError = result.error ?? 'unknown'
+        repo.appendEvent(run.id, 'leader_agent_error', null, JSON.stringify({
+          status: result.status,
+          error: providerError,
+          output: rawOutput.slice(0, 500),
+        }))
+      }
     }
     catch (err) {
       this.currentProvider = null
+      providerFailed = true
+      providerError = err instanceof Error ? err.message : String(err)
+      repo.appendEvent(run.id, 'leader_agent_error', null, JSON.stringify({ error: providerError }))
       rawOutput = ''
     }
 
     // Cleanup Leader worktree
     try { await removeWorktree(repoPath, leaderWorktree) } catch {}
+
+    // If provider outright failed, skip parsing retries
+    if (providerFailed) {
+      repo.updateRunStatus(run.id, 'failed')
+      repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({
+        reason: `Leader agent 运行失败: ${providerError}`,
+      }))
+      repo.updateRequirementStatus(req.id, 'pending')
+      return
+    }
 
     // Parse Leader decision (6D: marker → regex → Zod)
     let decision = parseLeaderDecision(rawOutput)
@@ -216,7 +286,7 @@ export class LeaderLoop {
         attempt: 1,
       }))
 
-      // Retry once with repair prompt
+      // Retry once with repair prompt (only when agent ran but output was unparseable)
       const retryResult = await this.retryLeaderParsing(
         provider, context, rawOutput, run.id,
       )
@@ -229,10 +299,12 @@ export class LeaderLoop {
         }))
         repo.updateRunStatus(run.id, 'failed')
         repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({
-          reason: 'Leader failed to produce valid JSON after 2 attempts',
+          reason: rawOutput.length === 0
+            ? 'Leader agent 返回空输出 — 请检查 agent 命令是否可用以及 API key 配置'
+            : 'Leader 输出无法解析为有效 JSON（已重试 2 次）',
         }))
         repo.updateRequirementStatus(req.id, 'pending')
-        return null
+        return
       }
     }
 
@@ -244,15 +316,13 @@ export class LeaderLoop {
       assignment_count: decision.assignments.length,
     }))
 
-    // Handle blocked
     if (decision.decision === 'blocked') {
       repo.updateRunStatus(run.id, 'blocked')
       repo.appendEvent(run.id, 'run_blocked', null, JSON.stringify({ reason: decision.reason }))
       repo.updateRequirementStatus(req.id, 'pending')
-      return run.id
+      return
     }
 
-    // Phase 1: downgrade split to single assignment
     const assignmentsToCreate = decision.decision === 'split'
       ? [decision.assignments[0]]
       : decision.assignments.slice(0, 1)
@@ -263,7 +333,7 @@ export class LeaderLoop {
         reason: 'Leader decision had no assignments',
       }))
       repo.updateRequirementStatus(req.id, 'pending')
-      return null
+      return
     }
 
     const assignmentInput = assignmentsToCreate[0]
@@ -274,7 +344,7 @@ export class LeaderLoop {
         reason: `Unknown role: ${assignmentInput.role}`,
       }))
       repo.updateRequirementStatus(req.id, 'pending')
-      return null
+      return
     }
 
     const assignment = repo.createAssignment({
@@ -313,8 +383,6 @@ export class LeaderLoop {
         reason: workerResult.phaseResult.error,
       }))
     }
-
-    return run.id
   }
 
   private async retryLeaderParsing(

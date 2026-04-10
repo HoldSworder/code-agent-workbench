@@ -208,6 +208,28 @@ export class OrchestratorRepository {
       .all() as Array<{ id: string, title: string, description: string }>
   }
 
+  findRequirementForDispatch(requirementId: string): { id: string, title: string, description: string } | null {
+    return (this.db
+      .prepare(
+        `SELECT r.id, r.title, r.description
+         FROM requirements r
+         WHERE r.id = ?
+           AND r.mode = 'orchestrator'
+           AND r.status = 'pending'`,
+      )
+      .get(requirementId) as { id: string, title: string, description: string } | undefined) ?? null
+  }
+
+  findRequirementRaw(requirementId: string): { id: string, title: string, description: string, mode: string, status: string } | null {
+    return (this.db
+      .prepare('SELECT id, title, description, mode, status FROM requirements WHERE id = ?')
+      .get(requirementId) as { id: string, title: string, description: string, mode: string, status: string } | undefined) ?? null
+  }
+
+  updateRequirementMode(requirementId: string, mode: string): void {
+    this.db.prepare('UPDATE requirements SET mode = ? WHERE id = ?').run(mode, requirementId)
+  }
+
   /**
    * Atomic CAS claim: pending → orchestrating. Returns true if claim succeeded.
    */

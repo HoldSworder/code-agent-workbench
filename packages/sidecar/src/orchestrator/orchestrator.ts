@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type Database from 'better-sqlite3'
 import type { AgentProvider, RunOptions } from '../providers/types'
 import { ExternalCliProvider } from '../providers/cli.provider'
@@ -89,6 +91,21 @@ export class Orchestrator {
     this.onEvent?.('stopped')
   }
 
+  async dispatchRequirement(requirementId: string): Promise<{ runId: string } | { error: string }> {
+    if (!this.leaderLoop) {
+      this.leaderLoop = new LeaderLoop({
+        repo: this.repo,
+        teamConfig: this.teamConfig,
+        resolveProvider: role => this.resolveProviderForRole(role),
+        repoPath: this.repoPath,
+        defaultBranch: this.defaultBranch,
+        onChunk: this.onChunk,
+        onEvent: this.onEvent,
+      })
+    }
+    return this.leaderLoop.dispatchRequirement(requirementId)
+  }
+
   updateTeamConfig(config: TeamConfig): void {
     this.teamConfig = config
   }
@@ -103,13 +120,40 @@ export class Orchestrator {
     const proxyUrl = proxyEnabled ? (this.settings.get('proxy.url') ?? undefined) : undefined
 
     const provider = role.provider ?? globalProvider
-    const model = role.model ?? globalModel
+    const model = (role.model || undefined) ?? globalModel
+
+    if (proxyUrl) {
+      process.env.HTTP_PROXY = proxyUrl
+      process.env.HTTPS_PROXY = proxyUrl
+      process.env.ALL_PROXY = proxyUrl
+    }
+    else {
+      delete process.env.HTTP_PROXY
+      delete process.env.HTTPS_PROXY
+      delete process.env.ALL_PROXY
+    }
+
+    const sniProxyPatch = (() => {
+      if (!proxyUrl) return undefined
+      const projectRoot = resolve(__dirname, '..', '..', '..', '..')
+      const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
+      if (!existsSync(sniPatchPath)) return undefined
+      try {
+        const url = new URL(proxyUrl)
+        return { scriptPath: sniPatchPath, socks5Host: url.hostname || '127.0.0.1', socks5Port: Number(url.port) || 7890 }
+      }
+      catch {
+        const match = proxyUrl.match(/:(\d+)\s*$/)
+        return match ? { scriptPath: sniPatchPath, socks5Host: '127.0.0.1', socks5Port: Number(match[1]) } : undefined
+      }
+    })()
 
     return new ExternalCliProvider({
       type: provider as 'claude-code' | 'cursor-cli' | 'codex',
       model,
       binaryPath,
       proxyUrl,
+      sniProxyPatch,
     })
   }
 }

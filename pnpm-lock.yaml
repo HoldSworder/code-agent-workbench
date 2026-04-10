@@ -18,6 +18,46 @@ importers:
         specifier: ^6.0.2
         version: 6.0.2
 
+  apps/consult:
+    dependencies:
+      markdown-it:
+        specifier: ^14.1.1
+        version: 14.1.1
+      vue:
+        specifier: ^3.5.31
+        version: 3.5.31(typescript@6.0.2)
+    devDependencies:
+      '@iconify-json/carbon':
+        specifier: ^1.2.20
+        version: 1.2.20
+      '@types/markdown-it':
+        specifier: ^14.1.2
+        version: 14.1.2
+      '@unocss/preset-icons':
+        specifier: ^66.6.7
+        version: 66.6.7
+      '@unocss/preset-typography':
+        specifier: ^66.6.7
+        version: 66.6.7
+      '@unocss/preset-uno':
+        specifier: ^66.6.7
+        version: 66.6.7
+      '@vitejs/plugin-vue':
+        specifier: ^6.0.5
+        version: 6.0.5(vite@8.0.3)(vue@3.5.31)
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.2
+      unocss:
+        specifier: ^66.6.7
+        version: 66.6.7(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)(vite@8.0.3)
+      vite:
+        specifier: ^8.0.3
+        version: 8.0.3(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)(@types/node@25.5.0)(esbuild@0.27.7)(tsx@4.21.0)(yaml@2.8.3)
+      vue-tsc:
+        specifier: ^3.2.6
+        version: 3.2.6(typescript@6.0.2)
+
   apps/desktop:
     dependencies:
       '@tauri-apps/api':

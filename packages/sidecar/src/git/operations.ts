@@ -14,8 +14,16 @@ export async function createWorktree(
   branchName: string,
   baseBranch: string,
 ): Promise<void> {
-  await git(repoPath, ['fetch', 'origin', baseBranch])
-  await git(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, `origin/${baseBranch}`])
+  let useRemote = false
+  try {
+    await git(repoPath, ['fetch', 'origin', baseBranch])
+    useRemote = true
+  }
+  catch {
+    // remote fetch failed — fall back to local branch
+  }
+  const base = useRemote ? `origin/${baseBranch}` : baseBranch
+  await git(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, base])
 }
 
 export async function createBranch(

@@ -77,6 +77,8 @@ const statusBadge: Record<string, { label: string, class: string }> = {
   fetching: { label: '获取中', class: 'bg-violet-50 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400' },
   fetch_failed: { label: '获取失败', class: 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400' },
   pending: { label: '待编排', class: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400' },
+  orchestrating: { label: '编排中', class: 'bg-violet-50 text-violet-600 dark:bg-violet-500/10 dark:text-violet-400' },
+  pending_acceptance: { label: '待验收', class: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400' },
   draft: { label: '草稿', class: 'bg-gray-100 text-gray-500 dark:bg-gray-500/10 dark:text-gray-400' },
   active: { label: '进行中', class: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400' },
   suspended: { label: '已挂起', class: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400' },
@@ -86,6 +88,7 @@ const statusBadge: Record<string, { label: string, class: string }> = {
 
 const statusGroupOrder = [
   { key: 'fetching', icon: 'i-carbon-ai-status', dot: 'bg-violet-500' },
+  { key: 'orchestrating', icon: 'i-carbon-ai-status', dot: 'bg-violet-500' },
   { key: 'pending', icon: 'i-carbon-pending', dot: 'bg-blue-500' },
   { key: 'draft', icon: 'i-carbon-document-blank', dot: 'bg-gray-400' },
   { key: 'active', icon: 'i-carbon-in-progress', dot: 'bg-indigo-500' },
@@ -106,7 +109,7 @@ function getReqSortTime(reqId: string, createdAt: string): number {
 }
 
 function deriveEffectiveStatus(req: { id: string, status: string }): string {
-  if (req.status === 'fetching' || req.status === 'fetch_failed')
+  if (['fetching', 'fetch_failed', 'pending', 'orchestrating', 'pending_acceptance'].includes(req.status))
     return req.status
 
   const tasks = taskMap.value[req.id] ?? []
@@ -374,12 +377,16 @@ async function retryRequirementFetch(reqId: string) {
 }
 
 const orchestratorDispatching = ref(false)
+const orchestratorDispatchError = ref('')
 async function dispatchToOrchestrator(reqId: string) {
   orchestratorDispatching.value = true
+  orchestratorDispatchError.value = ''
   try {
-    await requirementsStore.updateMode(reqId, 'orchestrator')
-    if (!orchestratorStore.status?.running)
-      await orchestratorStore.start()
+    await rpc<{ dispatched: boolean, runId: string }>('orchestrator.dispatchRequirement', { requirementId: reqId })
+    await requirementsStore.refreshOne(reqId)
+  }
+  catch (err: unknown) {
+    orchestratorDispatchError.value = err instanceof Error ? err.message : String(err)
     await requirementsStore.refreshOne(reqId)
   }
   finally {
@@ -1377,21 +1384,45 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                     <div v-else class="i-carbon-send-alt w-4 h-4" />
                     派发给多 Agent 编排
                   </button>
+                  <div v-if="orchestratorDispatchError" class="mt-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-500/5 border border-red-200/60 dark:border-red-500/10 text-[12px] text-red-600 dark:text-red-400 break-all">
+                    {{ orchestratorDispatchError }}
+                  </div>
                 </div>
-                <!-- pending: 已派发到编排，等待处理 -->
+                <!-- pending + orchestrator: 等待开始编排 -->
                 <div v-else-if="selectedReq.status === 'pending' && selectedReq.mode === 'orchestrator'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
+                  <div class="flex items-center gap-2 mb-3">
+                    <span class="text-[11px] text-gray-400">执行模式:</span>
+                    <span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400">
+                      多 Agent 编排
+                    </span>
+                  </div>
+                  <button
+                    class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-150 active:scale-[0.98] disabled:opacity-50 bg-violet-600 text-white hover:bg-violet-500 shadow-sm shadow-violet-600/20"
+                    :disabled="orchestratorDispatching"
+                    @click="dispatchToOrchestrator(selectedReq.id)"
+                  >
+                    <div v-if="orchestratorDispatching" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+                    <div v-else class="i-carbon-play-filled w-4 h-4" />
+                    开始编排
+                  </button>
+                  <div v-if="orchestratorDispatchError" class="mt-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-500/5 border border-red-200/60 dark:border-red-500/10 text-[12px] text-red-600 dark:text-red-400 break-all">
+                    {{ orchestratorDispatchError }}
+                  </div>
+                </div>
+                <!-- orchestrating: Leader 正在分析 -->
+                <div v-else-if="selectedReq.status === 'orchestrating'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
                   <div class="flex items-center gap-2 mb-2">
                     <span class="text-[11px] text-gray-400">执行模式:</span>
                     <span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400">
                       多 Agent 编排
                     </span>
                   </div>
-                  <div class="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-blue-50/80 dark:bg-blue-500/5 border border-blue-200/60 dark:border-blue-500/10">
-                    <div class="i-carbon-circle-dash w-4 h-4 text-blue-500 animate-spin shrink-0" />
-                    <span class="text-[12px] font-medium text-blue-600 dark:text-blue-400">已派发，等待 Leader 分析分配...</span>
+                  <div class="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-violet-50/80 dark:bg-violet-500/5 border border-violet-200/60 dark:border-violet-500/10">
+                    <div class="i-carbon-circle-dash w-4 h-4 text-violet-500 animate-spin shrink-0" />
+                    <span class="text-[12px] font-medium text-violet-600 dark:text-violet-400">Leader 正在分析需求并分配任务...</span>
                   </div>
                 </div>
-                <!-- 非 draft/pending 状态只读显示 -->
+                <!-- 非可编辑状态只读显示 -->
                 <div v-else class="px-6 py-3 border-b border-gray-100 dark:border-white/5 flex items-center gap-2">
                   <span class="text-[11px] text-gray-400">执行模式:</span>
                   <span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400">

@@ -298,6 +298,16 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'skillStore.uninstall':
       mockInstalledSkills.delete(params.slug)
       return { removed: true } as T
+    case 'consult.start':
+      return { running: true, port: 3100, localIp: '192.168.1.100' } as T
+    case 'consult.stop':
+      return { ok: true } as T
+    case 'consult.status':
+      return { running: false, port: null, localIp: null } as T
+    case 'consult.listSessions':
+      return [] as T
+    case 'consult.getSessionMessages':
+      return [] as T
     case 'orchestrator.status':
       return { running: false, teamName: 'default-team', roles: ['leader', 'frontend_dev', 'backend_dev'] } as T
     case 'orchestrator.start':
@@ -325,6 +335,8 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         { id: 5, run_id: 'run-mock-001', assignment_id: 'assign-1', event_type: 'worker_completed', payload: '{"output":"已完成头像组件开发"}', created_at: '2026-04-09T10:14:00Z' },
         { id: 6, run_id: 'run-mock-001', assignment_id: null, event_type: 'run_completed', payload: null, created_at: '2026-04-09T10:15:00Z' },
       ] as T
+    case 'orchestrator.dispatchRequirement':
+      return { dispatched: true } as T
     case 'orchestrator.cancelRun':
     case 'orchestrator.rejectRun':
     case 'orchestrator.retryAssignment':

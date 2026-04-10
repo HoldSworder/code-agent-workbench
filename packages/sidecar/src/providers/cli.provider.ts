@@ -237,11 +237,11 @@ export class ExternalCliProvider implements AgentProvider {
         }
 
         if (sig) {
-          finish({ status: 'failed', error: stderr || `Killed by signal: ${sig}` })
+          finish({ status: 'failed', error: stderr || `Killed by signal: ${sig}`, output: assistantText || stdout.slice(0, 2000) })
           return
         }
         if (code !== 0 && code !== null) {
-          finish({ status: 'failed', error: stderr || `Exit code: ${code}` })
+          finish({ status: 'failed', error: stderr || `Exit code: ${code}`, output: assistantText || stdout.slice(0, 2000) })
           return
         }
 

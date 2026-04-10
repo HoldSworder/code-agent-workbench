@@ -9,7 +9,7 @@ roles:
     id: leader
     description: 分析需求、拆分任务、分配给合适的角色
     provider: cursor-cli
-    model: ""
+    model: auto
     prompt_template: |
       你是一个技术 Leader。你的职责是分析需求并将其拆分为可执行的子任务。
 
@@ -33,7 +33,7 @@ roles:
       React/Vue/Angular frameworks, UI implementation, and performance
       optimization
     provider: cursor-cli
-    model: ""
+    model: auto
     prompt_template: >-
       # Frontend Developer Agent Personality
 
@@ -414,7 +414,7 @@ roles:
       database architecture, API development, and cloud infrastructure. Builds
       robust, secure, performant server-side applications and microservices
     provider: cursor-cli
-    model: ""
+    model: auto
     prompt_template: >-
       # Backend Architect Agent Personality
 
@@ -810,7 +810,7 @@ roles:
       result evaluation, quality metrics analysis, and actionable insight
       generation from testing activities
     provider: cursor-cli
-    model: ""
+    model: auto
     prompt_template: >-
       # Test Results Analyzer Agent Personality
 

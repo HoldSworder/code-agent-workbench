@@ -153,6 +153,30 @@ export function registerOrchestratorMethods(rpc: RpcServer, orchestrator: Orches
     }
   })
 
+  rpc.register('orchestrator.dispatchRequirement', async (params: { requirementId: string }) => {
+    if (!params.requirementId)
+      throw new Error('requirementId is required')
+
+    const reqRow = repo.findRequirementRaw(params.requirementId)
+    if (!reqRow)
+      throw new Error(`Requirement not found: ${params.requirementId}`)
+
+    if (reqRow.mode !== 'orchestrator')
+      repo.updateRequirementMode(params.requirementId, 'orchestrator')
+
+    const DISPATCHABLE = ['draft', 'pending', 'fetch_failed']
+    if (!DISPATCHABLE.includes(reqRow.status))
+      throw new Error(`Requirement status "${reqRow.status}" cannot be dispatched`)
+
+    if (reqRow.status !== 'pending')
+      repo.updateRequirementStatus(params.requirementId, 'pending')
+
+    const result = await orchestrator.dispatchRequirement(params.requirementId)
+    if ('error' in result)
+      throw new Error(result.error)
+    return { dispatched: true, runId: result.runId }
+  })
+
   rpc.register('orchestrator.getRuns', async (params: { limit?: number, offset?: number }) => {
     return repo.findAllRuns(params.limit ?? 50, params.offset ?? 0)
   })
