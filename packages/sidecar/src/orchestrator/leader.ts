@@ -8,6 +8,7 @@ import type { OrchestratorRepository, RequirementForLeader } from './repository'
 import type { TeamConfig, LeaderDecision, RoleConfig } from './types'
 import { runWorker } from './worker-runner'
 import type { WorkerRunnerDeps } from './worker-runner'
+import { fetchLarkDocContent } from './lark-fetcher'
 
 const LeaderDecisionSchema = z.object({
   decision: z.enum(['single_worker', 'split', 'blocked']),
@@ -234,9 +235,24 @@ export class LeaderLoop {
     const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
     const leaderRole = teamConfig.roles.leader
 
+    // Auto-fetch lark doc content when doc_url exists and content is not yet cached
+    let docContent = req.fetch_output ?? ''
+    if (req.doc_url && !docContent) {
+      this.deps.onEvent?.('doc_fetch_started', { doc_url: req.doc_url })
+      const result = await fetchLarkDocContent(req.doc_url)
+      if (result.content) {
+        docContent = result.content
+        repo.updateRequirementFetchOutput(req.id, docContent)
+        this.deps.onEvent?.('doc_fetch_completed', { length: docContent.length })
+      }
+      else {
+        this.deps.onEvent?.('doc_fetch_failed', { error: result.error })
+      }
+    }
+
     const rejectFeedback = repo.getLastRejectFeedback(req.id)
     const repos = repo.findAllRepos()
-    const leaderPrompt = buildLeaderPrompt({ role: leaderRole, req, repos, rejectFeedback })
+    const leaderPrompt = buildLeaderPrompt({ role: leaderRole, req, repos, rejectFeedback, docContent })
 
     const provider = resolveProvider(leaderRole)
     this.currentProvider = provider
@@ -392,7 +408,10 @@ export class LeaderLoop {
       onChunk,
     }
 
-    const requirementContext = `${req.title}\n\n${req.description}`
+    const requirementContextParts = [req.title, '', req.description]
+    if (docContent)
+      requirementContextParts.push('', '## 需求文档内容', '', docContent)
+    const requirementContext = requirementContextParts.join('\n')
     const workerResult = await runWorker(workerDeps, assignment, role, requirementContext)
 
     if (workerResult.phaseResult.status === 'success') {
@@ -447,11 +466,18 @@ interface BuildLeaderPromptInput {
   req: RequirementForLeader
   repos: Array<{ id: string, name: string, local_path: string, default_branch: string }>
   rejectFeedback: string | null
+  docContent?: string
 }
 
-function buildLeaderPrompt({ role, req, repos, rejectFeedback }: BuildLeaderPromptInput): string {
+function buildLeaderPrompt({ role, req, repos, rejectFeedback, docContent }: BuildLeaderPromptInput): string {
   const parts = [
     role.prompt_template ?? '',
+    '',
+    '## 工作模式',
+    '',
+    '你是一个全权自主决策的技术 Leader，不需要征求任何人的意见。',
+    '直接根据需求内容、代码库现状和你的专业判断做出决策。',
+    '禁止输出任何"是否继续？""请确认""需要你的意见"等交互式提问。',
     '',
     '## 需求信息',
     `**标题：** ${req.title}`,
@@ -459,7 +485,16 @@ function buildLeaderPrompt({ role, req, repos, rejectFeedback }: BuildLeaderProm
   ]
 
   if (req.source_url) parts.push(`**需求来源：** ${req.source_url}`)
-  if (req.doc_url) parts.push(`**需求文档：** ${req.doc_url}`)
+  if (req.doc_url) parts.push(`**需求文档链接：** ${req.doc_url}`)
+
+  if (docContent) {
+    parts.push(
+      '',
+      '## 需求文档详细内容',
+      '',
+      docContent,
+    )
+  }
 
   if (repos.length > 0) {
     parts.push('', '## 可用仓库')
@@ -489,7 +524,7 @@ function buildLeaderPrompt({ role, req, repos, rejectFeedback }: BuildLeaderProm
     '    {',
     '      "role": "角色ID（对应 team.yaml 中的角色）",',
     '      "title": "子任务标题",',
-    '      "description": "详细描述",',
+    '      "description": "详细描述（必须包含足够的上下文，使 worker 无需再看需求文档即可独立完成）",',
     '      "acceptance_criteria": "验收标准"',
     '    }',
     '  ]',

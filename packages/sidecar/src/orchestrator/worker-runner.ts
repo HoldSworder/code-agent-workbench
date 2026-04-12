@@ -102,6 +102,12 @@ function buildWorkerPrompt(
   const parts = [
     role.prompt_template ?? '',
     '',
+    '## 工作模式',
+    '',
+    '你是一个全权自主工作的开发者，不需要征求任何人的意见。',
+    '直接根据任务描述和验收标准独立完成工作，做出所有技术决策。',
+    '禁止输出任何"是否继续？""请确认""需要你的意见"等交互式提问。',
+    '',
     '## 当前任务',
     `**标题：** ${assignment.title}`,
     `**描述：** ${assignment.description}`,

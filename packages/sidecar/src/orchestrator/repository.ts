@@ -17,6 +17,7 @@ export interface RequirementForLeader {
   description: string
   source_url: string | null
   doc_url: string | null
+  fetch_output: string | null
 }
 
 export class OrchestratorRepository {
@@ -203,7 +204,7 @@ export class OrchestratorRepository {
   findPendingOrchestratorRequirements(): Array<RequirementForLeader> {
     return this.db
       .prepare(
-        `SELECT r.id, r.title, r.description, r.source_url, r.doc_url
+        `SELECT r.id, r.title, r.description, r.source_url, r.doc_url, r.fetch_output
          FROM requirements r
          WHERE r.mode = 'orchestrator'
            AND r.status = 'pending'
@@ -219,7 +220,7 @@ export class OrchestratorRepository {
   findRequirementForDispatch(requirementId: string): RequirementForLeader | null {
     return (this.db
       .prepare(
-        `SELECT r.id, r.title, r.description, r.source_url, r.doc_url
+        `SELECT r.id, r.title, r.description, r.source_url, r.doc_url, r.fetch_output
          FROM requirements r
          WHERE r.id = ?
            AND r.mode = 'orchestrator'
@@ -259,6 +260,10 @@ export class OrchestratorRepository {
 
   updateRequirementStatus(requirementId: string, status: string): void {
     this.db.prepare('UPDATE requirements SET status = ? WHERE id = ?').run(status, requirementId)
+  }
+
+  updateRequirementFetchOutput(requirementId: string, output: string | null): void {
+    this.db.prepare('UPDATE requirements SET fetch_output = ? WHERE id = ?').run(output, requirementId)
   }
 
   /**
