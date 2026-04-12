@@ -1,9 +1,27 @@
 node_modules/
 dist/
 target/
+.DS_Store
+*.log
+
+# Database files
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
-.DS_Store
-*.log
+*.sqlite
+*.sqlite3
+
+# Runtime data
+data/
+
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+*.cert
+*.p12
+
+# Tauri build artifacts
+apps/desktop/src-tauri/binaries/
