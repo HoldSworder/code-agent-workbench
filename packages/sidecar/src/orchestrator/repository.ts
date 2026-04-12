@@ -11,6 +11,14 @@ import type {
   CreateAssignmentInput,
 } from './types'
 
+export interface RequirementForLeader {
+  id: string
+  title: string
+  description: string
+  source_url: string | null
+  doc_url: string | null
+}
+
 export class OrchestratorRepository {
   constructor(private db: Database.Database) {}
 
@@ -192,10 +200,10 @@ export class OrchestratorRepository {
    * Find requirements eligible for orchestrator pickup:
    * mode=orchestrator, status=pending, and no blocked run exists for them.
    */
-  findPendingOrchestratorRequirements(): Array<{ id: string, title: string, description: string }> {
+  findPendingOrchestratorRequirements(): Array<RequirementForLeader> {
     return this.db
       .prepare(
-        `SELECT r.id, r.title, r.description
+        `SELECT r.id, r.title, r.description, r.source_url, r.doc_url
          FROM requirements r
          WHERE r.mode = 'orchestrator'
            AND r.status = 'pending'
@@ -205,19 +213,25 @@ export class OrchestratorRepository {
            )
          ORDER BY r.created_at ASC`,
       )
-      .all() as Array<{ id: string, title: string, description: string }>
+      .all() as Array<RequirementForLeader>
   }
 
-  findRequirementForDispatch(requirementId: string): { id: string, title: string, description: string } | null {
+  findRequirementForDispatch(requirementId: string): RequirementForLeader | null {
     return (this.db
       .prepare(
-        `SELECT r.id, r.title, r.description
+        `SELECT r.id, r.title, r.description, r.source_url, r.doc_url
          FROM requirements r
          WHERE r.id = ?
            AND r.mode = 'orchestrator'
            AND r.status = 'pending'`,
       )
-      .get(requirementId) as { id: string, title: string, description: string } | undefined) ?? null
+      .get(requirementId) as RequirementForLeader | undefined) ?? null
+  }
+
+  findAllRepos(): Array<{ id: string, name: string, alias: string | null, local_path: string, default_branch: string }> {
+    return this.db
+      .prepare('SELECT id, name, alias, local_path, default_branch FROM repos ORDER BY created_at ASC')
+      .all() as Array<{ id: string, name: string, alias: string | null, local_path: string, default_branch: string }>
   }
 
   findRequirementRaw(requirementId: string): { id: string, title: string, description: string, mode: string, status: string } | null {

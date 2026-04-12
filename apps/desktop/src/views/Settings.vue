@@ -77,6 +77,15 @@ async function saveProxyConfig() {
 }
 
 // --- Repos config ---
+const showRepoForm = ref(false)
+const repoFormMode = ref<'add' | 'edit'>('add')
+const repoFormId = ref('')
+const repoFormPath = ref('')
+const repoFormName = ref('')
+const repoFormAlias = ref('')
+const repoFormBranch = ref('main')
+const repoFormSaving = ref(false)
+
 async function pickAndAddRepo() {
   let folderPath: string | null = null
 
@@ -91,8 +100,48 @@ async function pickAndAddRepo() {
   if (!folderPath)
     return
 
-  const name = folderPath.split('/').filter(Boolean).pop() || 'unknown'
-  await reposStore.create({ name, local_path: folderPath, default_branch: 'main' })
+  repoFormMode.value = 'add'
+  repoFormId.value = ''
+  repoFormPath.value = folderPath
+  repoFormName.value = folderPath.split('/').filter(Boolean).pop() || 'unknown'
+  repoFormAlias.value = ''
+  repoFormBranch.value = 'main'
+  showRepoForm.value = true
+}
+
+function openEditRepo(repo: { id: string, name: string, alias: string | null, default_branch: string }) {
+  repoFormMode.value = 'edit'
+  repoFormId.value = repo.id
+  repoFormPath.value = ''
+  repoFormName.value = repo.name
+  repoFormAlias.value = repo.alias ?? ''
+  repoFormBranch.value = repo.default_branch
+  showRepoForm.value = true
+}
+
+async function saveRepoForm() {
+  repoFormSaving.value = true
+  try {
+    if (repoFormMode.value === 'add') {
+      await reposStore.create({
+        name: repoFormName.value,
+        alias: repoFormAlias.value || undefined,
+        local_path: repoFormPath.value,
+        default_branch: repoFormBranch.value,
+      })
+    }
+    else {
+      await reposStore.update(repoFormId.value, {
+        name: repoFormName.value,
+        alias: repoFormAlias.value || null,
+        default_branch: repoFormBranch.value,
+      })
+    }
+    showRepoForm.value = false
+  }
+  finally {
+    repoFormSaving.value = false
+  }
 }
 
 async function removeRepo(id: string) {
@@ -360,12 +409,21 @@ const inputClass = 'w-full h-9 px-3 py-2 rounded-xl bg-[#fafafa] dark:bg-white/[
                     <div class="i-carbon-logo-github w-4.5 h-4.5 text-gray-400 dark:text-gray-500" />
                   </div>
                   <div class="flex-1 min-w-0">
-                    <div class="text-[13px] font-medium text-gray-800 dark:text-gray-100">{{ repo.name }}</div>
+                    <div class="flex items-center gap-2">
+                      <span class="text-[13px] font-medium text-gray-800 dark:text-gray-100">{{ repo.alias || repo.name }}</span>
+                      <span v-if="repo.alias" class="text-[11px] text-gray-400 dark:text-gray-500">({{ repo.name }})</span>
+                    </div>
                     <div class="text-[11px] text-gray-400 dark:text-gray-500 truncate font-mono mt-0.5">{{ repo.local_path }}</div>
                   </div>
                   <span class="text-[11px] text-gray-400 bg-gray-100 dark:bg-white/[0.04] px-2 py-0.5 rounded-md font-mono shrink-0">
                     {{ repo.default_branch }}
                   </span>
+                  <button
+                    class="p-1.5 rounded-lg text-gray-300 dark:text-gray-600 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 opacity-0 group-hover:opacity-100 transition-all duration-150"
+                    @click="openEditRepo(repo)"
+                  >
+                    <div class="i-carbon-edit w-3.5 h-3.5" />
+                  </button>
                   <button
                     class="p-1.5 rounded-lg text-gray-300 dark:text-gray-600 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 opacity-0 group-hover:opacity-100 transition-all duration-150"
                     @click="removeRepo(repo.id)"
@@ -384,6 +442,91 @@ const inputClass = 'w-full h-9 px-3 py-2 rounded-xl bg-[#fafafa] dark:bg-white/[
               </div>
             </div>
           </section>
+
+          <!-- Repo add/edit dialog -->
+          <Teleport to="body">
+            <Transition
+              enter-active-class="transition-all duration-200 ease-out"
+              leave-active-class="transition-all duration-150 ease-in"
+              enter-from-class="opacity-0"
+              leave-to-class="opacity-0"
+            >
+              <div
+                v-if="showRepoForm"
+                class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+                @click.self="showRepoForm = false"
+              >
+                <Transition
+                  appear
+                  enter-active-class="transition-all duration-200 ease-out"
+                  enter-from-class="opacity-0 scale-95 translate-y-2"
+                >
+                  <div class="bg-white dark:bg-[#2c2c30] rounded-2xl shadow-2xl shadow-black/10 w-full max-w-md p-6">
+                    <div class="flex items-center gap-3 mb-5">
+                      <div class="w-10 h-10 rounded-full bg-teal-50 dark:bg-teal-500/10 flex items-center justify-center shrink-0">
+                        <div class="i-carbon-folder-details w-5 h-5 text-teal-500" />
+                      </div>
+                      <div>
+                        <h2 class="text-base font-semibold">{{ repoFormMode === 'add' ? '添加仓库' : '编辑仓库' }}</h2>
+                        <p v-if="repoFormMode === 'add'" class="text-[13px] text-gray-400 mt-0.5 truncate max-w-[300px]">{{ repoFormPath }}</p>
+                      </div>
+                    </div>
+
+                    <div class="space-y-4 mb-6">
+                      <div>
+                        <label class="block text-[12px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">仓库名称</label>
+                        <input
+                          v-model="repoFormName"
+                          type="text"
+                          placeholder="仓库名称"
+                          :class="inputClass"
+                        >
+                      </div>
+                      <div>
+                        <label class="block text-[12px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">
+                          别名
+                          <span class="text-gray-300 dark:text-gray-600 font-normal ml-1">可选，设置后将优先显示</span>
+                        </label>
+                        <input
+                          v-model="repoFormAlias"
+                          type="text"
+                          placeholder="例如：前端主仓库"
+                          :class="inputClass"
+                        >
+                      </div>
+                      <div>
+                        <label class="block text-[12px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">默认分支</label>
+                        <input
+                          v-model="repoFormBranch"
+                          type="text"
+                          placeholder="main"
+                          :class="inputClass"
+                        >
+                      </div>
+                    </div>
+
+                    <div class="flex justify-end gap-2">
+                      <button
+                        class="px-4 py-2 rounded-lg text-[13px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                        @click="showRepoForm = false"
+                      >
+                        取消
+                      </button>
+                      <button
+                        class="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed"
+                        :disabled="!repoFormName.trim() || repoFormSaving"
+                        @click="saveRepoForm"
+                      >
+                        <div v-if="repoFormSaving" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
+                        <div v-else class="i-carbon-checkmark w-4 h-4" />
+                        {{ repoFormSaving ? '保存中...' : '保存' }}
+                      </button>
+                    </div>
+                  </div>
+                </Transition>
+              </div>
+            </Transition>
+          </Teleport>
         </div>
       </Transition>
     </div>

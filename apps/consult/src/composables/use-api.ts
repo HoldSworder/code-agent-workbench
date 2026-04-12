@@ -3,6 +3,7 @@ const BASE = import.meta.env.DEV ? '' : ''
 export interface Repo {
   id: string
   name: string
+  alias: string | null
   local_path: string
   default_branch: string
 }

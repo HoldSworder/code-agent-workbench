@@ -18,6 +18,7 @@ watch(() => props.events.length, async () => {
 
 const eventConfig: Record<string, { label: string, icon: string, color: string }> = {
   leader_started: { label: 'Leader 启动', icon: 'i-carbon-play', color: 'text-indigo-500' },
+  leader_agent_error: { label: 'Leader Agent 错误', icon: 'i-carbon-error', color: 'text-red-500' },
   leader_output_invalid: { label: 'Leader 输出无效', icon: 'i-carbon-warning', color: 'text-amber-500' },
   requirement_analyzed: { label: '需求分析完成', icon: 'i-carbon-analytics', color: 'text-blue-500' },
   task_assigned: { label: '任务已分配', icon: 'i-carbon-task', color: 'text-indigo-500' },
@@ -91,7 +92,7 @@ function payloadSummary(payload: Record<string, unknown>): string {
           </div>
           <p
             v-if="parsePayload(event.payload)"
-            class="text-[11px] text-gray-500 dark:text-gray-400 truncate"
+            class="text-[11px] text-gray-500 dark:text-gray-400 whitespace-pre-wrap break-words"
           >
             {{ payloadSummary(parsePayload(event.payload)!) }}
           </p>

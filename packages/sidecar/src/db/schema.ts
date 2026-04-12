@@ -5,6 +5,7 @@ export function applySchema(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS repos (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
+      alias TEXT,
       local_path TEXT NOT NULL UNIQUE,
       default_branch TEXT NOT NULL DEFAULT 'main',
       agent_provider TEXT,
@@ -201,6 +202,12 @@ export function applySchema(db: Database.Database): void {
   }
   if (!reqCols4.some(c => c.name === 'fetch_model')) {
     db.exec(`ALTER TABLE requirements ADD COLUMN fetch_model TEXT`)
+  }
+
+  // Migration: add alias column to repos
+  const repoCols = db.prepare(`PRAGMA table_info(repos)`).all() as { name: string }[]
+  if (!repoCols.some(c => c.name === 'alias')) {
+    db.exec(`ALTER TABLE repos ADD COLUMN alias TEXT`)
   }
 
   // Fix stale default: old schema created tables with phase_status DEFAULT 'running'.

@@ -81,10 +81,11 @@ function handleReject(feedback: string) {
           </button>
           <button
             v-if="run.status === 'running'"
-            class="px-2.5 py-1 text-[11px] font-medium rounded-md bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10 transition-colors"
+            class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-md bg-red-500 text-white hover:bg-red-600 active:bg-red-700 shadow-sm transition-colors"
             @click="emit('cancel', run.id)"
           >
-            取消
+            <span class="i-carbon-stop-filled w-3.5 h-3.5" />
+            取消运行
           </button>
         </div>
       </div>

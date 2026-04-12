@@ -13,6 +13,12 @@
           "name": "binaries/sidecar",
           "sidecar": true,
           "args": true
+        },
+        {
+          "name": "node",
+          "cmd": "node",
+          "args": true,
+          "sidecar": false
         }
       ]
     },
@@ -23,6 +29,12 @@
           "name": "binaries/sidecar",
           "sidecar": true,
           "args": true
+        },
+        {
+          "name": "node",
+          "cmd": "node",
+          "args": true,
+          "sidecar": false
         }
       ]
     },

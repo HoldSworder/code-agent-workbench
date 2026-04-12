@@ -106,6 +106,24 @@ export class Orchestrator {
     return this.leaderLoop.dispatchRequirement(requirementId)
   }
 
+  async cancelRun(runId: string): Promise<void> {
+    const run = this.repo.findRunById(runId)
+    if (!run || run.status !== 'running') return
+
+    if (this.leaderLoop) {
+      await this.leaderLoop.cancelCurrentProvider()
+    }
+
+    const assignments = this.repo.findAssignmentsByRunId(runId)
+    for (const a of assignments) {
+      if (a.status === 'pending' || a.status === 'running')
+        this.repo.updateAssignmentStatus(a.id, 'cancelled')
+    }
+    this.repo.updateRunStatus(runId, 'cancelled')
+    this.repo.appendEvent(runId, 'run_cancelled')
+    this.repo.updateRequirementStatus(run.requirement_id, 'pending')
+  }
+
   updateTeamConfig(config: TeamConfig): void {
     this.teamConfig = config
   }

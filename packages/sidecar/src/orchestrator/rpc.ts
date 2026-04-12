@@ -204,14 +204,7 @@ export function registerOrchestratorMethods(rpc: RpcServer, orchestrator: Orches
     if (!run) throw new Error(`Run not found: ${params.runId}`)
     if (run.status !== 'running') throw new Error(`Run is not running: ${run.status}`)
 
-    const assignments = repo.findAssignmentsByRunId(params.runId)
-    for (const a of assignments) {
-      if (a.status === 'pending' || a.status === 'running')
-        repo.updateAssignmentStatus(a.id, 'cancelled')
-    }
-    repo.updateRunStatus(params.runId, 'cancelled')
-    repo.appendEvent(params.runId, 'run_cancelled')
-    repo.updateRequirementStatus(run.requirement_id, 'pending')
+    await orchestrator.cancelRun(params.runId)
     return { success: true }
   })
 

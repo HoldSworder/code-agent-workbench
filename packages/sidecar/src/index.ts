@@ -28,7 +28,11 @@ function parseArg(name: string): string | undefined {
 const projectRoot = parseArg('project-root') ?? resolve(__dirname, '../../..')
 const workflowsDir = resolve(projectRoot, 'workflows')
 
-const dbPath = process.env.DB_PATH ?? parseArg('db-path') ?? resolve(projectRoot, 'data', 'code-agent.db')
+const dbPath = process.env.DB_PATH
+  ?? parseArg('db-path')
+  ?? (parseArg('project-root')
+    ? resolve(projectRoot, 'data', 'code-agent.db')
+    : resolve(__dirname, '..', 'code-agent.db'))
 const workflowPath = process.env.WORKFLOW_PATH ?? resolve(projectRoot, 'workflow.yaml')
 
 try { mkdirSync(dirname(dbPath), { recursive: true }) } catch {}

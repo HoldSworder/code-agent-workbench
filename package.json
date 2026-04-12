@@ -6,8 +6,8 @@
     "dev": "pnpm --filter @code-agent/desktop dev",
     "dev:sidecar": "pnpm --filter @code-agent/sidecar dev",
     "dev:consult": "pnpm --filter @code-agent/consult dev",
-    "dev:tauri": "PATH=\"$HOME/.cargo/bin:$PATH\" && pnpm --filter @code-agent/sidecar build:sea && pnpm --filter @code-agent/desktop tauri dev",
-    "build": "pnpm --filter @code-agent/sidecar build:sea && pnpm --filter @code-agent/consult build && pnpm --filter @code-agent/desktop build",
+    "dev:tauri": "PATH=\"$HOME/.cargo/bin:$PATH\" && pnpm --filter @code-agent/sidecar build && pnpm --filter @code-agent/desktop tauri dev",
+    "build": "pnpm --filter @code-agent/sidecar build:sea && pnpm --filter @code-agent/consult build && PATH=\"$HOME/.cargo/bin:$PATH\" pnpm --filter @code-agent/desktop tauri build",
     "build:consult": "pnpm --filter @code-agent/consult build",
     "test": "pnpm --filter @code-agent/sidecar test",
     "lint": "eslint ."

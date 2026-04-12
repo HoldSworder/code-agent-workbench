@@ -42,7 +42,7 @@ onMounted(async () => {
           active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"
         >
           <div class="i-carbon-folder-details w-4 h-4 opacity-60" />
-          {{ repo.name }}
+          {{ repo.alias || repo.name }}
         </router-link>
       </div>
 

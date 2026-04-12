@@ -42,8 +42,19 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
       return {
         id: `mock-${Date.now()}`,
         name: params.name,
+        alias: params.alias ?? null,
         local_path: params.local_path,
         default_branch: params.default_branch,
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      } as T
+    case 'repo.update':
+      return {
+        id: params.id,
+        name: params.name ?? 'mock',
+        alias: params.alias ?? null,
+        local_path: '',
+        default_branch: params.default_branch ?? 'main',
         agent_provider: null,
         created_at: new Date().toISOString(),
       } as T
@@ -388,7 +399,9 @@ export async function startSidecar(): Promise<void> {
   if (childProcess)
     return
 
-  const command = Command.sidecar('binaries/sidecar', ['--project-root', __PROJECT_ROOT__])
+  const command = __USE_SIDECAR_BIN__
+    ? Command.sidecar('binaries/sidecar', ['--project-root', __PROJECT_ROOT__])
+    : Command.create('node', [__SIDECAR_SCRIPT__])
   command.stdout.on('data', (line: string) => {
     buffer += line
     const lines = buffer.split('\n')

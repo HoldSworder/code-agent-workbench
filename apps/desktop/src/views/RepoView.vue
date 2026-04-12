@@ -149,9 +149,10 @@ const statusConfig: Record<string, { label: string, dotClass: string, badgeClass
   },
 }
 
-const repoName = computed(() =>
-  reposStore.repos.find(r => r.id === repoId.value)?.name ?? repoId.value,
-)
+const repoName = computed(() => {
+  const repo = reposStore.repos.find(r => r.id === repoId.value)
+  return repo?.alias || repo?.name || repoId.value
+})
 
 const requirementById = computed(() =>
   Object.fromEntries(requirementsStore.requirements.map(r => [r.id, r])),

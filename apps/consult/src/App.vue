@@ -94,7 +94,7 @@ function selectRepo(id: string) {
       <ChatView
         v-if="selectedRepo"
         :repo-id="selectedRepo.id"
-        :repo-name="selectedRepo.name"
+        :repo-name="selectedRepo.alias || selectedRepo.name"
       />
       <div v-else class="flex flex-col items-center justify-center h-full text-center px-6">
         <div class="relative mb-5">

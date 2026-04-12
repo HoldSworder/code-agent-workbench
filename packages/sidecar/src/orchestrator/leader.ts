@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { AgentProvider, PhaseContext, RunOptions } from '../providers/types'
 import { createWorktree, removeWorktree, git } from '../git/operations'
-import type { OrchestratorRepository } from './repository'
+import type { OrchestratorRepository, RequirementForLeader } from './repository'
 import type { TeamConfig, LeaderDecision, RoleConfig } from './types'
 import { runWorker } from './worker-runner'
 import type { WorkerRunnerDeps } from './worker-runner'
@@ -116,6 +116,13 @@ export class LeaderLoop {
     }
   }
 
+  async cancelCurrentProvider(): Promise<void> {
+    if (this.currentProvider) {
+      await this.currentProvider.cancel()
+      this.currentProvider = null
+    }
+  }
+
   async dispatchRequirement(requirementId: string): Promise<{ runId: string } | { error: string }> {
     const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
     const req = repo.findRequirementForDispatch(requirementId)
@@ -191,7 +198,7 @@ export class LeaderLoop {
   }
 
   private async processRequirement(
-    req: { id: string, title: string, description: string },
+    req: RequirementForLeader,
   ): Promise<string | null> {
     const { repo, teamConfig, repoPath, defaultBranch } = this.deps
 
@@ -219,7 +226,7 @@ export class LeaderLoop {
   }
 
   private async executeLeader(
-    req: { id: string, title: string, description: string },
+    req: RequirementForLeader,
     run: { id: string },
     leaderWorktree: string,
     leaderBranch: string,
@@ -228,7 +235,8 @@ export class LeaderLoop {
     const leaderRole = teamConfig.roles.leader
 
     const rejectFeedback = repo.getLastRejectFeedback(req.id)
-    const leaderPrompt = buildLeaderPrompt(leaderRole, req, rejectFeedback)
+    const repos = repo.findAllRepos()
+    const leaderPrompt = buildLeaderPrompt({ role: leaderRole, req, repos, rejectFeedback })
 
     const provider = resolveProvider(leaderRole)
     this.currentProvider = provider
@@ -273,6 +281,10 @@ export class LeaderLoop {
 
     // Cleanup Leader worktree
     try { await removeWorktree(repoPath, leaderWorktree) } catch {}
+
+    // If run was cancelled while provider was running, bail out
+    const currentRun = repo.findRunById(run.id)
+    if (currentRun?.status === 'cancelled') return
 
     // If provider outright failed, skip parsing retries
     if (providerFailed) {
@@ -368,6 +380,10 @@ export class LeaderLoop {
       title: assignmentInput.title,
     }))
 
+    // Re-check cancellation before spawning worker
+    const runBeforeWorker = repo.findRunById(run.id)
+    if (runBeforeWorker?.status === 'cancelled') return
+
     const workerDeps: WorkerRunnerDeps = {
       repo,
       resolveProvider,
@@ -426,11 +442,14 @@ ${rawOutput.slice(0, 500)}`
   }
 }
 
-function buildLeaderPrompt(
-  role: RoleConfig,
-  req: { id: string, title: string, description: string },
-  rejectFeedback: string | null,
-): string {
+interface BuildLeaderPromptInput {
+  role: RoleConfig
+  req: RequirementForLeader
+  repos: Array<{ id: string, name: string, local_path: string, default_branch: string }>
+  rejectFeedback: string | null
+}
+
+function buildLeaderPrompt({ role, req, repos, rejectFeedback }: BuildLeaderPromptInput): string {
   const parts = [
     role.prompt_template ?? '',
     '',
@@ -438,6 +457,16 @@ function buildLeaderPrompt(
     `**标题：** ${req.title}`,
     `**描述：** ${req.description}`,
   ]
+
+  if (req.source_url) parts.push(`**需求来源：** ${req.source_url}`)
+  if (req.doc_url) parts.push(`**需求文档：** ${req.doc_url}`)
+
+  if (repos.length > 0) {
+    parts.push('', '## 可用仓库')
+    for (const repo of repos)
+      parts.push(`- **${repo.name}**：\`${repo.local_path}\`（默认分支：${repo.default_branch}）`)
+    parts.push('', '请根据需求内容和仓库特征，将子任务分配到合适的仓库执行。')
+  }
 
   if (rejectFeedback) {
     parts.push(

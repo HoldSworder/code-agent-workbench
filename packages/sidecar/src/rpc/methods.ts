@@ -74,6 +74,7 @@ export function registerMethods(
   // ── Repo CRUD ──
   server.register('repo.list', async () => repoRepo.findAll())
   server.register('repo.create', async (params) => repoRepo.create(params))
+  server.register('repo.update', async ({ id, ...input }) => repoRepo.update(id, input))
   server.register('repo.delete', async ({ id }) => repoRepo.delete(id))
 
   server.register(

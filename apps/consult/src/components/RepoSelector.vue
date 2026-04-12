@@ -55,7 +55,7 @@ const emit = defineEmits<{
           <div
             class="text-[13px] font-medium truncate transition-colors"
             :class="selectedId === repo.id ? 'text-indigo-600 dark:text-indigo-300' : 'text-gray-700 dark:text-gray-300'"
-          >{{ repo.name }}</div>
+          >{{ repo.alias || repo.name }}</div>
           <div class="text-[10px] text-gray-400 dark:text-gray-600 truncate font-mono mt-0.5">{{ repo.local_path }}</div>
         </div>
         <div
