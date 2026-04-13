@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import type { OrchestratorRun, Assignment } from '../../stores/orchestrator'
 import OrchestratorRejectDialog from './OrchestratorRejectDialog.vue'
+import OrchestratorAgentOutput from './OrchestratorAgentOutput.vue'
 
 const props = defineProps<{
   run: OrchestratorRun
@@ -12,9 +13,19 @@ const emit = defineEmits<{
   cancel: [runId: string]
   reject: [runId: string, feedback: string]
   retry: [assignmentId: string]
+  retryRun: [runId: string]
 }>()
 
 const showRejectDialog = ref(false)
+const showLeaderOutput = ref(false)
+const expandedAssignments = ref<Set<string>>(new Set())
+
+function toggleAssignmentOutput(id: string) {
+  const s = new Set(expandedAssignments.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  expandedAssignments.value = s
+}
 
 const statusBadge: Record<string, { label: string, class: string }> = {
   running: { label: '运行中', class: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400' },
@@ -73,6 +84,14 @@ function handleReject(feedback: string) {
         </div>
         <div class="flex items-center gap-1.5">
           <button
+            v-if="run.status === 'failed' || run.status === 'blocked' || run.status === 'cancelled'"
+            class="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-md bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-500/10 dark:text-indigo-400 dark:hover:bg-indigo-500/20 transition-colors"
+            @click="emit('retryRun', run.id)"
+          >
+            <span class="i-carbon-restart w-3.5 h-3.5" />
+            重试
+          </button>
+          <button
             v-if="run.status === 'completed'"
             class="px-2.5 py-1 text-[11px] font-medium rounded-md bg-red-50 text-red-600 hover:bg-red-100 dark:bg-red-500/10 dark:text-red-400 dark:hover:bg-red-500/20 transition-colors"
             @click="showRejectDialog = true"
@@ -99,12 +118,32 @@ function handleReject(feedback: string) {
 
       <!-- Leader decision -->
       <div v-if="leaderDecision" class="mt-3 p-3 rounded-lg bg-gray-50 dark:bg-white/3">
-        <div class="text-[11px] font-semibold text-gray-400 uppercase tracking-widest mb-1.5">
-          Leader 决策
+        <div class="flex items-center justify-between mb-1.5">
+          <div class="text-[11px] font-semibold text-gray-400 uppercase tracking-widest">
+            Leader 决策
+          </div>
+          <button
+            class="text-[10px] px-1.5 py-0.5 rounded transition-colors"
+            :class="showLeaderOutput
+              ? 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400'
+              : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10'"
+            @click="showLeaderOutput = !showLeaderOutput"
+          >
+            {{ showLeaderOutput ? '收起对话' : '查看对话' }}
+          </button>
         </div>
         <div class="text-xs text-gray-600 dark:text-gray-300">
           {{ leaderDecision.reason }}
         </div>
+      </div>
+
+      <!-- Leader agent output -->
+      <div v-if="showLeaderOutput" class="mt-2">
+        <OrchestratorAgentOutput
+          :run-id="run.id"
+          label="Leader 对话"
+          :active="showLeaderOutput"
+        />
       </div>
 
       <!-- Reject feedback -->
@@ -163,13 +202,25 @@ function handleReject(feedback: string) {
             {{ a.description }}
           </p>
 
-          <div class="flex items-center gap-3 text-[11px] text-gray-400">
-            <span v-if="a.agent_provider">
-              {{ a.agent_provider }}{{ a.agent_model ? ` / ${a.agent_model}` : '' }}
-            </span>
-            <span v-if="a.branch_name" class="font-mono">
-              {{ a.branch_name }}
-            </span>
+          <div class="flex items-center justify-between text-[11px] text-gray-400">
+            <div class="flex items-center gap-3">
+              <span v-if="a.agent_provider">
+                {{ a.agent_provider }}{{ a.agent_model ? ` / ${a.agent_model}` : '' }}
+              </span>
+              <span v-if="a.branch_name" class="font-mono">
+                {{ a.branch_name }}
+              </span>
+            </div>
+            <button
+              v-if="a.status === 'running' || a.status === 'completed' || a.status === 'failed'"
+              class="text-[10px] px-1.5 py-0.5 rounded transition-colors"
+              :class="expandedAssignments.has(a.id)
+                ? 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/10 dark:text-indigo-400'
+                : 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-white/5 dark:text-gray-400 dark:hover:bg-white/10'"
+              @click="toggleAssignmentOutput(a.id)"
+            >
+              {{ expandedAssignments.has(a.id) ? '收起对话' : '查看对话' }}
+            </button>
           </div>
 
           <div
@@ -177,6 +228,16 @@ function handleReject(feedback: string) {
             class="mt-2 p-2 rounded bg-red-50 dark:bg-red-500/5 text-[11px] text-red-600 dark:text-red-400 font-mono break-all"
           >
             {{ a.error_message }}
+          </div>
+
+          <!-- Worker agent output -->
+          <div v-if="expandedAssignments.has(a.id)" class="mt-2">
+            <OrchestratorAgentOutput
+              :run-id="run.id"
+              :assignment-id="a.id"
+              :label="`${a.role} 对话`"
+              :active="expandedAssignments.has(a.id)"
+            />
           </div>
         </div>
       </div>

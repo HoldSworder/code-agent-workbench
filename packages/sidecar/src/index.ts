@@ -222,7 +222,7 @@ engine.recoverMcpBackups()
 
 // ── Orchestrator (multi-agent, independent from WorkflowEngine) ──
 
-const teamYamlPath = process.env.TEAM_YAML_PATH ?? resolve(projectRoot, 'team.yaml')
+const teamYamlPath = process.env.TEAM_YAML_PATH ?? resolve(projectRoot, 'workflows', 'orchestrator', 'team.yaml')
 let orchestrator: Orchestrator | null = null
 
 try {

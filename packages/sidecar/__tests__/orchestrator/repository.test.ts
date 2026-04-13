@@ -198,6 +198,45 @@ describe('OrchestratorRepository', () => {
     ).toEqual({ status: 'orchestrating' })
   })
 
+  it('createAssignment persists repo_id', () => {
+    const run = repo.createRun({ requirement_id: 'req-1', team_config: '{}' })
+    const a = repo.createAssignment({
+      run_id: run.id,
+      role: 'worker',
+      repo_id: 'my-repo-id',
+      title: 'T',
+      description: 'D',
+    })
+    expect(a.repo_id).toBe('my-repo-id')
+
+    const found = repo.findAssignmentById(a.id)!
+    expect(found.repo_id).toBe('my-repo-id')
+  })
+
+  it('createAssignment defaults repo_id to null', () => {
+    const run = repo.createRun({ requirement_id: 'req-1', team_config: '{}' })
+    const a = repo.createAssignment({
+      run_id: run.id,
+      role: 'worker',
+      title: 'T',
+      description: 'D',
+    })
+    expect(a.repo_id).toBeNull()
+  })
+
+  it('findRepoById returns matching repo or null', () => {
+    db.prepare(
+      `INSERT INTO repos (id, name, local_path, default_branch) VALUES (?, ?, ?, ?)`,
+    ).run('repo-1', 'frontend', '/path/to/frontend', 'main')
+
+    const found = repo.findRepoById('repo-1')
+    expect(found).not.toBeNull()
+    expect(found!.name).toBe('frontend')
+    expect(found!.local_path).toBe('/path/to/frontend')
+
+    expect(repo.findRepoById('nonexistent')).toBeNull()
+  })
+
   it('getLastRejectFeedback returns the most recent non-null feedback', () => {
     const r1 = repo.createRun({ requirement_id: 'req-1', team_config: '{}' })
     const r2 = repo.createRun({ requirement_id: 'req-1', team_config: '{}' })

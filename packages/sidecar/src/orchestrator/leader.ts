@@ -1,14 +1,11 @@
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { AgentProvider, PhaseContext, RunOptions } from '../providers/types'
-import { createWorktree, removeWorktree, git } from '../git/operations'
 import type { OrchestratorRepository, RequirementForLeader } from './repository'
 import type { TeamConfig, LeaderDecision, RoleConfig } from './types'
 import { runWorker } from './worker-runner'
 import type { WorkerRunnerDeps } from './worker-runner'
 import { fetchLarkDocContent } from './lark-fetcher'
+import { AgentOutputBuffer } from './output-buffer'
 
 const LeaderDecisionSchema = z.object({
   decision: z.enum(['single_worker', 'split', 'blocked']),
@@ -16,6 +13,7 @@ const LeaderDecisionSchema = z.object({
   assignments: z.array(
     z.object({
       role: z.string(),
+      repo_id: z.string().optional(),
       title: z.string(),
       description: z.string(),
       acceptance_criteria: z.string().optional(),
@@ -86,6 +84,7 @@ export interface LeaderLoopDeps {
   resolveProvider: (role: RoleConfig) => AgentProvider
   repoPath: string
   defaultBranch: string
+  outputBuffer?: AgentOutputBuffer
   onChunk?: RunOptions['onChunk']
   onEvent?: (event: string, data?: unknown) => void
 }
@@ -125,7 +124,7 @@ export class LeaderLoop {
   }
 
   async dispatchRequirement(requirementId: string): Promise<{ runId: string } | { error: string }> {
-    const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
+    const { repo, teamConfig, repoPath, onChunk } = this.deps
     const req = repo.findRequirementForDispatch(requirementId)
     if (!req) return { error: 'Requirement not found or not in pending state' }
     if (!repo.claimRequirement(req.id)) return { error: 'Failed to claim requirement (concurrent dispatch?)' }
@@ -135,24 +134,11 @@ export class LeaderLoop {
       team_config: JSON.stringify(teamConfig),
     })
 
-    const leaderWorktree = join(tmpdir(), `code-agent-leader-${randomUUID().slice(0, 8)}`)
-    const leaderBranch = `orchestrator/leader-${randomUUID().slice(0, 6)}`
-
-    try {
-      await createWorktree(repoPath, leaderWorktree, leaderBranch, defaultBranch)
-    }
-    catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      repo.updateRunStatus(run.id, 'failed')
-      repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({ reason: `Worktree creation failed: ${msg}` }))
-      repo.updateRequirementStatus(req.id, 'pending')
-      this.deps.onEvent?.('leader_worktree_failed', { error: msg })
-      return { error: `Git worktree 创建失败: ${msg}` }
-    }
+    const leaderCwd = this.resolveLeaderCwd()
 
     repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
 
-    this.executeLeader(req, run, leaderWorktree, leaderBranch).catch((err) => {
+    this.executeLeader(req, run, leaderCwd).catch((err) => {
       const errMsg = err instanceof Error ? err.message : String(err)
       this.deps.onEvent?.('leader_execution_error', { error: errMsg, runId: run.id })
       try {
@@ -201,20 +187,9 @@ export class LeaderLoop {
   private async processRequirement(
     req: RequirementForLeader,
   ): Promise<string | null> {
-    const { repo, teamConfig, repoPath, defaultBranch } = this.deps
+    const { repo, teamConfig } = this.deps
 
-    const leaderWorktree = join(tmpdir(), `code-agent-leader-${randomUUID().slice(0, 8)}`)
-    const leaderBranch = `orchestrator/leader-${randomUUID().slice(0, 6)}`
-
-    try {
-      await createWorktree(repoPath, leaderWorktree, leaderBranch, defaultBranch)
-    }
-    catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      repo.updateRequirementStatus(req.id, 'pending')
-      this.deps.onEvent?.('leader_worktree_failed', { error: msg })
-      return null
-    }
+    const leaderCwd = this.resolveLeaderCwd()
 
     const run = repo.createRun({
       requirement_id: req.id,
@@ -222,15 +197,20 @@ export class LeaderLoop {
     })
     repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
 
-    await this.executeLeader(req, run, leaderWorktree, leaderBranch)
+    await this.executeLeader(req, run, leaderCwd)
     return run.id
+  }
+
+  private resolveLeaderCwd(): string {
+    const repos = this.deps.repo.findAllRepos()
+    if (repos.length > 0) return repos[0].local_path
+    return this.deps.repoPath
   }
 
   private async executeLeader(
     req: RequirementForLeader,
     run: { id: string },
-    leaderWorktree: string,
-    leaderBranch: string,
+    leaderCwd: string,
   ): Promise<void> {
     const { repo, teamConfig, resolveProvider, repoPath, defaultBranch, onChunk } = this.deps
     const leaderRole = teamConfig.roles.leader
@@ -252,7 +232,10 @@ export class LeaderLoop {
 
     const rejectFeedback = repo.getLastRejectFeedback(req.id)
     const repos = repo.findAllRepos()
-    const leaderPrompt = buildLeaderPrompt({ role: leaderRole, req, repos, rejectFeedback, docContent })
+    const availableRoles = Object.entries(teamConfig.roles)
+      .filter(([id]) => id !== 'leader')
+      .map(([id, cfg]) => ({ id, description: cfg.description }))
+    const leaderPrompt = buildLeaderPrompt({ role: leaderRole, req, repos, availableRoles, rejectFeedback, docContent })
 
     const provider = resolveProvider(leaderRole)
     this.currentProvider = provider
@@ -261,21 +244,35 @@ export class LeaderLoop {
       stageId: 'orchestrator',
       stageName: 'Orchestrator',
       phaseId: 'leader-analyze',
-      repoPath: leaderWorktree,
-      openspecPath: leaderWorktree,
-      branchName: leaderBranch,
+      repoPath: leaderCwd,
+      openspecPath: leaderCwd,
+      branchName: '',
       skillContent: leaderPrompt,
       requirementTitle: req.title,
       requirementDescription: req.description,
+    }
+
+    const { outputBuffer } = this.deps
+    const bufferKey = outputBuffer
+      ? AgentOutputBuffer.leaderKey(run.id)
+      : ''
+    const leaderOnChunk = (chunk: string) => {
+      onChunk?.(chunk)
+      if (outputBuffer) outputBuffer.append(bufferKey, chunk)
     }
 
     let rawOutput = ''
     let providerFailed = false
     let providerError = ''
     try {
-      const result = await provider.run(context, { onChunk })
+      const result = await provider.run(context, { onChunk: leaderOnChunk })
       rawOutput = result.output ?? ''
       this.currentProvider = null
+
+      if (outputBuffer && rawOutput) {
+        const existing = outputBuffer.get(bufferKey)
+        if (existing.totalLength === 0) outputBuffer.append(bufferKey, rawOutput)
+      }
 
       if (result.status === 'failed' || result.status === 'cancelled') {
         providerFailed = true
@@ -294,9 +291,6 @@ export class LeaderLoop {
       repo.appendEvent(run.id, 'leader_agent_error', null, JSON.stringify({ error: providerError }))
       rawOutput = ''
     }
-
-    // Cleanup Leader worktree
-    try { await removeWorktree(repoPath, leaderWorktree) } catch {}
 
     // If run was cancelled while provider was running, bail out
     const currentRun = repo.findRunById(run.id)
@@ -358,11 +352,8 @@ export class LeaderLoop {
       return
     }
 
-    const assignmentsToCreate = decision.decision === 'split'
-      ? [decision.assignments[0]]
-      : decision.assignments.slice(0, 1)
-
-    if (!assignmentsToCreate.length || !assignmentsToCreate[0]) {
+    const assignmentsToCreate = decision.assignments
+    if (!assignmentsToCreate.length) {
       repo.updateRunStatus(run.id, 'failed')
       repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({
         reason: 'Leader decision had no assignments',
@@ -371,50 +362,84 @@ export class LeaderLoop {
       return
     }
 
-    const assignmentInput = assignmentsToCreate[0]
-    const role = teamConfig.roles[assignmentInput.role]
-    if (!role) {
-      repo.updateRunStatus(run.id, 'failed')
-      repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({
-        reason: `Unknown role: ${assignmentInput.role}`,
-      }))
-      repo.updateRequirementStatus(req.id, 'pending')
-      return
-    }
-
-    const assignment = repo.createAssignment({
-      run_id: run.id,
-      role: assignmentInput.role,
-      title: assignmentInput.title,
-      description: assignmentInput.description,
-      acceptance_criteria: assignmentInput.acceptance_criteria,
-      agent_provider: role.provider,
-      agent_model: role.model,
-    })
-    repo.appendEvent(run.id, 'task_assigned', assignment.id, JSON.stringify({
-      role: assignmentInput.role,
-      title: assignmentInput.title,
-    }))
-
-    // Re-check cancellation before spawning worker
-    const runBeforeWorker = repo.findRunById(run.id)
-    if (runBeforeWorker?.status === 'cancelled') return
-
-    const workerDeps: WorkerRunnerDeps = {
-      repo,
-      resolveProvider,
-      repoPath,
-      defaultBranch,
-      onChunk,
-    }
+    const workerRoleIds = Object.keys(teamConfig.roles).filter(k => k !== 'leader')
+    const fallbackRoleId = workerRoleIds[0]
 
     const requirementContextParts = [req.title, '', req.description]
     if (docContent)
       requirementContextParts.push('', '## 需求文档内容', '', docContent)
     const requirementContext = requirementContextParts.join('\n')
-    const workerResult = await runWorker(workerDeps, assignment, role, requirementContext)
 
-    if (workerResult.phaseResult.status === 'success') {
+    let allSucceeded = true
+    for (const assignmentInput of assignmentsToCreate) {
+      const runCheck = repo.findRunById(run.id)
+      if (runCheck?.status === 'cancelled') return
+
+      let roleId = assignmentInput.role
+      let role = teamConfig.roles[roleId]
+      if (!role && fallbackRoleId) {
+        repo.appendEvent(run.id, 'task_assigned', null, JSON.stringify({
+          warning: `Unknown role "${roleId}", falling back to "${fallbackRoleId}"`,
+        }))
+        roleId = fallbackRoleId
+        role = teamConfig.roles[roleId]!
+      }
+      if (!role) {
+        repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({
+          reason: `Unknown role: ${roleId} (no fallback available)`,
+        }))
+        allSucceeded = false
+        continue
+      }
+
+      let targetRepoPath = repoPath
+      let targetDefaultBranch = defaultBranch
+      if (assignmentInput.repo_id) {
+        const targetRepo = repos.find(r => r.id === assignmentInput.repo_id)
+          ?? repos.find(r => r.name === assignmentInput.repo_id)
+        if (targetRepo) {
+          targetRepoPath = targetRepo.local_path
+          targetDefaultBranch = targetRepo.default_branch
+        }
+        else {
+          repo.appendEvent(run.id, 'task_assigned', null, JSON.stringify({
+            warning: `Unknown repo_id "${assignmentInput.repo_id}", using default repo`,
+          }))
+        }
+      }
+
+      const assignment = repo.createAssignment({
+        run_id: run.id,
+        role: roleId,
+        repo_id: assignmentInput.repo_id,
+        title: assignmentInput.title,
+        description: assignmentInput.description,
+        acceptance_criteria: assignmentInput.acceptance_criteria,
+        agent_provider: role.provider,
+        agent_model: role.model,
+      })
+      repo.appendEvent(run.id, 'task_assigned', assignment.id, JSON.stringify({
+        role: roleId,
+        repo_id: assignmentInput.repo_id,
+        title: assignmentInput.title,
+      }))
+
+      const workerDeps: WorkerRunnerDeps = {
+        repo,
+        resolveProvider,
+        repoPath: targetRepoPath,
+        defaultBranch: targetDefaultBranch,
+        outputBuffer: this.deps.outputBuffer,
+        onChunk,
+      }
+
+      const workerResult = await runWorker(workerDeps, assignment, role, requirementContext)
+      if (workerResult.phaseResult.status !== 'success') {
+        allSucceeded = false
+      }
+    }
+
+    if (allSucceeded) {
       repo.updateRunStatus(run.id, 'completed')
       repo.appendEvent(run.id, 'run_completed')
       repo.updateRequirementStatus(req.id, 'pending_acceptance')
@@ -422,7 +447,7 @@ export class LeaderLoop {
     else {
       repo.updateRunStatus(run.id, 'failed')
       repo.appendEvent(run.id, 'run_failed', null, JSON.stringify({
-        reason: workerResult.phaseResult.error,
+        reason: 'One or more worker assignments failed',
       }))
     }
   }
@@ -433,17 +458,27 @@ export class LeaderLoop {
     rawOutput: string,
     runId: string,
   ): Promise<LeaderDecision | null> {
-    const repairPrompt = `你之前的输出无法解析为有效的 JSON。请重新输出，使用 <decision> 标签包裹：
+    const repairPrompt = `你之前的输出无法解析为有效 JSON。请在回复的最后用 <decision> 标签包裹你的 JSON 决策。
+
+格式示例：
 
 <decision>
 {
-  "decision": "single_worker" 或 "split" 或 "blocked",
-  "reason": "原因",
-  "assignments": [...]
+  "decision": "single_worker",
+  "reason": "决策原因",
+  "assignments": [
+    {
+      "role": "角色ID",
+      "repo_id": "仓库ID",
+      "title": "任务标题",
+      "description": "详细描述",
+      "acceptance_criteria": "验收标准"
+    }
+  ]
 }
 </decision>
 
-之前的输出片段：
+你之前的输出片段：
 ${rawOutput.slice(0, 500)}`
 
     const retryContext: PhaseContext = {
@@ -465,19 +500,33 @@ interface BuildLeaderPromptInput {
   role: RoleConfig
   req: RequirementForLeader
   repos: Array<{ id: string, name: string, local_path: string, default_branch: string }>
+  availableRoles: Array<{ id: string, description: string }>
   rejectFeedback: string | null
   docContent?: string
 }
 
-function buildLeaderPrompt({ role, req, repos, rejectFeedback, docContent }: BuildLeaderPromptInput): string {
+function buildLeaderPrompt({ role, req, repos, availableRoles, rejectFeedback, docContent }: BuildLeaderPromptInput): string {
+  const roleIdList = availableRoles.map(r => r.id).join(', ')
+  const repoIdList = repos.map(r => r.id).join(', ')
+
   const parts = [
     role.prompt_template ?? '',
     '',
     '## 工作模式',
     '',
-    '你是一个全权自主决策的技术 Leader，不需要征求任何人的意见。',
-    '直接根据需求内容、代码库现状和你的专业判断做出决策。',
-    '禁止输出任何"是否继续？""请确认""需要你的意见"等交互式提问。',
+    '你是一个全权自主决策的技术 Leader，负责分析需求并拆分为可独立执行的开发任务。',
+    '你可以浏览代码库来了解项目结构和实现细节，但**最终必须输出 `<decision>` JSON 决策**。',
+    '',
+    '### 决策原则',
+    '1. **自主决策** — 根据需求内容、代码库现状和专业判断做出决策，禁止输出交互式提问',
+    '2. **仓库路由** — 根据需求涉及的技术栈和代码模块，判断子任务属于哪个仓库',
+    '3. **任务粒度** — 每个子任务应当：可独立完成、有明确的验收标准、description 中包含足够上下文（worker 不会看到原始需求文档）',
+    '4. **角色匹配** — 根据子任务的技术领域选择最合适的角色',
+    '',
+    '### 决策类型',
+    '- `single_worker`：需求简单明确，只涉及一个仓库/角色，分配一个任务即可',
+    '- `split`：需求涉及多个模块/仓库/角色，拆分为多个独立子任务',
+    '- `blocked`：需求信息不足或存在外部依赖无法继续，给出阻塞原因',
     '',
     '## 需求信息',
     `**标题：** ${req.title}`,
@@ -496,11 +545,30 @@ function buildLeaderPrompt({ role, req, repos, rejectFeedback, docContent }: Bui
     )
   }
 
+  if (availableRoles.length > 0) {
+    parts.push(
+      '',
+      '## 可分配的角色',
+      '',
+      '> 你必须且只能从以下角色中选择，禁止使用其他角色名。',
+      '',
+    )
+    for (const r of availableRoles)
+      parts.push(`- \`${r.id}\`：${r.description}`)
+  }
+
   if (repos.length > 0) {
-    parts.push('', '## 可用仓库')
+    parts.push(
+      '',
+      '## 可用代码仓库',
+      '',
+      '> 你可以通过绝对路径浏览以下任意仓库的代码来了解项目结构。',
+      '> 你必须根据需求内容判断每个子任务属于哪个仓库，并通过 `repo_id` 字段指定。',
+      '> 如果需求涉及多个仓库，请拆分为多个 assignment，每个指向不同的仓库。',
+      '',
+    )
     for (const repo of repos)
-      parts.push(`- **${repo.name}**：\`${repo.local_path}\`（默认分支：${repo.default_branch}）`)
-    parts.push('', '请根据需求内容和仓库特征，将子任务分配到合适的仓库执行。')
+      parts.push(`- ID: \`${repo.id}\`，名称: **${repo.name}**，路径: \`${repo.local_path}\`（默认分支：${repo.default_branch}）`)
   }
 
   if (rejectFeedback) {
@@ -514,22 +582,38 @@ function buildLeaderPrompt({ role, req, repos, rejectFeedback, docContent }: Bui
 
   parts.push(
     '',
-    '请分析该需求和当前代码库，然后用 <decision> 标签输出你的决策 JSON：',
+    '## 输出格式',
     '',
+    '分析完成后，用 `<decision>` 标签包裹你的决策 JSON（**只输出 JSON，不要在标签内写其他文字**）：',
+    '',
+    '```',
     '<decision>',
     '{',
-    '  "decision": "single_worker" | "split" | "blocked",',
-    '  "reason": "决策原因",',
+    '  "decision": "single_worker | split | blocked",',
+    '  "reason": "决策原因（简述为什么选择此决策类型）",',
     '  "assignments": [',
     '    {',
-    '      "role": "角色ID（对应 team.yaml 中的角色）",',
+    `      "role": "${roleIdList || '角色ID'}",`,
+    `      "repo_id": "${repoIdList || '仓库ID'}",`,
     '      "title": "子任务标题",',
-    '      "description": "详细描述（必须包含足够的上下文，使 worker 无需再看需求文档即可独立完成）",',
-    '      "acceptance_criteria": "验收标准"',
+    '      "description": "详细描述（必须包含完整上下文：要改哪些文件/模块、具体实现思路、相关接口和数据结构）",',
+    '      "acceptance_criteria": "验收标准（可验证的具体条件）"',
     '    }',
     '  ]',
     '}',
     '</decision>',
+    '```',
+    '',
+    '### 约束',
+    `- \`role\` 必须是：${roleIdList || '（无可用角色）'}`,
+    `- \`repo_id\` 必须是：${repoIdList || '（无可用仓库）'}`,
+    '- `single_worker` 时 assignments 只有 1 个元素',
+    '- `split` 时 assignments 有 2 个或更多元素',
+    '- `blocked` 时 assignments 为空数组 `[]`',
+    '- 每个 assignment 的 `description` 必须自包含，worker 看不到原始需求文档',
+    '',
+    '',
+    '⚠️ **最终输出要求：浏览代码完成分析后，你必须输出 `<decision>` 标签包裹的 JSON。不输出 `<decision>` 会导致任务失败。禁止只输出分析文本而不给出决策 JSON。**',
   )
 
   return parts.join('\n')

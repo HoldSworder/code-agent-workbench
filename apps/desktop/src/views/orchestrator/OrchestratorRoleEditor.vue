@@ -3,10 +3,23 @@ import { ref, watch } from 'vue'
 import type { RoleInput } from '../../stores/orchestrator'
 import AgentSelector from '../../components/AgentSelector.vue'
 
+export interface WorkerRoleSummary {
+  id: string
+  description: string
+}
+
+export interface RepoSummary {
+  id: string
+  name: string
+  local_path: string
+}
+
 const props = defineProps<{
   roleId: string
   role: RoleInput
   isLeader: boolean
+  workerRoles?: WorkerRoleSummary[]
+  repos?: RepoSummary[]
 }>()
 
 const emit = defineEmits<{
@@ -91,6 +104,47 @@ function save() {
         <p class="role-hint">
           支持变量: <code class="role-code">{requirement}</code> <code class="role-code">{plan}</code> <code class="role-code">{repo_path}</code>
         </p>
+      </div>
+
+      <!-- Leader auto-inject context -->
+      <div v-if="isLeader && (workerRoles?.length || repos?.length)" class="inject-panel">
+        <div class="flex items-center gap-1.5 mb-2.5">
+          <div class="i-carbon-flash w-3.5 h-3.5 text-amber-500" />
+          <span class="text-[11px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">运行时自动注入</span>
+        </div>
+        <p class="text-[11px] text-gray-400 dark:text-gray-500 mb-3 leading-relaxed">
+          以下信息会在 Leader 运行时自动附加到 Prompt 末尾，无需手动编写。
+        </p>
+
+        <div v-if="workerRoles?.length" class="mb-3">
+          <div class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">可分配角色</div>
+          <div class="flex flex-wrap gap-1.5">
+            <span
+              v-for="r in workerRoles"
+              :key="r.id"
+              class="inject-tag"
+              :title="r.description"
+            >
+              <div class="i-carbon-user-role w-3 h-3 text-indigo-400 shrink-0" />
+              {{ r.id }}
+            </span>
+          </div>
+        </div>
+
+        <div v-if="repos?.length">
+          <div class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">可用仓库</div>
+          <div class="flex flex-wrap gap-1.5">
+            <span
+              v-for="repo in repos"
+              :key="repo.id"
+              class="inject-tag"
+              :title="repo.local_path"
+            >
+              <div class="i-carbon-repo-source-code w-3 h-3 text-emerald-400 shrink-0" />
+              {{ repo.name }}
+            </span>
+          </div>
+        </div>
       </div>
 
       <!-- Actions -->
@@ -254,5 +308,35 @@ textarea.role-input {
 }
 .role-save-btn:active {
   transform: scale(0.97);
+}
+
+.inject-panel {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #fefce8;
+  border: 1px solid rgba(234, 179, 8, 0.15);
+}
+:is(.dark) .inject-panel {
+  background: rgba(234, 179, 8, 0.04);
+  border-color: rgba(234, 179, 8, 0.1);
+}
+
+.inject-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  background: white;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  color: #374151;
+}
+:is(.dark) .inject-tag {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #d1d5db;
 }
 </style>

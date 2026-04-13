@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useOrchestratorStore } from '../../stores/orchestrator'
+import { useReposStore } from '../../stores/repos'
 import type { RoleInput, TeamConfigInput } from '../../stores/orchestrator'
 import OrchestratorRoleEditor from './OrchestratorRoleEditor.vue'
 import AgencyAgentBrowser from './AgencyAgentBrowser.vue'
 
 const store = useOrchestratorStore()
+const reposStore = useReposStore()
 
 const editingRoleId = ref<string | null>(null)
 const showAddRole = ref(false)
@@ -20,7 +22,7 @@ const teamDescription = ref('')
 const pollingInterval = ref(30)
 
 onMounted(async () => {
-  await store.fetchTeamConfig()
+  await Promise.all([store.fetchTeamConfig(), reposStore.fetchAll()])
   syncFromConfig()
 })
 
@@ -52,6 +54,16 @@ const roles = computed(() => {
     ...role,
   }))
 })
+
+const workerRoles = computed(() =>
+  roles.value
+    .filter(r => r.id !== 'leader')
+    .map(r => ({ id: r.id, description: r.description })),
+)
+
+const reposSummary = computed(() =>
+  reposStore.repos.map(r => ({ id: r.id, name: r.name, local_path: r.local_path })),
+)
 
 function startEdit(roleId: string) {
   editingRoleId.value = roleId
@@ -305,6 +317,8 @@ async function saveGeneralSettings() {
                 :role-id="r.id"
                 :role="r"
                 :is-leader="r.id === 'leader'"
+                :worker-roles="workerRoles"
+                :repos="reposSummary"
                 @update="handleUpdateRole"
                 @delete="handleDeleteRole"
                 @cancel="editingRoleId = null"

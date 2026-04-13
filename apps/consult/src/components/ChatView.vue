@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, nextTick, watch } from 'vue'
 import { sendChat, deleteSession, type ChatEvent } from '../composables/use-api'
+import { getMessages, getSessionId, saveMessages, saveSessionId, clearChat, type ChatMessage } from '../composables/use-chat-store'
 import MessageBubble from './MessageBubble.vue'
 
 const props = defineProps<{
@@ -8,16 +9,11 @@ const props = defineProps<{
   repoName: string
 }>()
 
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-}
-
-const messages = ref<Message[]>([])
+const messages = ref<ChatMessage[]>(getMessages(props.repoId))
 const input = ref('')
 const sending = ref(false)
 const streamingText = ref('')
-const sessionId = ref<string | null>(null)
+const sessionId = ref<string | null>(getSessionId(props.repoId))
 const messagesContainer = ref<HTMLElement | null>(null)
 let currentAbort: (() => void) | null = null
 
@@ -28,15 +24,15 @@ const suggestions = [
   { icon: 'i-carbon-settings', text: '使用了哪些关键依赖？' },
 ]
 
-watch(() => props.repoId, () => {
-  if (sessionId.value) {
-    deleteSession(sessionId.value).catch(() => {})
-  }
-  messages.value = []
+watch(() => props.repoId, (newId) => {
+  currentAbort?.()
   streamingText.value = ''
-  sessionId.value = null
   sending.value = false
   currentAbort = null
+
+  messages.value = getMessages(newId)
+  sessionId.value = getSessionId(newId)
+  nextTick(scrollToBottom)
 })
 
 function scrollToBottom() {
@@ -52,6 +48,7 @@ function handleSend(text?: string) {
   if (!msg || sending.value) return
 
   messages.value.push({ role: 'user', content: msg })
+  saveMessages(props.repoId, messages.value)
   input.value = ''
   sending.value = true
   streamingText.value = ''
@@ -63,6 +60,7 @@ function handleSend(text?: string) {
       switch (event.type) {
         case 'session':
           sessionId.value = event.sessionId ?? null
+          saveSessionId(props.repoId, sessionId.value)
           break
         case 'chunk':
           streamingText.value += event.text ?? ''
@@ -70,6 +68,7 @@ function handleSend(text?: string) {
           break
         case 'done':
           messages.value.push({ role: 'assistant', content: event.fullText ?? streamingText.value })
+          saveMessages(props.repoId, messages.value)
           streamingText.value = ''
           sending.value = false
           currentAbort = null
@@ -80,6 +79,7 @@ function handleSend(text?: string) {
             messages.value.push({ role: 'assistant', content: streamingText.value })
           }
           messages.value.push({ role: 'assistant', content: `_Error: ${event.message}_` })
+          saveMessages(props.repoId, messages.value)
           streamingText.value = ''
           sending.value = false
           currentAbort = null
@@ -95,6 +95,7 @@ function handleStop() {
   currentAbort?.()
   if (streamingText.value) {
     messages.value.push({ role: 'assistant', content: streamingText.value })
+    saveMessages(props.repoId, messages.value)
   }
   streamingText.value = ''
   sending.value = false
@@ -105,6 +106,7 @@ function handleNewChat() {
   if (sessionId.value) {
     deleteSession(sessionId.value).catch(() => {})
   }
+  clearChat(props.repoId)
   messages.value = []
   streamingText.value = ''
   sessionId.value = null

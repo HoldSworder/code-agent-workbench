@@ -1,10 +1,11 @@
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { stringify as yamlStringify } from 'yaml'
 import type { RpcServer } from '../rpc/server'
 import type { Orchestrator } from './orchestrator'
 import { parseTeamConfig } from './team-parser'
 import { fetchAgencyCatalog, fetchAgentPrompt } from './agency-agents'
+import { AgentOutputBuffer } from './output-buffer'
 
 interface RoleInput {
   description: string
@@ -21,16 +22,39 @@ interface TeamConfigInput {
   roles: Record<string, RoleInput>
 }
 
+const LEADER_PROMPT = [
+  '# 技术 Leader Agent',
+  '',
+  '你是一个经验丰富的技术 Leader，负责：',
+  '1. 深度分析需求，理解业务意图和技术实现要点',
+  '2. 评估需求涉及的代码仓库和技术模块',
+  '3. 将需求拆分为可独立执行的子任务，分配给合适的角色和仓库',
+  '',
+  '你的分析应当覆盖：',
+  '- 需求的核心功能点和边界条件',
+  '- 涉及的前后端模块、API 接口、数据库变更',
+  '- 子任务间的依赖关系（尽量拆分为无依赖的独立任务）',
+  '- 每个子任务的验收标准',
+  '',
+  '使用 <decision> 标签包裹你的 JSON 决策。',
+].join('\n')
+
 const DEFAULT_TEAM_CONFIG: TeamConfigInput = {
   name: 'default-team',
   description: '默认多 Agent 开发团队',
   polling: { interval_seconds: 30, board_filter: { status: 'pending' } },
   roles: {
     leader: {
-      description: '分析需求、拆分任务、分配给合适的角色',
+      description: '分析需求、拆分任务、分配给合适的角色和仓库',
       provider: 'claude-code',
       model: '',
-      prompt_template: '你是一个技术 Leader。分析需求并拆分为可执行的子任务。\n\n使用 <decision> 标签包裹你的 JSON 决策。',
+      prompt_template: LEADER_PROMPT,
+    },
+    developer: {
+      description: '全栈开发，负责功能实现、代码编写和单元测试',
+      provider: 'claude-code',
+      model: '',
+      prompt_template: '你是一个高级全栈开发工程师。根据任务描述独立完成功能开发，确保代码质量和测试覆盖。',
     },
   },
 }
@@ -91,6 +115,7 @@ export function registerTeamConfigMethods(
     // Validate through Zod
     const validated = parseTeamConfig(yamlContent, baseDir)
 
+    mkdirSync(baseDir, { recursive: true })
     writeFileSync(teamYamlPath, yamlContent, 'utf-8')
 
     const orchestrator = getOrchestrator()
@@ -104,6 +129,7 @@ export function registerTeamConfigMethods(
     if (existsSync(teamYamlPath))
       throw new Error('team.yaml already exists')
 
+    mkdirSync(dirname(teamYamlPath), { recursive: true })
     const yamlContent = yamlStringify(DEFAULT_TEAM_CONFIG)
     writeFileSync(teamYamlPath, yamlContent, 'utf-8')
     return { success: true, path: teamYamlPath }
@@ -220,6 +246,21 @@ export function registerOrchestratorMethods(rpc: RpcServer, orchestrator: Orches
     return { success: true }
   })
 
+  rpc.register('orchestrator.retryRun', async (params: { runId: string }) => {
+    const run = repo.findRunById(params.runId)
+    if (!run) throw new Error(`Run not found: ${params.runId}`)
+
+    const RETRYABLE: string[] = ['failed', 'blocked', 'cancelled']
+    if (!RETRYABLE.includes(run.status))
+      throw new Error(`Run status "${run.status}" cannot be retried`)
+
+    repo.updateRequirementStatus(run.requirement_id, 'pending')
+    const result = await orchestrator.dispatchRequirement(run.requirement_id)
+    if ('error' in result)
+      throw new Error(result.error)
+    return { success: true, newRunId: result.runId }
+  })
+
   rpc.register('orchestrator.retryAssignment', async (params: { assignmentId: string }) => {
     const assignment = repo.findAssignmentById(params.assignmentId)
     if (!assignment) throw new Error(`Assignment not found: ${params.assignmentId}`)
@@ -236,6 +277,17 @@ export function registerOrchestratorMethods(rpc: RpcServer, orchestrator: Orches
 
     repo.updateAssignmentStatus(params.assignmentId, 'cancelled')
     return { success: true }
+  })
+
+  rpc.register('orchestrator.getAgentOutput', async (params: {
+    runId: string
+    assignmentId?: string
+    offset?: number
+  }) => {
+    const key = params.assignmentId
+      ? AgentOutputBuffer.workerKey(params.runId, params.assignmentId)
+      : AgentOutputBuffer.leaderKey(params.runId)
+    return orchestrator.outputBuffer.get(key, params.offset ?? 0)
   })
 
 }

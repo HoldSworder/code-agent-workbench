@@ -55,10 +55,10 @@ export class OrchestratorRepository {
         const aId = randomUUID()
         this.db
           .prepare(
-            `INSERT INTO assignments (id, run_id, role, title, description, acceptance_criteria, agent_provider, agent_model)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO assignments (id, run_id, role, repo_id, title, description, acceptance_criteria, agent_provider, agent_model)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(aId, runId, a.role, a.title, a.description, a.acceptance_criteria ?? null, a.agent_provider ?? null, a.agent_model ?? null)
+          .run(aId, runId, a.role, a.repo_id ?? null, a.title, a.description, a.acceptance_criteria ?? null, a.agent_provider ?? null, a.agent_model ?? null)
         created.push(this.findAssignmentById(aId)!)
 
         this.appendEvent(runId, 'task_assigned', aId, JSON.stringify({
@@ -118,10 +118,10 @@ export class OrchestratorRepository {
     const id = randomUUID()
     this.db
       .prepare(
-        `INSERT INTO assignments (id, run_id, role, title, description, acceptance_criteria, agent_provider, agent_model)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO assignments (id, run_id, role, repo_id, title, description, acceptance_criteria, agent_provider, agent_model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, input.run_id, input.role, input.title, input.description, input.acceptance_criteria ?? null, input.agent_provider ?? null, input.agent_model ?? null)
+      .run(id, input.run_id, input.role, input.repo_id ?? null, input.title, input.description, input.acceptance_criteria ?? null, input.agent_provider ?? null, input.agent_model ?? null)
     return this.findAssignmentById(id)!
   }
 
@@ -233,6 +233,12 @@ export class OrchestratorRepository {
     return this.db
       .prepare('SELECT id, name, alias, local_path, default_branch FROM repos ORDER BY created_at ASC')
       .all() as Array<{ id: string, name: string, alias: string | null, local_path: string, default_branch: string }>
+  }
+
+  findRepoById(repoId: string): { id: string, name: string, alias: string | null, local_path: string, default_branch: string } | null {
+    return (this.db
+      .prepare('SELECT id, name, alias, local_path, default_branch FROM repos WHERE id = ?')
+      .get(repoId) as { id: string, name: string, alias: string | null, local_path: string, default_branch: string } | undefined) ?? null
   }
 
   findRequirementRaw(requirementId: string): { id: string, title: string, description: string, mode: string, status: string } | null {

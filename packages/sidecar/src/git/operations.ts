@@ -3,10 +3,14 @@ import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
 
-export async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await exec('git', args, { cwd, encoding: 'utf8' })
+export async function git(cwd: string, args: string[], timeoutMs?: number): Promise<string> {
+  const opts: Record<string, any> = { cwd, encoding: 'utf8' }
+  if (timeoutMs) opts.timeout = timeoutMs
+  const { stdout } = await exec('git', args, opts)
   return stdout.trim()
 }
+
+const FETCH_TIMEOUT_MS = 15_000
 
 export async function createWorktree(
   repoPath: string,
@@ -16,14 +20,50 @@ export async function createWorktree(
 ): Promise<void> {
   let useRemote = false
   try {
-    await git(repoPath, ['fetch', 'origin', baseBranch])
+    await git(repoPath, ['fetch', '--depth=1', 'origin', baseBranch], FETCH_TIMEOUT_MS)
     useRemote = true
   }
   catch {
-    // remote fetch failed — fall back to local branch
+    // remote fetch failed or timed out — fall back to local branch
   }
   const base = useRemote ? `origin/${baseBranch}` : baseBranch
   await git(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, base])
+}
+
+/**
+ * Create a feature branch in the repo following the naming convention:
+ * feature/<english-slug>
+ *
+ * Steps: detect base branch → checkout base → pull (with timeout) → checkout -b feature/xxx
+ * Returns the created branch name.
+ */
+export async function createFeatureBranch(
+  repoPath: string,
+  slug: string,
+  baseBranch: string,
+): Promise<string> {
+  const branchName = `feature/${slug}`
+
+  const current = await getCurrentBranch(repoPath)
+  if (current === branchName) return branchName
+
+  const localBranches = await git(repoPath, ['branch', '--list', branchName])
+  if (localBranches) {
+    await git(repoPath, ['checkout', branchName])
+    return branchName
+  }
+
+  await git(repoPath, ['checkout', baseBranch])
+
+  try {
+    await git(repoPath, ['pull', 'origin', baseBranch], FETCH_TIMEOUT_MS)
+  }
+  catch {
+    // network unavailable — continue with local state
+  }
+
+  await git(repoPath, ['checkout', '-b', branchName])
+  return branchName
 }
 
 export async function createBranch(

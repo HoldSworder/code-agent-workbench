@@ -187,11 +187,17 @@ export class ExternalCliProvider implements AgentProvider {
       }
 
       // ── stdout processing ──
+      let debugFirstChunks = 0
       this.childProcess.stdout?.on('data', (data) => {
         const chunk = String(data)
         stdout += chunk
         stdoutChunks++
         resetActivityTimer()
+
+        if (debugFirstChunks < 3) {
+          debugFirstChunks++
+          log(`stdout chunk #${debugFirstChunks}: ${chunk.slice(0, 300)}`)
+        }
 
         if (useStreamJson && options?.onChunk) {
           lineBuf += chunk
@@ -231,7 +237,10 @@ export class ExternalCliProvider implements AgentProvider {
           if (normalized) {
             this.extractSessionId(normalized)
             const { text } = extractStreamText(normalized)
-            if (text) assistantText += text
+            if (text) {
+              assistantText += text
+              options?.onChunk?.(text)
+            }
           }
           lineBuf = ''
         }
@@ -246,9 +255,13 @@ export class ExternalCliProvider implements AgentProvider {
         }
 
         if (useStreamJson) {
+          const finalOutput = assistantText || parseStreamResult(stdout)
+          log(`close: assistantTextLen=${assistantText.length} parseStreamLen=${assistantText ? 0 : finalOutput.length} stdoutLen=${stdout.length}`)
+          if (!assistantText && stdout.length > 0)
+            log(`close: stdout first 500: ${stdout.slice(0, 500)}`)
           finish({
             status: 'success',
-            output: assistantText || parseStreamResult(stdout),
+            output: finalOutput,
             tokenUsage: extractTokenUsage(stdout),
           })
         }
@@ -347,6 +360,9 @@ export class ExternalCliProvider implements AgentProvider {
   private buildPrompt(context: PhaseContext): string {
     if (this.config.resumeSessionId && context.userMessage)
       return context.userMessage
+
+    if (context.phaseId === 'leader-analyze' && context.skillContent)
+      return context.skillContent
 
     const canReadFiles = this.config.type === 'cursor-cli' || this.config.type === 'claude-code'
     return buildPromptFromContext(context, canReadFiles)

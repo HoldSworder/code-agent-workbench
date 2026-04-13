@@ -1,16 +1,15 @@
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { randomUUID } from 'node:crypto'
 import type { AgentProvider, PhaseContext, PhaseResult, RunOptions } from '../providers/types'
-import { createWorktree, removeWorktree } from '../git/operations'
+import { createFeatureBranch, getCurrentBranch, git } from '../git/operations'
 import type { OrchestratorRepository } from './repository'
 import type { Assignment, RoleConfig } from './types'
+import { AgentOutputBuffer } from './output-buffer'
 
 export interface WorkerRunnerDeps {
   repo: OrchestratorRepository
   resolveProvider: (role: RoleConfig) => AgentProvider
   repoPath: string
   defaultBranch: string
+  outputBuffer?: AgentOutputBuffer
   onChunk?: RunOptions['onChunk']
 }
 
@@ -19,30 +18,37 @@ export interface WorkerResult {
   phaseResult: PhaseResult
 }
 
+function slugify(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[\u4e00-\u9fff]+/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || 'task'
+}
+
 export async function runWorker(
   deps: WorkerRunnerDeps,
   assignment: Assignment,
   role: RoleConfig,
   requirementContext: string,
 ): Promise<WorkerResult> {
-  const { repo, resolveProvider, repoPath, defaultBranch, onChunk } = deps
-  const branchName = `orchestrator/${assignment.run_id.slice(0, 8)}/${assignment.role}-${randomUUID().slice(0, 6)}`
-  const worktreePath = join(tmpdir(), `code-agent-worker-${assignment.id.slice(0, 8)}`)
+  const { repo, resolveProvider, repoPath, defaultBranch, onChunk, outputBuffer } = deps
+
+  const slug = `${slugify(assignment.title)}-${assignment.id.slice(0, 6)}`
+  let branchName: string
 
   repo.updateAssignmentStatus(assignment.id, 'running')
-  repo.updateAssignmentWorktree(assignment.id, worktreePath, branchName)
   repo.appendEvent(assignment.run_id, 'worker_started', assignment.id, JSON.stringify({
     role: assignment.role,
-    branch: branchName,
-    worktree: worktreePath,
   }))
 
   try {
-    await createWorktree(repoPath, worktreePath, branchName, defaultBranch)
+    branchName = await createFeatureBranch(repoPath, slug, defaultBranch)
   }
   catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    repo.updateAssignmentStatus(assignment.id, 'failed', `worktree creation failed: ${msg}`)
+    repo.updateAssignmentStatus(assignment.id, 'failed', `branch creation failed: ${msg}`)
     repo.appendEvent(assignment.run_id, 'worker_failed', assignment.id, JSON.stringify({ error: msg }))
     return {
       assignment: repo.findAssignmentById(assignment.id)!,
@@ -50,26 +56,67 @@ export async function runWorker(
     }
   }
 
+  repo.updateAssignmentWorktree(assignment.id, repoPath, branchName)
+
   const provider = resolveProvider(role)
   const context: PhaseContext = {
     stageId: 'orchestrator',
     stageName: 'Orchestrator',
     phaseId: `worker-${assignment.role}`,
-    repoPath: worktreePath,
-    openspecPath: worktreePath,
+    repoPath,
+    openspecPath: repoPath,
     branchName,
-    skillContent: buildWorkerPrompt(role, assignment, requirementContext),
+    skillContent: buildWorkerPrompt(role, assignment, requirementContext, branchName),
     requirementTitle: assignment.title,
     requirementDescription: assignment.description,
   }
 
+  const bufferKey = outputBuffer
+    ? AgentOutputBuffer.workerKey(assignment.run_id, assignment.id)
+    : ''
+
+  let textLen = 0
+  let lastHeartbeatAt = Date.now()
+  const HEARTBEAT_INTERVAL_MS = 10_000
+
+  const wrappedOnChunk = (chunk: string) => {
+    onChunk?.(chunk)
+    if (outputBuffer) outputBuffer.append(bufferKey, chunk)
+    textLen += chunk.length
+    const now = Date.now()
+    if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      lastHeartbeatAt = now
+      repo.appendEvent(assignment.run_id, 'worker_output', assignment.id, JSON.stringify({
+        length: textLen,
+        tail: chunk.slice(-200),
+      }))
+    }
+  }
+
+  const heartbeatTimer = setInterval(() => {
+    repo.appendEvent(assignment.run_id, 'worker_heartbeat', assignment.id, JSON.stringify({
+      text_length: textLen,
+      elapsed_s: Math.round((Date.now() - lastHeartbeatAt) / 1000),
+      status: 'running',
+    }))
+  }, HEARTBEAT_INTERVAL_MS)
+
   let phaseResult: PhaseResult
   try {
-    phaseResult = await provider.run(context, { onChunk })
+    phaseResult = await provider.run(context, { onChunk: wrappedOnChunk })
   }
   catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     phaseResult = { status: 'failed', error: msg }
+  }
+  finally {
+    clearInterval(heartbeatTimer)
+  }
+
+  if (outputBuffer && bufferKey) {
+    const existing = outputBuffer.get(bufferKey)
+    if (existing.totalLength === 0 && phaseResult.output)
+      outputBuffer.append(bufferKey, phaseResult.output)
   }
 
   if (phaseResult.status === 'success') {
@@ -86,7 +133,12 @@ export async function runWorker(
     }))
   }
 
-  await cleanupWorktree(repoPath, worktreePath)
+  try {
+    await git(repoPath, ['checkout', defaultBranch])
+  }
+  catch {
+    // best-effort switch back to base branch
+  }
 
   return {
     assignment: repo.findAssignmentById(assignment.id)!,
@@ -98,6 +150,7 @@ function buildWorkerPrompt(
   role: RoleConfig,
   assignment: Assignment,
   requirementContext: string,
+  branchName: string,
 ): string {
   const parts = [
     role.prompt_template ?? '',
@@ -116,15 +169,11 @@ function buildWorkerPrompt(
     parts.push(`**验收标准：** ${assignment.acceptance_criteria}`)
   if (requirementContext)
     parts.push('', '## 需求背景', requirementContext)
-  parts.push('', '任务完成后，请确保所有修改已提交到当前分支。')
+  parts.push(
+    '',
+    '## Git 分支',
+    `你当前在分支 \`${branchName}\` 上工作。`,
+    '任务完成后，请确保所有修改已提交到当前分支。',
+  )
   return parts.join('\n')
-}
-
-async function cleanupWorktree(repoPath: string, worktreePath: string): Promise<void> {
-  try {
-    await removeWorktree(repoPath, worktreePath)
-  }
-  catch {
-    // Worktree may already be removed or in inconsistent state — ignore
-  }
 }

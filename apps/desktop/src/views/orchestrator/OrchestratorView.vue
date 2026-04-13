@@ -33,6 +33,14 @@ async function handleRetry(assignmentId: string) {
   await store.retryAssignment(assignmentId)
 }
 
+async function handleRetryRun(runId: string) {
+  const result = await store.retryRun(runId)
+  if (result?.newRunId) {
+    selectedRunId.value = result.newRunId
+    await store.fetchEvents(result.newRunId)
+  }
+}
+
 async function refresh() {
   await store.fetchRuns()
   if (selectedRunId.value) {
@@ -48,9 +56,11 @@ onMounted(async () => {
   pollTimer = setInterval(async () => {
     await store.fetchStatus()
     await store.fetchRuns()
-    if (selectedRunId.value)
+    if (selectedRunId.value) {
+      await store.fetchRunDetail(selectedRunId.value)
       await store.fetchEvents(selectedRunId.value)
-  }, 5000)
+    }
+  }, 3000)
 })
 
 onUnmounted(() => {
@@ -109,6 +119,7 @@ onUnmounted(() => {
               @cancel="handleCancel"
               @reject="handleReject"
               @retry="handleRetry"
+              @retry-run="handleRetryRun"
             />
           </div>
 

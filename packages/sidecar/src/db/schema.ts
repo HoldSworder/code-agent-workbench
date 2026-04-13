@@ -124,6 +124,7 @@ export function applySchema(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL REFERENCES orchestrator_runs(id),
       role TEXT NOT NULL,
+      repo_id TEXT,
       title TEXT NOT NULL,
       description TEXT NOT NULL,
       acceptance_criteria TEXT,
@@ -249,5 +250,11 @@ export function applySchema(db: Database.Database): void {
       `)
     })()
     db.pragma('foreign_keys = ON')
+  }
+
+  // Migration: add repo_id column to assignments for multi-repo orchestration
+  const assignCols = db.prepare(`PRAGMA table_info(assignments)`).all() as { name: string }[]
+  if (!assignCols.some(c => c.name === 'repo_id')) {
+    db.exec(`ALTER TABLE assignments ADD COLUMN repo_id TEXT`)
   }
 }

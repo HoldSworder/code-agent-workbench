@@ -26,6 +26,7 @@ export type LeaderDecisionType = 'single_worker' | 'split' | 'blocked'
 
 export interface LeaderAssignment {
   role: string
+  repo_id?: string
   title: string
   description: string
   acceptance_criteria?: string
@@ -55,6 +56,7 @@ export interface Assignment {
   id: string
   run_id: string
   role: string
+  repo_id: string | null
   title: string
   description: string
   acceptance_criteria: string | null
@@ -102,6 +104,7 @@ export interface CreateRunInput {
 export interface CreateAssignmentInput {
   run_id: string
   role: string
+  repo_id?: string
   title: string
   description: string
   acceptance_criteria?: string

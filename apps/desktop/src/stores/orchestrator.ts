@@ -151,6 +151,18 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     }
   }
 
+  async function retryRun(runId: string) {
+    const result = await rpc<{ success: boolean, newRunId: string }>('orchestrator.retryRun', { runId })
+    await fetchRuns()
+    if (result.newRunId) {
+      selectedRun.value = null
+      selectedRunAssignments.value = []
+      events.value = []
+      await fetchRunDetail(result.newRunId)
+    }
+    return result
+  }
+
   async function retryAssignment(assignmentId: string) {
     await rpc('orchestrator.retryAssignment', { assignmentId })
     if (selectedRun.value) {
@@ -158,10 +170,39 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     }
   }
 
+  const agentOutputs = ref<Map<string, { content: string, totalLength: number }>>(new Map())
+
+  async function fetchAgentOutput(runId: string, assignmentId?: string) {
+    const key = assignmentId ? `${runId}:${assignmentId}` : `${runId}:leader`
+    const existing = agentOutputs.value.get(key)
+    const offset = existing?.totalLength ?? 0
+
+    const result = await rpc<{ content: string, totalLength: number }>(
+      'orchestrator.getAgentOutput',
+      { runId, assignmentId, offset },
+    )
+
+    if (result.content || result.totalLength > offset) {
+      const prev = existing?.content ?? ''
+      const updated = new Map(agentOutputs.value)
+      updated.set(key, {
+        content: prev + result.content,
+        totalLength: result.totalLength,
+      })
+      agentOutputs.value = updated
+    }
+  }
+
+  function getAgentOutput(runId: string, assignmentId?: string): string {
+    const key = assignmentId ? `${runId}:${assignmentId}` : `${runId}:leader`
+    return agentOutputs.value.get(key)?.content ?? ''
+  }
+
   function clearSelection() {
     selectedRun.value = null
     selectedRunAssignments.value = []
     events.value = []
+    agentOutputs.value = new Map()
   }
 
   const agencyCatalog = ref<AgentCatalog | null>(null)
@@ -226,7 +267,11 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     fetchEvents,
     cancelRun,
     rejectRun,
+    retryRun,
     retryAssignment,
+    agentOutputs,
+    fetchAgentOutput,
+    getAgentOutput,
     clearSelection,
     fetchTeamConfig,
     saveTeamConfig,

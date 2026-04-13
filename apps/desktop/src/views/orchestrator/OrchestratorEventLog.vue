@@ -24,6 +24,7 @@ const eventConfig: Record<string, { label: string, icon: string, color: string }
   task_assigned: { label: '任务已分配', icon: 'i-carbon-task', color: 'text-indigo-500' },
   worker_started: { label: 'Worker 启动', icon: 'i-carbon-play', color: 'text-cyan-500' },
   worker_output: { label: 'Worker 输出', icon: 'i-carbon-terminal', color: 'text-gray-500' },
+  worker_heartbeat: { label: 'Worker 运行中', icon: 'i-carbon-activity', color: 'text-cyan-400' },
   worker_completed: { label: 'Worker 完成', icon: 'i-carbon-checkmark', color: 'text-emerald-500' },
   worker_failed: { label: 'Worker 失败', icon: 'i-carbon-error', color: 'text-red-500' },
   worker_timeout: { label: 'Worker 超时', icon: 'i-carbon-timer', color: 'text-amber-500' },
@@ -48,11 +49,17 @@ function parsePayload(payload: string | null): Record<string, unknown> | null {
 function payloadSummary(payload: Record<string, unknown>): string {
   const parts: string[] = []
   if (payload.role) parts.push(`角色: ${payload.role}`)
+  if (payload.repo_id) parts.push(`仓库: ${payload.repo_id}`)
   if (payload.title) parts.push(String(payload.title))
   if (payload.reason) parts.push(String(payload.reason))
   if (payload.error) parts.push(String(payload.error))
   if (payload.decision) parts.push(`决策: ${payload.decision}`)
   if (payload.feedback) parts.push(String(payload.feedback))
+  if (payload.warning) parts.push(String(payload.warning))
+  if (payload.status === 'running') parts.push('正在执行中…')
+  if (payload.text_length != null) parts.push(`文本输出 ${payload.text_length} 字符`)
+  if (payload.length != null && payload.text_length == null) parts.push(`已输出 ${payload.length} 字符`)
+  if (payload.tail) parts.push(String(payload.tail).trim().slice(-100))
   return parts.join(' · ') || JSON.stringify(payload).slice(0, 120)
 }
 </script>

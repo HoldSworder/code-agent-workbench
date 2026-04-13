@@ -6,6 +6,7 @@ import { SettingsRepository } from '../db/repositories/settings.repo'
 import { OrchestratorRepository } from './repository'
 import { LeaderLoop } from './leader'
 import type { TeamConfig, RoleConfig } from './types'
+import { AgentOutputBuffer } from './output-buffer'
 
 export interface OrchestratorOptions {
   db: Database.Database
@@ -28,6 +29,7 @@ export class Orchestrator {
   private defaultBranch: string
   private onChunk?: RunOptions['onChunk']
   private onEvent?: (event: string, data?: unknown) => void
+  readonly outputBuffer = new AgentOutputBuffer()
 
   constructor(private options: OrchestratorOptions) {
     this.repo = new OrchestratorRepository(options.db)
@@ -77,6 +79,7 @@ export class Orchestrator {
       resolveProvider: role => this.resolveProviderForRole(role),
       repoPath: this.repoPath,
       defaultBranch: this.defaultBranch,
+      outputBuffer: this.outputBuffer,
       onChunk: this.onChunk,
       onEvent: this.onEvent,
     })
@@ -99,6 +102,7 @@ export class Orchestrator {
         resolveProvider: role => this.resolveProviderForRole(role),
         repoPath: this.repoPath,
         defaultBranch: this.defaultBranch,
+        outputBuffer: this.outputBuffer,
         onChunk: this.onChunk,
         onEvent: this.onEvent,
       })

@@ -81,4 +81,33 @@ describe('parseLeaderDecision', () => {
     const raw = `x\n\`\`\`\n${inner}\n\`\`\``
     expect(parseLeaderDecision(raw)?.decision).toBe('single_worker')
   })
+
+  it('accepts assignments with optional repo_id', () => {
+    const payload = JSON.stringify({
+      decision: 'split',
+      reason: 'multi-repo',
+      assignments: [
+        { role: 'worker', repo_id: 'repo-frontend', title: 'Frontend', description: 'UI work' },
+        { role: 'worker', repo_id: 'repo-backend', title: 'Backend', description: 'API work' },
+      ],
+    })
+    const raw = `<decision>${payload}</decision>`
+    const parsed = parseLeaderDecision(raw)
+    expect(parsed?.decision).toBe('split')
+    expect(parsed?.assignments).toHaveLength(2)
+    expect(parsed?.assignments[0]?.repo_id).toBe('repo-frontend')
+    expect(parsed?.assignments[1]?.repo_id).toBe('repo-backend')
+  })
+
+  it('accepts assignments without repo_id', () => {
+    const payload = JSON.stringify({
+      decision: 'single_worker',
+      reason: 'single repo',
+      assignments: [
+        { role: 'worker', title: 'Task', description: 'Do something' },
+      ],
+    })
+    const parsed = parseLeaderDecision(payload)
+    expect(parsed?.assignments[0]?.repo_id).toBeUndefined()
+  })
 })
