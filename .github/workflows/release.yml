@@ -78,7 +78,7 @@ jobs:
             **Windows**: 下载 `.msi` 或 `.exe` 安装包直接安装。
 
             **Linux**: 下载 `.deb` 或 `.AppImage`。
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           tauriScript: pnpm tauri
           projectPath: apps/desktop
