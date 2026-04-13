@@ -29,11 +29,12 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = _event {
                 if !has_visible_windows {
                     let _ = tauri::WebviewWindowBuilder::new(
-                        app,
+                        _app,
                         "main",
                         tauri::WebviewUrl::App("index.html".into()),
                     )
