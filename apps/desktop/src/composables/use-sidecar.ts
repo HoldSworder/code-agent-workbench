@@ -247,6 +247,8 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'mcp.update':
     case 'mcp.toggle':
       return { id: `mock-${Date.now()}`, ...params } as T
+    case 'mcp.test':
+      return { ok: true } as T
     case 'mcp.delete':
     case 'mcp.setBindings':
       return { ok: true } as T

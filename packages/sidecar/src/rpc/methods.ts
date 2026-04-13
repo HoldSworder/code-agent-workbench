@@ -521,6 +521,88 @@ export function registerMethods(
 
   server.register('mcp.toggle', async ({ id }: { id: string }) => mcpServerRepo.toggle(id))
 
+  server.register('mcp.test', async ({ id }: { id: string }): Promise<{ ok: boolean, error?: string, tools?: number }> => {
+    const srv = mcpServerRepo.findById(id)
+    if (!srv) return { ok: false, error: 'Server not found' }
+
+    if (srv.transport === 'stdio') {
+      const command = srv.command
+      if (!command) return { ok: false, error: 'No command configured' }
+      const args = JSON.parse(srv.args || '[]') as string[]
+      const envVars = JSON.parse(srv.env || '{}') as Record<string, string>
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          child.kill()
+          resolve({ ok: false, error: 'Timed out after 15s — process started but MCP handshake did not complete' })
+        }, 15_000)
+
+        const child = spawnChild(command, args, {
+          env: { ...process.env, ...envVars },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+
+        let stdout = ''
+
+        child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+
+        const initRequest = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent-test', version: '0.1.0' } } })
+        child.stdin?.write(initRequest + '\n')
+
+        child.on('error', (err) => {
+          clearTimeout(timeout)
+          resolve({ ok: false, error: `Failed to spawn: ${err.message}` })
+        })
+
+        const checkInitResponse = () => {
+          try {
+            const lines = stdout.split('\n').filter(Boolean)
+            for (const line of lines) {
+              const resp = JSON.parse(line)
+              if (resp.id === 1 && resp.result) {
+                clearTimeout(timeout)
+                child.kill()
+                return resolve({ ok: true, tools: undefined })
+              }
+              if (resp.error) {
+                clearTimeout(timeout)
+                child.kill()
+                return resolve({ ok: false, error: resp.error.message || 'MCP init rejected' })
+              }
+            }
+          } catch { /* partial data, keep waiting */ }
+        }
+
+        child.stdout?.on('data', () => checkInitResponse())
+
+        child.on('close', (code) => {
+          clearTimeout(timeout)
+          if (code !== 0 && code !== null) {
+            resolve({ ok: false, error: `Process exited with code ${code}` })
+          }
+        })
+      })
+    }
+
+    const targetUrl = srv.url
+    if (!targetUrl) return { ok: false, error: 'No URL configured' }
+    const headers = JSON.parse(srv.headers || '{}') as Record<string, string>
+
+    try {
+      const resp = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent-test', version: '0.1.0' } } }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status} ${resp.statusText}` }
+      const body = await resp.json()
+      if (body.error) return { ok: false, error: body.error.message || 'MCP init rejected' }
+      return { ok: true }
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Connection failed' }
+    }
+  })
+
   server.register('mcp.getBindings', async ({ stageId, phaseId }: { stageId: string, phaseId: string }) =>
     mcpBindingRepo.findByPhase(stageId, phaseId),
   )
