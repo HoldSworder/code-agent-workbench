@@ -100,12 +100,21 @@ function resolveSkillContent(skillPath: string): string {
       if (existsSync(skillFile))
         return readFileSync(skillFile, 'utf-8')
 
-      // fe-specflow 等嵌套在子目录中的插件
+      // 嵌套在子目录中的插件（两层和三层嵌套）
+      // 两层: cache/{vendor}/{pack}/skills/{name}/SKILL.md
+      // 三层: cache/{vendor}/{pack}/{hash}/skills/{name}/SKILL.md
       const nestedEntries = readdirSafe(join(pluginCacheDir, entry))
       for (const nested of nestedEntries) {
         const nestedSkill = join(pluginCacheDir, entry, nested, 'skills', name, 'SKILL.md')
         if (existsSync(nestedSkill))
           return readFileSync(nestedSkill, 'utf-8')
+
+        const hashEntries = readdirSafe(join(pluginCacheDir, entry, nested))
+        for (const hash of hashEntries) {
+          const hashSkill = join(pluginCacheDir, entry, nested, hash, 'skills', name, 'SKILL.md')
+          if (existsSync(hashSkill))
+            return readFileSync(hashSkill, 'utf-8')
+        }
       }
     }
   }

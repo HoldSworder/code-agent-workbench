@@ -1,6 +1,6 @@
-# Spec 落盘
+# 需求对齐 & Spec 落盘
 
-将需求内容结构化为 OpenSpec 变更目录下的 `proposal.md` 与 `specs/*/spec.md`，作为后续任务拆分与开发的基础。本阶段是任务规划的第一步，Agent 根据需求描述完成 Spec 文档的生成。
+先通过 Brainstorming 与用户对齐需求理解和设计方案，再将共识结构化为 OpenSpec 变更目录下的 `proposal.md` 与 `specs/*/spec.md`，作为后续任务拆分与开发的基础。
 
 ---
 
@@ -12,6 +12,27 @@
 ---
 
 ## 执行步骤
+
+### Step 0: 需求对齐（Brainstorming）
+
+在写任何 OpenSpec 文档之前，先通过 `superpowers:brainstorming` 技能与用户对齐需求理解。
+
+**优先级声明：本 skill 中的覆盖约定优先于 brainstorming 技能原流程中的冲突指令。**
+
+**调用 brainstorming 技能时，仅执行以下 4 步，跳过其余流程：**
+
+1. **探索项目上下文** — 检查代码结构、现有模块、技术栈、近期提交，理解当前项目状态；如果需求关联了飞书文档链接（`doc_url`），先通过 `lark-cli` 获取文档正文作为需求理解的核心输入
+2. **逐个澄清需求** — 一次只问一个问题，优先使用选择题；聚焦于：目的、约束、验收标准
+3. **提出 2-3 个实现方案** — 附带优劣对比和推荐理由
+4. **用户确认设计方案** — 获得用户明确同意后，进入后续 OpenSpec 落盘步骤
+
+**覆盖约定（以下 brainstorming 原流程步骤在本阶段不执行）：**
+
+- **不写入** `docs/superpowers/specs/` 目录 — 设计共识直接体现在 proposal.md 的 Why / What Changes 章节中
+- **不调用** `writing-plans` 技能 — 由后续的任务拆分阶段替代
+- **不执行** spec review loop — 由 `openspec validate` 替代
+
+---
 
 ### Step 1: 创建变更目录
 

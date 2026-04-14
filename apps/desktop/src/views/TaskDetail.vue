@@ -42,6 +42,9 @@ const messages = ref<ChatMessage[]>([])
 const chatInput = ref('')
 const chatInputEl = ref<HTMLInputElement>()
 const liveOutput = ref('')
+const liveActivity = ref('')
+const processExpanded = ref(false)
+const activityScrollContainer = ref<HTMLElement>()
 const chatContainer = ref<HTMLElement>()
 
 // ── Workflow selection for pending tasks ──
@@ -163,6 +166,7 @@ interface AdvanceOption {
 interface AdvanceOptions {
   defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
   optionalPhases: AdvanceOption[]
+  blocked: boolean
 }
 
 const advanceOptions = ref<AdvanceOptions | null>(null)
@@ -438,11 +442,15 @@ let waitTimer: ReturnType<typeof setInterval> | null = null
 async function pollLiveOutput() {
   if (!task.value) return
   try {
-    const res = await rpc<{ output: string }>('task.getLiveOutput', { repoTaskId: taskId })
+    const res = await rpc<{ output: string, activity: string }>('task.getLiveOutput', { repoTaskId: taskId })
     if (res?.output && res.output !== liveOutput.value) {
       liveOutput.value = res.output
       if (waitTimer) { clearInterval(waitTimer); waitTimer = null }
       scrollToBottom()
+    }
+    if (res?.activity && res.activity !== liveActivity.value) {
+      liveActivity.value = res.activity
+      if (waitTimer) { clearInterval(waitTimer); waitTimer = null }
     }
     const t = await rpc<RepoTask>('task.get', { id: taskId })
     if (t) {
@@ -452,12 +460,16 @@ async function pollLiveOutput() {
         viewingPhaseId.value = t.current_phase
         await Promise.all([refreshMessages(), loadAgentRuns()])
         liveOutput.value = ''
+        liveActivity.value = ''
+        processExpanded.value = false
       }
       if (t.phase_status !== 'running') {
         clearInterval(pollTimer!)
         pollTimer = null
         await Promise.all([refreshMessages(), loadAgentRuns()])
         liveOutput.value = ''
+        liveActivity.value = ''
+        processExpanded.value = false
       }
     }
   }
@@ -483,11 +495,21 @@ function stopPolling() {
   }
   waitSeconds.value = 0
   liveOutput.value = ''
+  liveActivity.value = ''
+  processExpanded.value = false
 }
 
 watch(isRunning, (running) => {
   if (running) startPolling()
   else stopPolling()
+})
+
+watch(liveActivity, () => {
+  if (!processExpanded.value || !activityScrollContainer.value) return
+  nextTick(() => {
+    if (activityScrollContainer.value)
+      activityScrollContainer.value.scrollTop = activityScrollContainer.value.scrollHeight
+  })
 })
 
 watch(activeTab, (tab) => {
@@ -710,6 +732,32 @@ async function handleConfirmAndAdvance() {
   startPolling()
 }
 
+async function handleContinuePhase() {
+  if (!task.value) return
+
+  const isBlocked = advanceOptions.value?.blocked
+  const content = isBlocked
+    ? '请继续完成本阶段剩余工作。'
+    : '没有额外反馈，请继续执行。'
+  messages.value.push({
+    id: `local-${Date.now()}`,
+    phase_id: task.value.current_phase,
+    role: 'user',
+    content,
+    created_at: new Date().toISOString(),
+  })
+  scrollToBottom()
+
+  await rpc('workflow.feedback', {
+    repoTaskId: task.value.id,
+    feedback: content,
+  })
+  await new Promise(r => setTimeout(r, 300))
+  const t = await rpc<RepoTask>('task.get', { id: taskId })
+  if (t) task.value = t
+  startPolling()
+}
+
 async function handleConfirmAndAdvanceToPhase(targetPhaseId: string) {
   if (!task.value) return
 
@@ -847,6 +895,8 @@ async function confirmReset() {
       await rpc('workflow.resetPhase', { repoTaskId: task.value.id })
     }
     liveOutput.value = ''
+    liveActivity.value = ''
+    processExpanded.value = false
 
     await new Promise(r => setTimeout(r, 300))
     const t = await rpc<RepoTask>('task.get', { id: taskId })
@@ -1269,8 +1319,43 @@ async function handleCancel() {
                 </div>
               </template>
 
-              <!-- Live streaming output (current phase only) -->
+              <!-- Live streaming: process bubble + text bubble (current phase only) -->
               <template v-if="group.state === 'active'">
+                <!-- Process bubble (collapsible activity log) -->
+                <div v-if="liveActivity" class="flex justify-start">
+                  <div class="max-w-[85%] min-w-0 rounded-2xl rounded-bl-md overflow-hidden shadow-sm shadow-black/[0.04] dark:shadow-none">
+                    <!-- Collapsed: status bar -->
+                    <div
+                      class="flex items-center justify-between px-4 py-2.5 bg-gray-100/80 dark:bg-[#1e1e22] cursor-pointer select-none transition-colors hover:bg-gray-200/60 dark:hover:bg-[#252528]"
+                      @click="processExpanded = !processExpanded"
+                    >
+                      <div class="flex items-center gap-2 min-w-0">
+                        <div class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                        <span class="text-[12px] text-gray-500 dark:text-gray-400 truncate">
+                          {{ liveActivity.trim().split('\n').pop()?.slice(0, 60) || 'Agent 工作中...' }}
+                        </span>
+                      </div>
+                      <div class="flex items-center gap-2 shrink-0 ml-3">
+                        <span class="text-[10px] text-gray-400 dark:text-gray-500 font-mono">
+                          {{ liveActivity.trim().split('\n').length }} 条
+                        </span>
+                        <div
+                          class="w-4 h-4 transition-transform duration-200"
+                          :class="[processExpanded ? 'i-carbon-chevron-up' : 'i-carbon-chevron-down', 'text-gray-400']"
+                        />
+                      </div>
+                    </div>
+                    <!-- Expanded: terminal panel -->
+                    <div
+                      v-if="processExpanded"
+                      ref="activityScrollContainer"
+                      class="overflow-y-auto font-mono text-[11px] leading-relaxed px-4 py-3 bg-gray-900 text-gray-300 whitespace-pre-wrap break-all"
+                      style="max-height: 300px;"
+                    >{{ liveActivity }}</div>
+                  </div>
+                </div>
+
+                <!-- Text streaming bubble -->
                 <div v-if="liveOutput" class="flex justify-start">
                   <div class="max-w-[85%] min-w-0 rounded-2xl rounded-bl-md px-4 py-3 bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none overflow-hidden">
                     <div
@@ -1284,7 +1369,8 @@ async function handleCancel() {
                   </div>
                 </div>
 
-                <div v-else-if="isRunning && !liveOutput" class="flex justify-start">
+                <!-- Startup indicator (no activity and no output yet) -->
+                <div v-else-if="isRunning && !liveOutput && !liveActivity" class="flex justify-start">
                   <div class="flex items-center gap-2 px-4 py-3 rounded-2xl rounded-bl-md bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none">
                     <div class="flex gap-1">
                       <div class="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" style="animation-delay: 0ms" />
@@ -1296,9 +1382,41 @@ async function handleCancel() {
                 </div>
               </template>
 
-              <!-- Inline action card for waiting_input phase -->
+              <!-- Inline action card for waiting_input phase (blocked: simplified, normal: full) -->
               <div
-                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId"
+                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId && advanceOptions?.blocked"
+                class="rounded-xl border border-orange-200/60 dark:border-orange-500/15 bg-orange-50/50 dark:bg-orange-500/[0.04] px-4 py-3 max-w-[85%]"
+              >
+                <div class="flex items-center gap-2 mb-3">
+                  <div class="i-carbon-in-progress w-4 h-4 text-orange-500" />
+                  <span class="text-[13px] text-orange-700 dark:text-orange-400 font-medium">
+                    {{ displayPhase }} 完成条件未满足，可继续完成或输入反馈
+                  </span>
+                </div>
+                <div class="flex items-center gap-2 justify-end">
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"
+                    @click="handleCancel"
+                  >
+                    取消任务
+                  </button>
+                  <button
+                    v-if="currentPhaseSuspendable"
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-600/30 hover:bg-gray-100/50 dark:hover:bg-gray-500/10 transition-colors"
+                    @click="handleSuspend"
+                  >
+                    挂起需求
+                  </button>
+                  <button
+                    class="px-4 py-1.5 rounded-lg bg-orange-500 text-white text-[12px] font-medium hover:bg-orange-400 shadow-sm shadow-orange-500/20 transition-all duration-150 active:scale-[0.97]"
+                    @click="handleContinuePhase"
+                  >
+                    继续完成本阶段
+                  </button>
+                </div>
+              </div>
+              <div
+                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId && !advanceOptions?.blocked"
                 class="rounded-xl border border-orange-200/60 dark:border-orange-500/15 bg-orange-50/50 dark:bg-orange-500/[0.04] px-4 py-3 max-w-[85%]"
               >
                 <div class="flex items-center gap-2 mb-3">
@@ -1369,6 +1487,12 @@ async function handleCancel() {
                     @click="handleSuspend"
                   >
                     挂起需求
+                  </button>
+                  <button
+                    class="px-3 py-1.5 rounded-lg text-[12px] text-orange-600 dark:text-orange-400 border border-orange-200 dark:border-orange-500/20 hover:bg-orange-100/50 dark:hover:bg-orange-500/10 transition-colors"
+                    @click="handleContinuePhase"
+                  >
+                    继续执行
                   </button>
                   <button
                     class="px-4 py-1.5 rounded-lg bg-orange-500 text-white text-[12px] font-medium hover:bg-orange-400 shadow-sm shadow-orange-500/20 transition-all duration-150 active:scale-[0.97]"
@@ -1514,7 +1638,7 @@ async function handleCancel() {
 
             <!-- Empty state -->
             <div
-              v-if="!hasAnyMessages && !liveOutput && !isRunning"
+              v-if="!hasAnyMessages && !liveOutput && !liveActivity && !isRunning"
               class="flex items-center justify-center py-20 text-gray-300 dark:text-gray-600 text-[13px]"
             >
               <div class="text-center">

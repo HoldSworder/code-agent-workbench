@@ -1,6 +1,6 @@
 # 联调
 
-你是一名前端开发工程师，负责前后端联调。
+你是一名开发工程师，负责接口联调。
 
 ## 输入
 
@@ -12,16 +12,14 @@
 
 - `{{openspec_path}}/backend-*.md`（或用户粘贴的 spec 落盘）
 - API 差异报告（字段、类型、枚举、错误码、分页等）
-- 代码侧：Mock → 真实 API，类型与边界与后端一致
-- 全量 TDD 重跑通过后的可提交变更（遵循开发（`tdd-dev.md`）的 Git commit 流程）
+- 代码侧：Mock → 真实 API，类型与边界与实际接口一致
+- 全量 TDD 重跑通过后的可提交变更（遵循外部规则中注入的 Git Commit 流程）
 
 ---
 
-## 步骤 1：调用 `fe-specflow:pull-spec` 技能拉取后端 Spec
+## 步骤 1：拉取后端 Spec
 
 **INVOKE SKILL: `fe-specflow:pull-spec`**
-
-Agent 必须直接调用 pull-spec 技能，执行以下操作：
 
 ### 若用户提供 GitLab URL
 
@@ -54,25 +52,25 @@ ls {{openspec_path}}/backend-*.md
 
 ## 步骤 2：对比 API 契约
 
-- 对比 `proposal.md` 中前端定义的 API 契约与后端 spec 实际接口
+- 对比 `proposal.md` 中定义的接口契约与后端 spec 实际接口
 - 输出差异报告：字段名/类型不匹配、缺失字段、枚举值差异、错误码差异、分页参数差异
 
 ---
 
 ## 步骤 3：切换 Mock → 真实 API
 
-- 前端切换 mock 数据为真实后端 API 调用
+- 切换 mock 数据为真实 API 调用
 - 处理接口差异和边界情况
-- 更新类型定义以匹配后端实际返回
+- 更新类型定义以匹配实际返回
 
 ---
 
-## 步骤 4：全量重跑前端 TDD
+## 步骤 4：全量重跑 TDD
 
 **INVOKE SKILL: `superpowers:test-driven-development`**
 
 - 重跑 **L1 契约测试 + L2 行为测试**
-- 根据后端实际返回校准 mock 数据
+- 根据实际返回校准 mock 数据
 - 修复不通过的测试
 
 ---
@@ -87,7 +85,7 @@ ls {{openspec_path}}/backend-*.md
 
 ## 步骤 6：Git Commit
 
-联调修复完成后，遵循开发（`tdd-dev.md`）的 Git Commit 流程（用户确认 → `git add` → 代码审查 → `commit`）。
+联调修复完成后，遵循外部规则中注入的 Git Commit 流程。
 
 ---
 

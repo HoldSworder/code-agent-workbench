@@ -211,7 +211,10 @@ export function registerMethods(
   )
 
   server.register('task.getLiveOutput', async ({ repoTaskId }) => {
-    return { output: engine.getLiveOutput(repoTaskId) }
+    return {
+      output: engine.getLiveOutput(repoTaskId),
+      activity: engine.getLiveActivity(repoTaskId),
+    }
   })
 
   server.register('task.getLastError', async ({ repoTaskId }) => {

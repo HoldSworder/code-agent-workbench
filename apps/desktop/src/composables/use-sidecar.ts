@@ -208,7 +208,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'workflow.checkDependencies':
       return { ok: true, missing: [] } as T
     case 'task.getLiveOutput':
-      return { output: '' } as T
+      return { output: '', activity: '' } as T
     case 'task.getLastError':
       return { error: null } as T
     case 'task.changedFiles':

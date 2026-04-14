@@ -92,7 +92,7 @@ glab mr create \
 
 ## 护栏
 
-- 仅提交 openspec 目录的归档 commit 时，**不得误含无关未审变更**；若一并推送功能代码，须已通过代码 Review（`self-test.md`）与 E2E 浏览器测试（`e2e-test.md`）门禁
+- 仅提交 openspec 目录的归档 commit 时，**不得误含无关未审变更**；若一并推送功能代码，须已通过 E2E 浏览器测试（`e2e-test.md`）门禁
 - `git commit` message 在纯归档步骤使用 `chore:` 前缀
 - 推送前确认当前分支不是 `main` 或 `master`（除非流程明确允许）
 - 目标分支默认为 `develop`，除非上下文另有指定

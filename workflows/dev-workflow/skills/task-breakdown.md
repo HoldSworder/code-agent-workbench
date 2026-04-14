@@ -37,10 +37,10 @@ openspec instructions tasks --change "{{change_id}}"
 > - 不要求每个 TDD 循环都 commit
 >
 > **测试分层**
-> - L1 契约测试: 基于 proposal 中 API 契约，使用 mock 数据
-> - L2 行为测试: 基于 spec.md 中 Scenario（WHEN/THEN）
-> - L3 联调验证: 后端 spec 到达 → 校准 mock；联调 → 真实 API 重跑
-> - L4 交叉验证: 测试 spec 到达 → Browser Agent 自动化（e2e-verify）
+> - L1 契约测试: 基于 proposal 中接口契约，使用 mock 数据验证数据结构与边界
+> - L2 行为测试: 基于 spec.md 中 Scenario（WHEN/THEN）验证业务逻辑
+> - L3 联调验证: 真实接口就绪后，校准 mock 并用真实 API 重跑
+> - L4 端到端验证: 通过浏览器自动化验证完整用户流程
 
 ## 1. <功能模块>
 
@@ -52,7 +52,7 @@ openspec instructions tasks --change "{{change_id}}"
 
 ## 任务粒度规则
 
-- 按 **组件/页面/功能模块** 拆分，每个 task 聚焦一个前端交付物（组件、hook、store、页面等）
+- 按 **模块/功能单元** 拆分，每个 task 聚焦一个可独立交付的代码单元
 - 每个任务 2-5 分钟可完成
 - 每个任务明确指定要修改的文件路径
 - 包含测试要点（L1/L2 层验证点）
@@ -61,7 +61,25 @@ openspec instructions tasks --change "{{change_id}}"
 
 ---
 
+## 校验
+
+任务列表编写完成后，立即执行校验：
+
+```bash
+openspec validate "{{change_id}}"
+```
+
+逐条检查：
+- 每个 task 包含 **文件路径**（如 `文件: \`path\``）
+- 每个 task 包含 **测试要点**（可验证的断言或场景）
+- tasks.md 结构符合 OpenSpec 约定（标题、checkbox、编号层级）
+
+校验失败时先修正文档再重跑 `openspec validate`，不得带着无效 tasks 进入开发阶段。
+
+---
+
 ## 护栏
 
 - 展示 tasks 内容，**等待用户确认** 后才进入开发阶段
 - 不在本阶段跳过任务拆分直接写实现代码
+- 不得在未实际运行 `openspec validate` 的情况下声称 tasks 已验证

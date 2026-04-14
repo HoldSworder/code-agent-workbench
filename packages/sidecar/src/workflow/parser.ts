@@ -128,6 +128,16 @@ const GuardrailDefinitionSchema = z.object({
   severity: z.enum(['hard', 'soft']).default('soft'),
 })
 
+// ── 外部规则定义 ──
+
+const ExternalRuleSchema = z.object({
+  id: z.string(),
+  /** 规则文件路径（相对于 workflow 所在目录或共享目录） */
+  path: z.string(),
+  /** 规则描述（用于日志和调试） */
+  description: z.string().optional(),
+})
+
 // ── 完整工作流 ──
 
 const WorkflowSchema = z.object({
@@ -138,6 +148,8 @@ const WorkflowSchema = z.object({
   gate_definitions: z.record(z.string(), GateDefinitionSchema).optional(),
   state_inference: StateInferenceSchema.optional(),
   guardrail_definitions: z.record(z.string(), GuardrailDefinitionSchema).optional(),
+  /** 外部规则列表，注入到所有阶段的 prompt 中 */
+  external_rules: z.array(ExternalRuleSchema).optional(),
   /** 需求收集阶段（独立于工作流 stages，在需求看板中执行） */
   requirement_phases: z.array(PhaseSchema).optional(),
   stages: z.array(StageSchema).min(1),
@@ -155,6 +167,7 @@ export type StateInferenceRule = z.infer<typeof StateInferenceRuleSchema>
 export type TriggerMappingEntry = z.infer<typeof TriggerMappingEntrySchema>
 export type DependencyConfig = z.infer<typeof DependencySchema>
 export type GuardrailDefinition = z.infer<typeof GuardrailDefinitionSchema>
+export type ExternalRuleConfig = z.infer<typeof ExternalRuleSchema>
 
 export function parseWorkflow(yamlContent: string): WorkflowConfig {
   const raw = parse(yamlContent)

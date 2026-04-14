@@ -25,11 +25,11 @@
 
 ---
 
-## 调用 `fe-specflow:e2e-verify` 技能
+## 执行验证流程
 
 **INVOKE SKILL: `fe-specflow:e2e-verify`**
 
-Agent 必须直接调用 e2e-verify 技能，使用 **Cursor 内置浏览器**（`browser_*` 工具）执行完整验证流程：
+使用 **Cursor 内置浏览器**（`browser_*` 工具）执行完整验证流程：
 
 ### 步骤 1：定位验证依据
 

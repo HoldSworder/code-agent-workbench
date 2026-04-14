@@ -10,6 +10,11 @@ export interface ConversationTurn {
   content: string
 }
 
+export interface ExternalRule {
+  id: string
+  content: string
+}
+
 export interface PhaseContext {
   stageId: string
   stageName: string
@@ -27,6 +32,8 @@ export interface PhaseContext {
   guardrails?: string[]
   /** 门禁规则描述，注入到 prompt 中让 Agent 感知 */
   gates?: string[]
+  /** 外部规则，注入到 prompt 中约束 Agent 行为 */
+  externalRules?: ExternalRule[]
   /** 本阶段完成后是否需要用户确认才能推进 */
   requiresConfirm?: boolean
   /** 本阶段完成后是否允许用户挂起需求 */
@@ -47,6 +54,7 @@ export interface PhaseResult {
 
 export interface RunOptions {
   onChunk?: (chunk: string) => void
+  onActivity?: (entry: string) => void
 }
 
 export interface AgentProvider {

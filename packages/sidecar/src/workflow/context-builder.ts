@@ -1,10 +1,14 @@
-import type { GateDefinition, GuardrailDefinition, PhaseConfig } from './parser'
-import type { ConversationTurn, InvokedSkill, PhaseContext } from '../providers/types'
+import type { ExternalRuleConfig, GateDefinition, GuardrailDefinition, PhaseConfig } from './parser'
+import type { ConversationTurn, ExternalRule, InvokedSkill, PhaseContext } from '../providers/types'
 
 export interface ContextBuilderDeps {
   resolveSkillContent: (skillPath: string) => string
   guardrailDefinitions?: Record<string, GuardrailDefinition>
   gateDefinitions?: Record<string, GateDefinition>
+  /** 工作流级别的外部规则定义 */
+  externalRules?: ExternalRuleConfig[]
+  /** 根据规则路径解析规则文件内容 */
+  resolveRuleContent?: (rulePath: string) => string
 }
 
 function resolveInvokedSkills(
@@ -69,6 +73,24 @@ function resolveGates(
   return lines.length > 0 ? lines : undefined
 }
 
+function resolveExternalRules(
+  ruleConfigs: ExternalRuleConfig[] | undefined,
+  resolveContent?: (rulePath: string) => string,
+): ExternalRule[] | undefined {
+  if (!ruleConfigs?.length || !resolveContent) return undefined
+
+  return ruleConfigs
+    .map((rule) => {
+      try {
+        return { id: rule.id, content: resolveContent(rule.path) }
+      }
+      catch {
+        return undefined
+      }
+    })
+    .filter((r): r is ExternalRule => r != null && r.content.length > 0)
+}
+
 export interface RequirementInfo {
   title: string
   description: string
@@ -123,6 +145,7 @@ export function buildPhaseContext(
     invokeCommands: leanMode ? undefined : interpolateCommands(phase.invoke_commands, templateVars),
     guardrails: leanMode ? undefined : resolveGuardrails(phase.guardrails, deps.guardrailDefinitions),
     gates: leanMode ? undefined : resolveGates(phase, stageGate, deps.gateDefinitions),
+    externalRules: leanMode ? undefined : resolveExternalRules(deps.externalRules, deps.resolveRuleContent),
     requiresConfirm: phase.requires_confirm,
     suspendable: phase.suspendable,
   }

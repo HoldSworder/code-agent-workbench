@@ -25,3 +25,5 @@ data/
 
 # Tauri build artifacts
 apps/desktop/src-tauri/binaries/
+
+graphify-out

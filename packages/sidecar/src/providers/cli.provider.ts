@@ -107,6 +107,7 @@ export class ExternalCliProvider implements AgentProvider {
       let assistantText = ''
       let resolved = false
       let stdoutChunks = 0
+      let lastActivityEntry = ''
 
       const finish = (result: PhaseResult) => {
         if (resolved) return
@@ -199,7 +200,7 @@ export class ExternalCliProvider implements AgentProvider {
           log(`stdout chunk #${debugFirstChunks}: ${chunk.slice(0, 300)}`)
         }
 
-        if (useStreamJson && options?.onChunk) {
+        if (useStreamJson) {
           lineBuf += chunk
           const lines = lineBuf.split('\n')
           lineBuf = lines.pop()!
@@ -213,12 +214,19 @@ export class ExternalCliProvider implements AgentProvider {
             if (text) {
               if (isComplete && assistantText.endsWith(text)) continue
               assistantText += text
-              options.onChunk(text)
+              options?.onChunk?.(text)
+            }
+
+            const activity = extractActivityEntry(normalized)
+            if (activity && activity !== lastActivityEntry) {
+              lastActivityEntry = activity
+              options?.onActivity?.(activity + '\n')
             }
           }
         }
         else {
           options?.onChunk?.(chunk)
+          options?.onActivity?.(chunk)
         }
       })
 
@@ -240,6 +248,11 @@ export class ExternalCliProvider implements AgentProvider {
             if (text) {
               assistantText += text
               options?.onChunk?.(text)
+            }
+            const activity = extractActivityEntry(normalized)
+            if (activity && activity !== lastActivityEntry) {
+              lastActivityEntry = activity
+              options?.onActivity?.(activity + '\n')
             }
           }
           lineBuf = ''
@@ -419,6 +432,12 @@ export function buildPromptFromContext(context: PhaseContext, canReadFiles = tru
 
   sections.push(buildSignalPrompt(context))
 
+  if (context.externalRules?.length) {
+    sections.push('---\n\n## 外部规则\n\n以下规则为跨阶段共享的强制约束，必须在本阶段执行过程中遵守：')
+    for (const rule of context.externalRules)
+      sections.push(rule.content)
+  }
+
   if (context.guardrails?.length)
     sections.push(`---\n\n## 护栏规则\n\n${context.guardrails.map(g => `- ${g}`).join('\n')}`)
 
@@ -460,6 +479,147 @@ function normalizeLine(raw: string): string {
 
 function stripThinkTags(text: string): string {
   return text.replace(/<\/?think(?:ing)?>/gi, '').replace(/\n{3,}/g, '\n\n')
+}
+
+function activityTimestamp(): string {
+  const d = new Date()
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
+}
+
+function extractToolName(evt: Record<string, any>): string {
+  return evt.tool ?? evt.tool_name ?? evt.name ?? 'unknown'
+}
+
+function extractToolInput(evt: Record<string, any>): string {
+  const input = evt.input ?? evt.tool_input ?? evt.params ?? {}
+  if (typeof input === 'string') return input.slice(0, 120)
+  if (input.command) return input.command.slice(0, 120)
+  if (input.path) return input.path
+  if (input.pattern) return `pattern: ${input.pattern}`
+  if (input.query) return `query: ${input.query.slice(0, 80)}`
+  if (input.glob_pattern) return input.glob_pattern
+  const keys = Object.keys(input)
+  if (keys.length === 0) return ''
+  return keys.slice(0, 3).join(', ')
+}
+
+/**
+ * Extract a human-readable activity log entry from a stream-json line.
+ * Returns null for events that don't warrant a log entry.
+ */
+function extractActivityEntry(line: string): string | null {
+  try {
+    const evt = JSON.parse(line) as Record<string, any>
+    const ts = activityTimestamp()
+
+    // ── cursor-cli: thinking delta (agent reasoning, very frequent) ──
+    if (evt.type === 'thinking' && evt.subtype === 'delta' && typeof evt.text === 'string') {
+      const snippet = evt.text.replace(/\n/g, ' ').trim().slice(-60)
+      if (snippet) return `[${ts}] 🧠 ${snippet}`
+      return null
+    }
+
+    // ── cursor-cli: text delta ──
+    if (evt.type === 'assistant' && evt.subtype === 'delta' && typeof evt.text === 'string') {
+      const snippet = stripThinkTags(evt.text).replace(/\n/g, ' ').slice(0, 80)
+      if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
+      return null
+    }
+
+    // ── cursor-cli: cumulative assistant message (parse content blocks) ──
+    if (evt.type === 'assistant' && !evt.subtype) {
+      const blocks = evt.message?.content ?? evt.content
+      if (!Array.isArray(blocks) || blocks.length === 0) return null
+      const lastBlock = blocks[blocks.length - 1]
+      if (lastBlock.type === 'tool_use') {
+        const name = lastBlock.name ?? 'unknown'
+        const input = extractToolInput(lastBlock)
+        return `[${ts}] 🔧 Tool: ${name}${input ? ` → ${input}` : ''}`
+      }
+      if (lastBlock.type === 'tool_result') {
+        const status = lastBlock.is_error ? '❌' : '✅'
+        const len = typeof lastBlock.content === 'string' ? lastBlock.content.length : 0
+        return `[${ts}] ${status} Tool result${len ? ` (${len} chars)` : ''}`
+      }
+      if (lastBlock.type === 'text') {
+        const snippet = (lastBlock.text ?? '').replace(/\n/g, ' ').trim().slice(-60)
+        if (snippet) return `[${ts}] ✍️ ${snippet}`
+      }
+      return null
+    }
+
+    // ── cursor-cli / generic: user message ──
+    if (evt.type === 'user')
+      return `[${ts}] 📨 User message received`
+
+    // ── cursor-cli / generic: system event ──
+    if (evt.type === 'system') {
+      if (evt.subtype === 'init')
+        return `[${ts}] ⚙️ Init | Model: ${evt.model ?? 'unknown'}`
+      return `[${ts}] ⚙️ System: ${evt.subtype ?? evt.message ?? ''}`
+    }
+
+    // ── claude-code: text event ──
+    if (evt.type === 'text' && typeof evt.text === 'string') {
+      const snippet = stripThinkTags(evt.text).replace(/\n/g, ' ').slice(0, 80)
+      if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
+      return null
+    }
+
+    // ── claude-code / generic: standalone tool_use event ──
+    if (evt.type === 'tool_use' || evt.subtype === 'tool_use') {
+      const tool = extractToolName(evt)
+      const input = extractToolInput(evt)
+      return `[${ts}] 🔧 Tool: ${tool}${input ? ` → ${input}` : ''}`
+    }
+
+    if (evt.type === 'assistant' && evt.subtype === 'tool_use_delta')
+      return null
+
+    // ── claude-code / generic: tool result ──
+    if (evt.type === 'tool_result' || evt.subtype === 'tool_result') {
+      const len = typeof evt.output === 'string' ? evt.output.length : (evt.content?.length ?? 0)
+      const status = evt.is_error ? '❌' : '✅'
+      return `[${ts}] ${status} Tool result${len ? ` (${len} chars)` : ''}`
+    }
+
+    // ── claude-code: stream_event wrapper ──
+    if (evt.type === 'stream_event') {
+      const inner = evt.event
+      if (!inner) return null
+      const delta = inner.delta
+      if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        const snippet = delta.text.replace(/\n/g, ' ').slice(0, 80)
+        if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
+        return null
+      }
+      if (delta?.type === 'input_json_delta') return null
+      if (inner.type === 'content_block_start') {
+        const block = inner.content_block
+        if (block?.type === 'tool_use')
+          return `[${ts}] 🔧 Tool: ${block.name ?? 'unknown'}`
+        return null
+      }
+      if (inner.type === 'content_block_stop' || inner.type === 'message_start'
+        || inner.type === 'message_stop' || inner.type === 'message_delta')
+        return null
+    }
+
+    // ── Anthropic API: content_block_delta ──
+    if (evt.type === 'content_block_delta') {
+      if (evt.delta?.type === 'text_delta') {
+        const snippet = (evt.delta.text ?? '').replace(/\n/g, ' ').slice(0, 80)
+        if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
+      }
+      return null
+    }
+
+    if (evt.type === 'result')
+      return `[${ts}] 🏁 Agent completed`
+
+    return null
+  }
+  catch { return null }
 }
 
 function extractStreamText(line: string): { text: string, isComplete: boolean } {

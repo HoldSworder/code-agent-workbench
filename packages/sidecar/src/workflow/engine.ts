@@ -59,6 +59,7 @@ export class WorkflowEngine {
   private mcpServerRepo: McpServerRepository
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
+  private liveActivityLogs = new Map<string, string>()
   private requirementLiveOutputs = new Map<string, string>()
   private activeRequirementProviders = new Map<string, AgentProvider>()
   private activatedPhases = new Map<string, Set<string>>()
@@ -132,6 +133,10 @@ export class WorkflowEngine {
 
   getLiveOutput(repoTaskId: string): string {
     return this.liveOutputs.get(repoTaskId) ?? ''
+  }
+
+  getLiveActivity(repoTaskId: string): string {
+    return this.liveActivityLogs.get(repoTaskId) ?? ''
   }
 
   // ── 依赖检查 ──
@@ -619,13 +624,21 @@ export class WorkflowEngine {
   getAdvanceOptions(repoTaskId: string): {
     defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
     optionalPhases: { phaseId: string, phaseName: string, stageId: string, entryInput?: { label: string, description?: string, placeholder?: string } }[]
+    blocked: boolean
   } {
     const task = this.taskRepo.findById(repoTaskId)
-    if (!task) return { defaultNext: null, optionalPhases: [] }
+    if (!task) return { defaultNext: null, optionalPhases: [], blocked: false }
 
     const wf = this.resolveConfigForTask(repoTaskId)
     const loc = findPhaseInStages(wf.stages, task.current_stage, task.current_phase)
-    if (!loc) return { defaultNext: null, optionalPhases: [] }
+    if (!loc) return { defaultNext: null, optionalPhases: [], blocked: false }
+
+    if (task.phase_status === 'waiting_input' && loc.phase.completion_check) {
+      const passed = this.evaluateGate(loc.phase.completion_check, task.worktree_path, task.openspec_path, wf)
+      if (!passed) {
+        return { defaultNext: null, optionalPhases: [], blocked: true }
+      }
+    }
 
     const { stageIdx, phaseIdx } = loc
     const stages = wf.stages
@@ -666,7 +679,7 @@ export class WorkflowEngine {
       collectFromPhases(nextStage.phases, 0, nextStage)
     }
 
-    return { defaultNext, optionalPhases }
+    return { defaultNext, optionalPhases, blocked: false }
   }
 
   /**
@@ -778,6 +791,7 @@ export class WorkflowEngine {
   async resetTask(repoTaskId: string): Promise<void> {
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
+    this.liveActivityLogs.delete(repoTaskId)
     this.activatedPhases.delete(repoTaskId)
 
     const task = this.taskRepo.findById(repoTaskId)
@@ -834,6 +848,7 @@ export class WorkflowEngine {
 
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
+    this.liveActivityLogs.delete(repoTaskId)
 
     let resetSha: string | null = null
     if (target.stageIdx === 0 && target.phaseIdx === 0) {
@@ -991,7 +1006,11 @@ export class WorkflowEngine {
         '',
         '',
         '',
-        { resolveSkillContent: this.resolveSkillContent },
+        {
+          resolveSkillContent: this.resolveSkillContent,
+          externalRules: this.config.external_rules,
+          resolveRuleContent: this.resolveSkillContent,
+        },
         undefined,
         undefined,
         false,
@@ -1222,6 +1241,8 @@ export class WorkflowEngine {
       resolveSkillContent: this.resolveSkillContent,
       guardrailDefinitions: wf.guardrail_definitions,
       gateDefinitions: wf.gate_definitions,
+      externalRules: wf.external_rules,
+      resolveRuleContent: this.resolveSkillContent,
     }
 
     const stageTyped = stage as StageConfig
@@ -1283,6 +1304,8 @@ export class WorkflowEngine {
       resolveSkillContent: this.resolveSkillContent,
       guardrailDefinitions: wf.guardrail_definitions,
       gateDefinitions: wf.gate_definitions,
+      externalRules: wf.external_rules,
+      resolveRuleContent: this.resolveSkillContent,
     }
 
     const stageTyped = stage as StageConfig
@@ -1364,6 +1387,8 @@ export class WorkflowEngine {
         resolveSkillContent: this.resolveSkillContent,
         guardrailDefinitions: wf.guardrail_definitions,
         gateDefinitions: wf.gate_definitions,
+        externalRules: wf.external_rules,
+        resolveRuleContent: this.resolveSkillContent,
       }
 
       const shouldInjectStageGate = stage.gate
@@ -1418,6 +1443,7 @@ export class WorkflowEngine {
       agentRunId = agentRun.id
       this.activeProviders.set(repoTaskId, provider)
       this.liveOutputs.set(repoTaskId, '')
+      this.liveActivityLogs.set(repoTaskId, '')
 
       const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
       const promptText = isResume && context.userMessage
@@ -1449,12 +1475,20 @@ export class WorkflowEngine {
         elog(`executePhase: injected ${mcpServers.length} MCP server(s) for ${stage.id}/${phase.id}`)
       }
 
+      const MAX_ACTIVITY_SIZE = 50 * 1024
       let result: PhaseResult
       try {
         result = await provider.run(context, {
           onChunk: (chunk) => {
             const current = this.liveOutputs.get(repoTaskId) ?? ''
             this.liveOutputs.set(repoTaskId, current + chunk)
+          },
+          onActivity: (entry) => {
+            let current = this.liveActivityLogs.get(repoTaskId) ?? ''
+            current += entry
+            if (current.length > MAX_ACTIVITY_SIZE)
+              current = current.slice(-MAX_ACTIVITY_SIZE)
+            this.liveActivityLogs.set(repoTaskId, current)
           },
         })
       } finally {
@@ -1478,13 +1512,17 @@ export class WorkflowEngine {
         })
       }
 
-      setTimeout(() => this.liveOutputs.delete(repoTaskId), 2000)
+      setTimeout(() => {
+        this.liveOutputs.delete(repoTaskId)
+        this.liveActivityLogs.delete(repoTaskId)
+      }, 2000)
 
       await this.handlePhaseResult(repoTaskId, phase, stage, result)
     }
     catch (err: unknown) {
       this.activeProviders.delete(repoTaskId)
       this.liveOutputs.delete(repoTaskId)
+      this.liveActivityLogs.delete(repoTaskId)
       const errMsg = err instanceof Error ? err.message : String(err)
 
       if (agentRunId)

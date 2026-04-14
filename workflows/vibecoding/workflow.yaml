@@ -29,6 +29,11 @@ gate_definitions:
       - type: command_succeeds
         command: "test $(git rev-list --count HEAD ^$(git merge-base HEAD origin/$(git remote show origin | grep 'HEAD branch' | awk '{print $NF}'))) -gt 0"
 
+external_rules:
+  - id: lark-cli-only
+    path: ../shared/rules/lark-cli-only.md
+    description: 飞书文档操作必须使用 lark-cli
+
 guardrail_definitions:
   no_uncommitted_claim:
     description: >-
