@@ -236,6 +236,8 @@ stages:
         provider: external-cli
         skill: skills/frontend/integration.md
         optional: true
+        requires_confirm: true
+        completion_check: working_tree_clean
         triggers:
           - "后端spec到了"
           - "联调"

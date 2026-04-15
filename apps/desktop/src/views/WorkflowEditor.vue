@@ -518,6 +518,7 @@ function toggleYaml() {
   showYaml.value = !showYaml.value
   if (showYaml.value) loadRawYaml()
 }
+
 </script>
 
 <template>
@@ -585,13 +586,15 @@ function toggleYaml() {
               <p class="text-[13px] text-gray-400 dark:text-gray-500 mt-0.5 max-w-xl">{{ config.description }}</p>
             </div>
           </div>
-          <button
-            class="flex items-center gap-1.5 px-3 py-2 rounded-lg text-[13px] font-medium border border-gray-200 dark:border-white/10 text-gray-500 hover:text-indigo-600 hover:border-indigo-300 dark:hover:border-indigo-500/30 transition-all shrink-0"
-            @click="toggleYaml"
-          >
-            <div class="i-carbon-code w-3.5 h-3.5" />
-            {{ showYaml ? '关闭 YAML' : 'YAML' }}
-          </button>
+          <div class="flex items-center gap-2 shrink-0">
+            <button
+              class="flex items-center gap-1.5 px-3 py-2 rounded-lg text-[13px] font-medium border border-gray-200 dark:border-white/10 text-gray-500 hover:text-indigo-600 hover:border-indigo-300 dark:hover:border-indigo-500/30 transition-all"
+              @click="toggleYaml"
+            >
+              <div class="i-carbon-code w-3.5 h-3.5" />
+              {{ showYaml ? '关闭 YAML' : 'YAML' }}
+            </button>
+          </div>
         </div>
 
         <!-- YAML Preview -->

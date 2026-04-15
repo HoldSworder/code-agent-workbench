@@ -1,5 +1,6 @@
 import type { WorkflowTool, ToolInjectionContext, InjectedTool } from './types'
 import { historyQueryTool } from './history-query.tool'
+import { inspectLogsTool } from './inspect-logs.tool'
 
 const tools: WorkflowTool[] = []
 
@@ -27,3 +28,4 @@ export function collectTools(ctx: ToolInjectionContext): InjectedTool[] {
 }
 
 registerTool(historyQueryTool)
+registerTool(inspectLogsTool)

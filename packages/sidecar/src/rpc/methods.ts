@@ -26,6 +26,7 @@ import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { OrchestratorRepository } from '../orchestrator/repository'
 import type { ConsultServer } from '../consult/server'
 import type { ConsultConfig } from '../consult/types'
+import { getAllTools, collectTools } from '../tools/registry'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -62,6 +63,7 @@ export function registerMethods(
   consultServer?: ConsultServer,
   buildConsultConfig?: () => ConsultConfig,
   workflowsDir?: string,
+  dbPath?: string,
 ): void {
   const repoRepo = new RepoRepository(db)
   const reqRepo = new RequirementRepository(db)
@@ -129,6 +131,17 @@ export function registerMethods(
     if (!ALLOWED[req.status]?.includes(status))
       throw new Error(`Cannot transition from ${req.status} to ${status}`)
     reqRepo.updateStatus(id, status)
+    return reqRepo.findById(id)
+  })
+
+  server.register('requirement.archive', async ({ id }: { id: string }) => {
+    const req = reqRepo.findById(id)
+    if (!req) throw new Error(`Requirement not found: ${id}`)
+    if (req.status === 'archived') return reqRepo.findById(id)
+    const tasks = taskRepo.findByRequirementId(id)
+    if (tasks.length > 0 && !tasks.every(t => t.phase_status === 'completed'))
+      throw new Error('Cannot archive: not all tasks are completed')
+    reqRepo.updateStatus(id, 'archived')
     return reqRepo.findById(id)
   })
 
@@ -504,6 +517,38 @@ export function registerMethods(
   // ── 依赖检查 ──
   server.register('workflow.checkDependencies', async () => {
     return engine.checkDependencies()
+  })
+
+  // ── Workflow Tools ──
+
+  server.register('workflow.listTools', async () => {
+    return getAllTools().map((t) => {
+      let scriptPath: string | null = null
+      try {
+        scriptPath = t.resolveScript({} as any)
+      }
+      catch { /* path resolution may fail without real ctx */ }
+      return {
+        id: t.id,
+        name: t.name,
+        description: t.description,
+        injectionRule: t.injectionRule,
+        usage: t.usage,
+        scriptPath,
+      }
+    })
+  })
+
+  server.register('workflow.getInjectedTools', async ({ repoTaskId, phaseId }: { repoTaskId: string, phaseId: string }) => {
+    const task = taskRepo.findById(repoTaskId)
+    if (!task || !dbPath) return []
+    return collectTools({
+      db,
+      repoTaskId,
+      currentPhaseId: phaseId,
+      worktreePath: task.worktree_path,
+      dbPath,
+    }).map(t => ({ id: t.id }))
   })
 
   // ── Skills ──

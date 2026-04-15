@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsup src/index.ts --format esm --target node20 --no-splitting --external better-sqlite3 && cp -r tools dist/tools",
+    "build": "tsup src/index.ts --format esm --target node20 --no-splitting --external better-sqlite3",
     "build:sea": "bash scripts/build-sea.sh",
     "test": "vitest run",
     "test:watch": "vitest"

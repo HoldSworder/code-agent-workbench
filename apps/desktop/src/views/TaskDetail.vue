@@ -25,6 +25,7 @@ interface RepoTask {
   openspec_path: string
   worktree_path: string
   workflow_id: string | null
+  workflow_completed: number
   created_at: string
   updated_at: string
 }
@@ -565,7 +566,7 @@ onMounted(async () => {
   }
 
   if (!isPending.value) {
-    await Promise.all([refreshMessages(), loadAgentRuns()])
+    await Promise.all([refreshMessages(), loadAgentRuns(), loadInjectedTools()])
     if (isRunning.value) startPolling()
   }
 })
@@ -876,6 +877,29 @@ async function previewPhasePrompt() {
   }
 }
 
+// ── Injected Tools ──
+
+interface InjectedToolRef { id: string }
+
+const injectedTools = ref<InjectedToolRef[]>([])
+const showToolsPopover = ref(false)
+
+async function loadInjectedTools() {
+  const phaseId = viewingPhaseId.value ?? task.value?.current_phase
+  if (!task.value || !phaseId) { injectedTools.value = []; return }
+  try {
+    const res = await rpc<InjectedToolRef[]>('workflow.getInjectedTools', {
+      repoTaskId: task.value.id,
+      phaseId,
+    })
+    injectedTools.value = res ?? []
+  } catch {
+    injectedTools.value = []
+  }
+}
+
+watch(() => viewingPhaseId.value, () => loadInjectedTools())
+
 const cancelling = ref(false)
 
 async function handleAbort() {
@@ -1053,6 +1077,38 @@ async function handleCancel() {
         <div class="i-carbon-view w-3.5 h-3.5" />
         提示词
       </button>
+
+      <!-- Injected tools badge -->
+      <div v-if="injectedTools.length > 0 && !isPending" class="relative">
+        <button
+          class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-colors"
+          title="当前阶段注入的工具"
+          @click="showToolsPopover = !showToolsPopover"
+        >
+          <div class="i-carbon-tool-box w-3.5 h-3.5" />
+          {{ injectedTools.length }} 工具
+        </button>
+        <div v-if="showToolsPopover" class="fixed inset-0 z-40" @click="showToolsPopover = false" />
+        <Transition
+          enter-active-class="transition-all duration-150 ease-out"
+          leave-active-class="transition-all duration-100 ease-in"
+          enter-from-class="opacity-0 scale-95"
+          leave-to-class="opacity-0 scale-95"
+        >
+          <div
+            v-if="showToolsPopover"
+            class="absolute right-0 top-full mt-1 z-50 min-w-48 rounded-lg bg-white dark:bg-[#2c2c30] border border-gray-200 dark:border-white/10 shadow-lg shadow-black/10 dark:shadow-black/30 py-1.5"
+          >
+            <div class="px-3 py-1.5 text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wide">
+              已注入工具
+            </div>
+            <div v-for="t in injectedTools" :key="t.id" class="px-3 py-1.5 text-[12px] text-gray-700 dark:text-gray-300 flex items-center gap-2">
+              <div class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+              {{ t.id }}
+            </div>
+          </div>
+        </Transition>
+      </div>
 
       <!-- Tab toggle -->
       <div v-if="!isPending" class="flex bg-gray-100 dark:bg-white/5 rounded-lg p-0.5">
@@ -1683,6 +1739,15 @@ async function handleCancel() {
                 <div class="i-carbon-chat w-10 h-10 mx-auto mb-2 opacity-30" />
                 <p>暂无对话记录</p>
               </div>
+            </div>
+
+            <!-- Workflow completed hint -->
+            <div
+              v-if="task && (task.phase_status === 'completed' || task.phase_status === 'waiting_event') && hasAnyMessages"
+              class="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-50/60 dark:bg-emerald-500/[0.06] border border-emerald-200/40 dark:border-emerald-500/10 text-[12px] text-emerald-600 dark:text-emerald-400"
+            >
+              <div class="i-carbon-checkmark-outline w-4 h-4 shrink-0" />
+              <span>工作流已完成所有阶段，你可以继续输入指令对当前阶段进行追加操作。</span>
             </div>
           </div>
         </div>

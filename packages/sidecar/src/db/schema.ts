@@ -35,6 +35,7 @@ export function applySchema(db: Database.Database): void {
       openspec_path TEXT NOT NULL,
       worktree_path TEXT NOT NULL,
       workflow_id TEXT,
+      workflow_completed INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -150,6 +151,13 @@ export function applySchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_orchestrator_runs_requirement ON orchestrator_runs(requirement_id);
     CREATE INDEX IF NOT EXISTS idx_assignments_run ON assignments(run_id);
     CREATE INDEX IF NOT EXISTS idx_orchestrator_events_run ON orchestrator_events(run_id);
+
+    CREATE TABLE IF NOT EXISTS activated_phases (
+      repo_task_id TEXT NOT NULL REFERENCES repo_tasks(id),
+      phase_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (repo_task_id, phase_id)
+    );
   `)
 
   // Migrations: add doc_url column to requirements for existing DBs
@@ -234,6 +242,7 @@ export function applySchema(db: Database.Database): void {
           openspec_path TEXT NOT NULL,
           worktree_path TEXT NOT NULL,
           workflow_id TEXT,
+          workflow_completed INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -241,6 +250,7 @@ export function applySchema(db: Database.Database): void {
           id, requirement_id, repo_id, branch_name, change_id,
           current_stage, current_phase, phase_status,
           openspec_path, worktree_path, workflow_id,
+          CASE WHEN phase_status = 'completed' THEN 1 ELSE 0 END,
           created_at, updated_at
         FROM repo_tasks;
         DROP TABLE repo_tasks;
@@ -256,5 +266,11 @@ export function applySchema(db: Database.Database): void {
   const assignCols = db.prepare(`PRAGMA table_info(assignments)`).all() as { name: string }[]
   if (!assignCols.some(c => c.name === 'repo_id')) {
     db.exec(`ALTER TABLE assignments ADD COLUMN repo_id TEXT`)
+  }
+
+  // Migration: add workflow_completed flag to repo_tasks
+  const taskCols3 = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
+  if (!taskCols3.some(c => c.name === 'workflow_completed')) {
+    db.exec(`ALTER TABLE repo_tasks ADD COLUMN workflow_completed INTEGER NOT NULL DEFAULT 0`)
   }
 }

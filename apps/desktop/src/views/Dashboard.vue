@@ -106,6 +106,9 @@ function getReqSortTime(reqId: string, createdAt: string): number {
 }
 
 function deriveEffectiveStatus(req: { id: string, status: string }): string {
+  if (req.status === 'archived')
+    return 'archived'
+
   if (req.status === 'pending_acceptance')
     return 'active'
 
@@ -114,6 +117,9 @@ function deriveEffectiveStatus(req: { id: string, status: string }): string {
 
   const tasks = taskMap.value[req.id] ?? []
   if (tasks.length === 0) return req.status
+
+  if (tasks.every(t => t.workflow_completed))
+    return 'completed'
 
   const statuses = tasks.map(t => t.phase_status)
 
@@ -721,9 +727,17 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
               class="bg-white dark:bg-[#28282c] rounded-lg p-3.5 shadow-sm shadow-black/[0.04] dark:shadow-none transition-all duration-200 hover:shadow-md hover:shadow-black/[0.08] cursor-pointer"
               @click="openReqDetail(req.id)"
             >
-              <!-- 标题 + 删除 -->
+              <!-- 标题 + 操作 -->
               <div class="flex items-start gap-2">
                 <h4 class="flex-1 min-w-0 text-[13px] font-semibold leading-snug line-clamp-2">{{ req.title }}</h4>
+                <button
+                  v-if="deriveEffectiveStatus(req) === 'completed'"
+                  class="shrink-0 p-0.5 rounded text-gray-300 dark:text-gray-600 hover:text-indigo-500 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-colors"
+                  title="归档需求"
+                  @click.stop="requirementsStore.archive(req.id)"
+                >
+                  <div class="i-carbon-archive w-3 h-3" />
+                </button>
                 <button
                   class="shrink-0 p-0.5 rounded text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
                   title="删除需求"

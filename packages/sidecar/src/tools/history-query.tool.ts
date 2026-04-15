@@ -6,16 +6,14 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
 /**
- * Resolve absolute path to `tools/query-history.sh`.
- * Works in both dev (`tsx`) and production (`tsup` bundle) layouts:
- *   dev:  src/workflow/tools/  -> ../../tools/query-history.sh  (3 levels up to sidecar/)
- *   prod: dist/                -> ../tools/query-history.sh     (1 level up to sidecar/)
- *
- * We try the dev path first, then fallback to prod.
+ * Resolve absolute path to project-root `tools/query-history.sh`.
+ * Layout (from this file's perspective):
+ *   dev:  packages/sidecar/src/tools/  -> 4 levels up -> <root>/tools/
+ *   prod: packages/sidecar/dist/       -> 3 levels up -> <root>/tools/
  */
 function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', 'tools', 'query-history.sh')
-  const prodPath = resolve(__dirname, '..', 'tools', 'query-history.sh')
+  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'query-history.sh')
+  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'query-history.sh')
   try {
     // eslint-disable-next-line ts/no-require-imports
     const { existsSync } = require('node:fs') as typeof import('node:fs')
@@ -29,6 +27,9 @@ function resolveScriptPath(): string {
 export const historyQueryTool: WorkflowTool = {
   id: 'history-query',
   name: '历史对话查询',
+  description: '当同一任务的其他阶段存在对话记录时自动注入，允许 Agent 渐进式搜索之前阶段的问答内容。',
+  injectionRule: '当同一任务的其他阶段存在对话记录时注入',
+  usage: 'query-history.sh --db <path> --task <id> --phase <id> <command>\n命令: list | get <phase-id> [limit] [offset] | search "<keyword>" [limit]',
 
   shouldInject(ctx: ToolInjectionContext): boolean {
     const row = ctx.db.prepare(`

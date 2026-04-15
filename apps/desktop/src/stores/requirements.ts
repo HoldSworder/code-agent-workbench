@@ -71,5 +71,12 @@ export const useRequirementsStore = defineStore('requirements', () => {
     if (idx >= 0) requirements.value[idx] = req
   }
 
-  return { requirements, loading, fetchAll, create, refreshOne, remove, updateMode, updateStatus }
+  async function archive(id: string) {
+    const req = await rpc<Requirement>('requirement.archive', { id })
+    if (!req) return
+    const idx = requirements.value.findIndex(r => r.id === id)
+    if (idx >= 0) requirements.value[idx] = req
+  }
+
+  return { requirements, loading, fetchAll, create, refreshOne, remove, updateMode, updateStatus, archive }
 })

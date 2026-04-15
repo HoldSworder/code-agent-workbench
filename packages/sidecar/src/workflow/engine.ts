@@ -18,14 +18,15 @@ import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { MessageRepository } from '../db/repositories/message.repo'
 import { RequirementRepository } from '../db/repositories/requirement.repo'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
+import { ActivatedPhaseRepository } from '../db/repositories/activated-phase.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { git, getHead, getMergeBase, resetHard, getCurrentBranch } from '../git/operations'
+import { git, getHead, getMergeBase, resetHard, stashIfDirty, getCurrentBranch } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
-import { collectTools } from './tools/registry'
+import { collectTools } from '../tools/registry'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
@@ -59,13 +60,13 @@ export class WorkflowEngine {
   private settingsRepo: SettingsRepository
   private cliType: string
   private mcpServerRepo: McpServerRepository
+  private activatedPhaseRepo: ActivatedPhaseRepository
   private dbPath: string
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
   private liveActivityLogs = new Map<string, string>()
   private requirementLiveOutputs = new Map<string, string>()
   private activeRequirementProviders = new Map<string, AgentProvider>()
-  private activatedPhases = new Map<string, Set<string>>()
   private pendingAdvance = new Set<string>()
 
   private rawYaml: string
@@ -89,6 +90,7 @@ export class WorkflowEngine {
     this.mcpServerRepo = new McpServerRepository(this.db)
     this.repoRepo = new RepoRepository(this.db)
     this.settingsRepo = new SettingsRepository(this.db)
+    this.activatedPhaseRepo = new ActivatedPhaseRepository(this.db)
   }
 
   addWorkflow(id: string, yamlContent: string): void {
@@ -350,16 +352,11 @@ export class WorkflowEngine {
   // ── Optional phase 激活 ──
 
   private activatePhase(repoTaskId: string, phaseId: string): void {
-    let set = this.activatedPhases.get(repoTaskId)
-    if (!set) {
-      set = new Set()
-      this.activatedPhases.set(repoTaskId, set)
-    }
-    set.add(phaseId)
+    this.activatedPhaseRepo.activate(repoTaskId, phaseId)
   }
 
   private isPhaseActivated(repoTaskId: string, phaseId: string): boolean {
-    if (this.activatedPhases.get(repoTaskId)?.has(phaseId))
+    if (this.activatedPhaseRepo.isActivated(repoTaskId, phaseId))
       return true
     return this.settingsRepo.get(`phase.${phaseId}.enabled`) === 'true'
   }
@@ -510,6 +507,7 @@ export class WorkflowEngine {
 
     if (phase.is_terminal) {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
+      this.taskRepo.markWorkflowCompleted(repoTaskId)
       return
     }
 
@@ -583,24 +581,6 @@ export class WorkflowEngine {
     if (!found)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
 
-    try {
-      const currentBranch = (await getCurrentBranch(task.worktree_path)).trim()
-      if (currentBranch !== task.branch_name) {
-        elog(`resumeTask: branch mismatch current=${currentBranch} target=${task.branch_name}, switching`)
-        const status = await git(task.worktree_path, ['status', '--porcelain'])
-        if (status.trim()) {
-          await git(task.worktree_path, ['stash', 'push', '-m', `auto-stash before resume ${repoTaskId}`])
-          elog(`resumeTask: stashed uncommitted changes on branch ${currentBranch}`)
-        }
-        await git(task.worktree_path, ['checkout', task.branch_name])
-        elog(`resumeTask: checked out ${task.branch_name}`)
-      }
-    }
-    catch (err) {
-      elog(`resumeTask: branch switch failed: ${err}`)
-      throw new Error(`Failed to switch to branch ${task.branch_name}: ${err}`)
-    }
-
     this.msgRepo.create({
       repo_task_id: repoTaskId,
       phase_id: task.current_phase,
@@ -614,7 +594,7 @@ export class WorkflowEngine {
   async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} feedback=${feedback.slice(0, 100)}`)
-    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended', 'failed', 'cancelled']
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended', 'failed', 'cancelled', 'completed', 'waiting_event']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
 
@@ -643,7 +623,7 @@ export class WorkflowEngine {
   async confirmAndExecute(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`confirmAndExecute: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
-    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended']
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended', 'waiting_event']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
 
@@ -743,7 +723,7 @@ export class WorkflowEngine {
   async confirmAndAdvanceToPhase(repoTaskId: string, targetPhaseId: string, input?: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`confirmAndAdvanceToPhase: task=${repoTaskId} target=${targetPhaseId} phase=${task?.current_phase} status=${task?.phase_status}`)
-    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended']
+    const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended', 'waiting_event', 'completed']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a confirmable state (current: ${task?.phase_status})`)
 
@@ -846,10 +826,15 @@ export class WorkflowEngine {
     await this.cancelCurrentAgent(repoTaskId)
     this.liveOutputs.delete(repoTaskId)
     this.liveActivityLogs.delete(repoTaskId)
-    this.activatedPhases.delete(repoTaskId)
+    this.activatedPhaseRepo.deleteByTask(repoTaskId)
 
     const task = this.taskRepo.findById(repoTaskId)
     if (task) {
+      try {
+        await stashIfDirty(task.worktree_path, `auto-stash before resetTask ${repoTaskId}`)
+      }
+      catch (e) { elog(`resetTask: stash failed: ${e}`) }
+
       let initialSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
       if (!initialSha) initialSha = await getMergeBase(task.worktree_path)
       if (initialSha) {
@@ -927,7 +912,10 @@ export class WorkflowEngine {
     }
 
     if (resetSha) {
-      try { await resetHard(task.worktree_path, resetSha) }
+      try {
+        await stashIfDirty(task.worktree_path, `auto-stash before rollback to ${targetStageId}/${targetPhaseId}`)
+        await resetHard(task.worktree_path, resetSha)
+      }
       catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
     }
 
@@ -1712,6 +1700,9 @@ export class WorkflowEngine {
 
     if (phase.id === 'create-branch') {
       this.syncBranchNameFromWorktree(repoTaskId)
+      this.syncBranchToFeishuProject(repoTaskId).catch(err => {
+        elog(`syncBranchToFeishuProject failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
     }
 
     if (phase.completion_check) {
@@ -1764,6 +1755,7 @@ export class WorkflowEngine {
 
     if (phase.is_terminal) {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
+      this.taskRepo.markWorkflowCompleted(repoTaskId)
       return
     }
 
@@ -1898,6 +1890,163 @@ export class WorkflowEngine {
     catch (err) {
       elog(`syncBranchName failed: ${err instanceof Error ? err.message : String(err)}`)
     }
+  }
+
+  /**
+   * create-branch 完成后，将分支名写入飞书项目工作项的"前端关联代码库"字段。
+   * 仅在需求关联了飞书项目链接且系统中配置了 lark-project MCP 时执行。
+   */
+  private async syncBranchToFeishuProject(repoTaskId: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return
+
+    const requirement = this.reqRepo.findById(task.requirement_id)
+    if (!requirement?.source_url) return
+
+    const feishuMatch = requirement.source_url.match(
+      /project\.feishu\.cn\/([^/]+)\/([^/]+)\/detail\/(\d+)/,
+    )
+    if (!feishuMatch) return
+
+    const [, projectKey, workItemType, workItemId] = feishuMatch
+    const branchName = task.branch_name
+
+    const mcpServer = this.mcpServerRepo.findByName('lark-project')
+    if (!mcpServer || !mcpServer.enabled || !mcpServer.url) {
+      elog(`syncBranchToFeishuProject: lark-project MCP not configured or disabled`)
+      return
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+      ...JSON.parse(mcpServer.headers || '{}'),
+    }
+
+    const repo = this.repoRepo.findById(task.repo_id)
+    const repoName = repo?.name ?? ''
+
+    elog(`syncBranchToFeishuProject: projectKey=${projectKey} workItemType=${workItemType} workItemId=${workItemId} branch=${branchName} repo=${repoName}`)
+
+    try {
+      const sessionId = await this.mcpInitialize(mcpServer.url, headers)
+      if (!sessionId) {
+        elog('syncBranchToFeishuProject: MCP initialize failed - no session ID')
+        return
+      }
+      const sessionHeaders = { ...headers, 'Mcp-Session-Id': sessionId }
+
+      const fieldConfig = await this.mcpToolCall(mcpServer.url, sessionHeaders, 'lark-project-list_workitem_field_config', {
+        project_key: projectKey,
+        work_item_type: workItemType,
+        field_query: '前端关联代码库',
+        page_num: 1,
+      })
+
+      const configData = this.extractMcpText(fieldConfig)
+      if (!configData) {
+        elog('syncBranchToFeishuProject: failed to get field config')
+        return
+      }
+
+      const parsed = JSON.parse(configData)
+      const compoundField = (parsed.list ?? []).find(
+        (f: any) => f.field_name === '前端关联代码库' && f.field_type === 'compound_field',
+      )
+      if (!compoundField) {
+        elog('syncBranchToFeishuProject: 前端关联代码库 compound_field not found')
+        return
+      }
+
+      const repoSubField = (compoundField.compound_field_info ?? []).find(
+        (f: any) => f.field_name === '代码仓库',
+      )
+      const branchSubField = (compoundField.compound_field_info ?? []).find(
+        (f: any) => f.field_name === '分支',
+      )
+      if (!repoSubField || !branchSubField) {
+        elog('syncBranchToFeishuProject: sub-fields not found')
+        return
+      }
+
+      let matchedOptionId: string | undefined
+      for (const opt of repoSubField.option ?? []) {
+        const optName: string = opt.option_name ?? ''
+        if (repoName && optName.toLowerCase().includes(repoName.toLowerCase())) {
+          matchedOptionId = opt.option_id
+          break
+        }
+      }
+      if (!matchedOptionId) {
+        const optionNames = (repoSubField.option ?? []).map((o: any) => o.option_name).join(', ')
+        elog(`syncBranchToFeishuProject: no matching repo option for "${repoName}" in [${optionNames}]`)
+        return
+      }
+
+      const fieldValue = JSON.stringify([[
+        { field_key: repoSubField.field_key, field_value: matchedOptionId },
+        { field_key: branchSubField.field_key, field_value: branchName },
+      ]])
+
+      await this.mcpToolCall(mcpServer.url, sessionHeaders, 'lark-project-update_field', {
+        work_item_id: workItemId,
+        project_key: projectKey,
+        fields: [{ field_key: compoundField.field_key, field_value: fieldValue }],
+      })
+
+      elog(`syncBranchToFeishuProject: updated work item ${workItemId} with repo=${matchedOptionId} branch=${branchName}`)
+    }
+    catch (err) {
+      elog(`syncBranchToFeishuProject: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  private async mcpInitialize(url: string, headers: Record<string, string>): Promise<string | null> {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent', version: '0.1.0' } },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!resp.ok) return null
+    const sessionId = resp.headers.get('mcp-session-id')
+    return sessionId ?? null
+  }
+
+  private async mcpToolCall(url: string, headers: Record<string, string>, toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: Date.now(), method: 'tools/call',
+        params: { name: toolName, arguments: args },
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!resp.ok) throw new Error(`MCP HTTP ${resp.status}`)
+    const text = await resp.text()
+    for (const line of text.split('\n')) {
+      if (line.startsWith('data: ')) {
+        return JSON.parse(line.slice(6))
+      }
+    }
+    return JSON.parse(text)
+  }
+
+  private extractMcpText(response: unknown): string | null {
+    const r = response as any
+    const contents = r?.result?.content
+    if (!Array.isArray(contents)) return null
+    if (r?.result?.isError) return null
+    for (const c of contents) {
+      if (c.type === 'text' && c.text && !c.text.startsWith('log_id:') && !c.text.startsWith('logid:')) {
+        return c.text
+      }
+    }
+    return null
   }
 
   private collectPhaseIdsAfter(stageIdx: number, phaseIdx: number, wf: WorkflowConfig): string[] {

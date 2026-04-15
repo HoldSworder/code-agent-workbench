@@ -12,24 +12,6 @@ export async function git(cwd: string, args: string[], timeoutMs?: number): Prom
 
 const FETCH_TIMEOUT_MS = 15_000
 
-export async function createWorktree(
-  repoPath: string,
-  worktreePath: string,
-  branchName: string,
-  baseBranch: string,
-): Promise<void> {
-  let useRemote = false
-  try {
-    await git(repoPath, ['fetch', '--depth=1', 'origin', baseBranch], FETCH_TIMEOUT_MS)
-    useRemote = true
-  }
-  catch {
-    // remote fetch failed or timed out — fall back to local branch
-  }
-  const base = useRemote ? `origin/${baseBranch}` : baseBranch
-  await git(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, base])
-}
-
 /**
  * Create a feature branch in the repo following the naming convention:
  * feature/<english-slug>
@@ -76,16 +58,23 @@ export async function createBranch(
   await git(repoPath, ['checkout', '-b', branchName])
 }
 
-export async function removeWorktree(repoPath: string, worktreePath: string): Promise<void> {
-  await git(repoPath, ['worktree', 'remove', worktreePath, '--force'])
-}
-
 export async function getCurrentBranch(cwd: string): Promise<string> {
   return git(cwd, ['branch', '--show-current'])
 }
 
 export async function getHead(cwd: string): Promise<string> {
   return git(cwd, ['rev-parse', 'HEAD'])
+}
+
+/**
+ * Stash any uncommitted changes (tracked + untracked) before performing
+ * a destructive git operation. Returns true if a stash was created.
+ */
+export async function stashIfDirty(cwd: string, message: string): Promise<boolean> {
+  const status = await git(cwd, ['status', '--porcelain'])
+  if (!status.trim()) return false
+  await git(cwd, ['stash', 'push', '--include-untracked', '-m', message])
+  return true
 }
 
 export async function resetHard(cwd: string, commitSha: string): Promise<void> {

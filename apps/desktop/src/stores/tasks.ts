@@ -14,6 +14,7 @@ export interface RepoTask {
   openspec_path: string
   worktree_path: string
   workflow_id: string | null
+  workflow_completed: number
   created_at: string
   updated_at: string
 }

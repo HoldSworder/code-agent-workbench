@@ -13,6 +13,7 @@ export interface RepoTask {
   openspec_path: string
   worktree_path: string
   workflow_id: string | null
+  workflow_completed: number
   created_at: string
   updated_at: string
 }
@@ -104,6 +105,12 @@ export class RepoTaskRepository {
       .run(branchName, changeId, openspecPath, id)
   }
 
+  markWorkflowCompleted(id: string): void {
+    this.db
+      .prepare(`UPDATE repo_tasks SET workflow_completed = 1, updated_at = datetime('now') WHERE id = ?`)
+      .run(id)
+  }
+
   updatePhase(id: string, currentStage: string, currentPhase: string, phaseStatus: string): void {
     this.db
       .prepare(
@@ -118,6 +125,7 @@ export class RepoTaskRepository {
 
   delete(id: string): void {
     const deleteRelated = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM activated_phases WHERE repo_task_id = ?').run(id)
       this.db.prepare('DELETE FROM phase_commits WHERE repo_task_id = ?').run(id)
       this.db.prepare('DELETE FROM conversation_messages WHERE repo_task_id = ?').run(id)
       this.db.prepare('DELETE FROM agent_runs WHERE repo_task_id = ?').run(id)

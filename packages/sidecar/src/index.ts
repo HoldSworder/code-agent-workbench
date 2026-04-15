@@ -292,7 +292,7 @@ const consultStaticDir = resolve(projectRoot, 'apps/consult/dist')
 const consultServer = new ConsultServer({ db, config: buildConsultConfig(), staticDir: consultStaticDir })
 
 const rpcServer = new RpcServer()
-registerMethods(rpcServer, db, engine, workflowPath, consultServer, buildConsultConfig, workflowsDir)
+registerMethods(rpcServer, db, engine, workflowPath, consultServer, buildConsultConfig, workflowsDir, dbPath)
 
 // 配置 RPC 始终可用（即使 team.yaml 不存在也能创建）
 registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator, () => {
