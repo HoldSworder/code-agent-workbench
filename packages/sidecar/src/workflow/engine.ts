@@ -25,6 +25,7 @@ import { SettingsRepository } from '../db/repositories/settings.repo'
 import { git, getHead, getMergeBase, resetHard, getCurrentBranch } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
+import { collectTools } from './tools/registry'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
@@ -36,6 +37,7 @@ export interface ResolveProviderOptions {
 
 export interface WorkflowEngineOptions {
   db: Database.Database
+  dbPath: string
   workflowYaml: string
   resolveProvider: (provider: string, options?: ResolveProviderOptions) => AgentProvider
   resolveSkillContent: (skillPath: string) => string
@@ -57,6 +59,7 @@ export class WorkflowEngine {
   private settingsRepo: SettingsRepository
   private cliType: string
   private mcpServerRepo: McpServerRepository
+  private dbPath: string
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
   private liveActivityLogs = new Map<string, string>()
@@ -71,6 +74,7 @@ export class WorkflowEngine {
 
   constructor(opts: WorkflowEngineOptions) {
     this.db = opts.db
+    this.dbPath = opts.dbPath
     this.config = parseWorkflow(opts.workflowYaml)
     this.rawYaml = opts.workflowYaml
     this.resolveProvider = opts.resolveProvider
@@ -910,8 +914,9 @@ export class WorkflowEngine {
       const flatIdx = allPhases.findIndex(
         p => p.id === targetPhaseId && p.stageId === targetStageId,
       )
-      if (flatIdx > 0)
-        resetSha = this.commitRepo.get(repoTaskId, allPhases[flatIdx - 1].id)
+      for (let i = flatIdx - 1; i >= 0 && !resetSha; i--) {
+        resetSha = this.commitRepo.get(repoTaskId, allPhases[i].id)
+      }
       if (!resetSha)
         resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
     }
@@ -1500,6 +1505,17 @@ export class WorkflowEngine {
         && getLastMandatoryPhaseId(stage) === phase.id
       const effectiveStageGate = shouldInjectStageGate ? stage.gate : undefined
 
+      const injectedTools = collectTools({
+        db: this.db,
+        repoTaskId,
+        currentPhaseId: phase.id,
+        worktreePath: task.worktree_path,
+        dbPath: this.dbPath,
+      })
+      const toolPrompts = injectedTools.length > 0
+        ? injectedTools.map(t => t.promptSection)
+        : undefined
+
       const context = isResume
         ? buildPhaseContext(
             phase,
@@ -1515,6 +1531,7 @@ export class WorkflowEngine {
             true,
             reqInfo,
             effectiveStageGate,
+            toolPrompts,
           )
         : buildPhaseContext(
             phase,
@@ -1530,6 +1547,7 @@ export class WorkflowEngine {
             false,
             reqInfo,
             effectiveStageGate,
+            toolPrompts,
           )
 
       const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
@@ -1724,6 +1742,16 @@ export class WorkflowEngine {
     }
 
     if (phase.requires_confirm && !shouldAutoAdvance) {
+      if (agentSignal !== 'complete') {
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: phase.id,
+          role: 'system',
+          content: `阶段「${phase.name}」等待你的反馈后继续执行。`,
+        })
+        this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
+        return
+      }
       this.msgRepo.create({
         repo_task_id: repoTaskId,
         phase_id: phase.id,

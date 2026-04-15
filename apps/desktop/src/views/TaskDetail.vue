@@ -40,7 +40,7 @@ interface ChatMessage {
 const task = ref<RepoTask | null>(null)
 const messages = ref<ChatMessage[]>([])
 const chatInput = ref('')
-const chatInputEl = ref<HTMLInputElement>()
+const chatInputEl = ref<HTMLTextAreaElement>()
 const liveOutput = ref('')
 const liveActivity = ref('')
 const processExpanded = ref(false)
@@ -832,6 +832,7 @@ function onCompositionEnd() {
 
 function onKeydownEnter(e: KeyboardEvent) {
   if (e.isComposing || composing.value) return
+  if (e.shiftKey) return
   e.preventDefault()
   sendMessage()
 }
@@ -895,11 +896,11 @@ async function handleAbort() {
 
 const resetting = ref(false)
 const showResetConfirm = ref(false)
-const rollbackPauseMode = ref(false)
+const rollbackPauseMode = ref(true)
 
 function requestReset() {
   if (!task.value || resetting.value) return
-  rollbackPauseMode.value = false
+  rollbackPauseMode.value = true
   showResetConfirm.value = true
 }
 
@@ -1688,17 +1689,18 @@ async function handleCancel() {
 
         <!-- Input bar -->
         <div class="border-t border-gray-200 dark:border-white/5 p-4 bg-white/60 dark:bg-[#1e1e22]/60 backdrop-blur-sm">
-          <div class="max-w-5xl mx-auto flex gap-2">
-            <input
+          <div class="max-w-5xl mx-auto flex items-end gap-2">
+            <textarea
               ref="chatInputEl"
               v-model="chatInput"
-              type="text"
+              rows="1"
               placeholder="输入反馈或指令..."
-              class="flex-1 px-4 py-2.5 rounded-xl bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
+              class="flex-1 px-4 py-2.5 rounded-xl bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors resize-none leading-relaxed max-h-[160px]"
+              style="field-sizing: content"
               @compositionstart="onCompositionStart"
               @compositionend="onCompositionEnd"
               @keydown.enter="onKeydownEnter"
-            >
+            />
             <button
               v-if="isRunning"
               class="px-4 py-2.5 rounded-xl bg-red-500 text-white text-[13px] font-medium hover:bg-red-400 shadow-sm shadow-red-500/20 transition-all duration-150 active:scale-[0.97] disabled:opacity-50"

@@ -107,13 +107,6 @@ stages:
         requires_confirm: true
         is_terminal: true
 
-      - id: post-deploy-fix
-        name: 测试环境 Bug 修复
-        provider: external-cli
-        skill: skills/post-deploy-fix.md
-        optional: true
-        loopable: true
-        loop_target: deploy
 
 trigger_mapping:
   - patterns: ["开始开发", "直接开发", "做个简单需求", "vibecoding"]

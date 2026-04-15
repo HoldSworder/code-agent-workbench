@@ -441,6 +441,9 @@ export function buildPromptFromContext(context: PhaseContext, canReadFiles = tru
   if (context.guardrails?.length)
     sections.push(`---\n\n## 护栏规则\n\n${context.guardrails.map(g => `- ${g}`).join('\n')}`)
 
+  if (context.injectedToolPrompts?.length)
+    sections.push(`---\n\n${context.injectedToolPrompts.join('\n\n---\n\n')}`)
+
   if (context.conversationHistory?.length) {
     sections.push('---\n\n## 历史对话')
     for (const turn of context.conversationHistory) {

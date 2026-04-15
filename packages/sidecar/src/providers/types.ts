@@ -43,6 +43,8 @@ export interface PhaseContext {
   requirementDescription?: string
   requirementDocUrl?: string
   requirementSourceUrl?: string
+  /** 由 WorkflowTool 插件自动注入的工具说明段落 */
+  injectedToolPrompts?: string[]
 }
 
 export interface PhaseResult {

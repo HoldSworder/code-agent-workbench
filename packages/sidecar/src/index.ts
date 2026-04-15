@@ -151,6 +151,7 @@ const currentCliType = () => settingsRepo.get('agent.provider') ?? 'cursor-cli'
 
 const engine = new WorkflowEngine({
   db,
+  dbPath,
   workflowYaml,
   cliType: currentCliType(),
   resolveProvider: (providerType, options) => {

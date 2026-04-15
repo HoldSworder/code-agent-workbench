@@ -172,8 +172,8 @@ state_inference:
 
     - condition: e2e_report_fail_no_consent
       stage: testing
-      phase: bug-fix
-      description: e2e-report.md 不通过且未同意带债 → Bug 修复
+      phase: e2e-test
+      description: e2e-report.md 不通过且未同意带债 → 重新进入 E2E 测试
 
     - condition: tasks_all_checked_no_e2e
       stage: testing
@@ -281,13 +281,6 @@ stages:
         requires_confirm: true
         completion_check: e2e_report_pass
 
-      - id: bug-fix
-        name: Bug 修复
-        provider: external-cli
-        skill: skills/bug-fix.md
-        optional: true
-        loopable: true
-        loop_target: e2e-test
 
   # ──────────────────────────────────────────────
   # Stage 4: 上线
@@ -304,13 +297,6 @@ stages:
           - openspec archive "{{change_id}}" --yes
         is_terminal: true
 
-      - id: post-deploy-fix
-        name: 测试环境 Bug 修复
-        provider: external-cli
-        skill: skills/post-deploy-fix.md
-        optional: true
-        loopable: true
-        loop_target: archive-deploy
 
 # trigger_mapping 为触发短语的唯一权威来源。
 # phase 级 triggers 字段引用同一短语集合，引擎匹配时合并两处。

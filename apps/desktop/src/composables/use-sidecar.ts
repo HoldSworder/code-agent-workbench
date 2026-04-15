@@ -115,7 +115,6 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         ] },
         { id: 'testing', name: '测试', phases: [
           { id: 'e2e-test', name: 'E2E 浏览器测试' },
-          { id: 'bug-fix', name: 'Bug 修复' },
         ] },
         { id: 'release', name: '上线', phases: [
           { id: 'archive-deploy', name: '归档与发布' },
@@ -160,7 +159,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
             { condition: 'has_proposal_and_specs_no_tasks', stage: 'planning', phase: 'task-breakdown', description: '有 proposal + specs 但无 tasks → 任务拆分' },
             { condition: 'tasks_has_unchecked', stage: 'development', phase: 'tdd-dev', description: 'tasks.md 有未勾选项 → 代码开发' },
             { condition: 'e2e_report_pass', stage: 'release', phase: 'archive-deploy', description: 'e2e-report 通过 → 可归档发布' },
-            { condition: 'e2e_report_fail_no_consent', stage: 'testing', phase: 'bug-fix', description: 'e2e-report 不通过且未同意带债 → Bug 修复' },
+            { condition: 'e2e_report_fail_no_consent', stage: 'testing', phase: 'e2e-test', description: 'e2e-report 不通过且未同意带债 → 重新进入 E2E 测试' },
             { condition: 'tasks_all_checked_no_e2e', stage: 'testing', phase: 'e2e-test', description: '任务全部完成但无 E2E 报告 → 进入测试' },
             { condition: 'tasks_all_checked', stage: 'development', phase: 'self-test', description: 'tasks.md 全部勾选 → 代码 Review' },
           ],
@@ -184,11 +183,9 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
           ] },
           { id: 'testing', name: '测试', gate: 'e2e_report_pass', phases: [
             { id: 'e2e-test', name: 'E2E 浏览器测试', provider: 'external-cli', skill: 'skills/frontend/e2e-test.md', requires_confirm: false, completion_check: 'e2e_report_pass' },
-            { id: 'bug-fix', name: 'Bug 修复', provider: 'external-cli', skill: 'skills/frontend/bug-fix.md', optional: true, loopable: true, loop_target: 'e2e-test', requires_confirm: false },
           ] },
           { id: 'release', name: '上线', phases: [
             { id: 'archive-deploy', name: '归档与发布', provider: 'external-cli', skill: 'skills/frontend/archive-deploy.md', requires_confirm: true, invoke_commands: ['openspec archive "{{change_id}}" --yes'], is_terminal: true },
-            { id: 'post-deploy-fix', name: '测试环境 Bug 修复', provider: 'external-cli', skill: 'skills/frontend/post-deploy-fix.md', optional: true, loopable: true, loop_target: 'archive-deploy', requires_confirm: false },
           ] },
         ],
         trigger_mapping: [

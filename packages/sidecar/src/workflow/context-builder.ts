@@ -116,6 +116,7 @@ export function buildPhaseContext(
   leanMode?: boolean,
   requirement?: RequirementInfo,
   stageGate?: string,
+  injectedToolPrompts?: string[],
 ): PhaseContext {
   const templateVars: Record<string, string> = {
     openspec_path: openspecPath,
@@ -148,5 +149,6 @@ export function buildPhaseContext(
     externalRules: leanMode ? undefined : resolveExternalRules(deps.externalRules, deps.resolveRuleContent),
     requiresConfirm: phase.requires_confirm,
     suspendable: phase.suspendable,
+    injectedToolPrompts: leanMode ? undefined : injectedToolPrompts,
   }
 }
