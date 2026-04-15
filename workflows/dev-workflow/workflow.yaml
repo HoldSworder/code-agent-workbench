@@ -17,6 +17,17 @@ dependencies:
       - openspec status
       - openspec archive
 
+  playwright-cli:
+    type: cli
+    check: "which playwright-cli"
+    install_hint: "npm install -g @playwright/cli@latest && playwright-cli install --skills"
+    commands:
+      - playwright-cli open
+      - playwright-cli snapshot
+      - playwright-cli click
+      - playwright-cli fill
+      - playwright-cli screenshot
+
   superpowers:
     type: skill-pack
     skills:
@@ -245,6 +256,7 @@ stages:
         provider: external-cli
         skill: skills/integration.md
         optional: true
+        requires_confirm: true
         triggers:
           - "后端spec到了"
           - "联调"

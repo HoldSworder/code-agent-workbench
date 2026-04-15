@@ -10,7 +10,7 @@ import { spawn as spawnChild } from 'node:child_process'
 import { resolve, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, writeFileSync, readFileSync } from 'node:fs'
 import { stringify as yamlStringify } from 'yaml'
 import type { WorkflowEngine } from '../workflow/engine'
 import { parseWorkflow } from '../workflow/parser'
@@ -61,6 +61,7 @@ export function registerMethods(
   workflowPath?: string,
   consultServer?: ConsultServer,
   buildConsultConfig?: () => ConsultConfig,
+  workflowsDir?: string,
 ): void {
   const repoRepo = new RepoRepository(db)
   const reqRepo = new RequirementRepository(db)
@@ -333,6 +334,10 @@ export function registerMethods(
     })
     return { ok: true }
   })
+  server.register('workflow.resume', async ({ repoTaskId }) => {
+    await engine.resumeTask(repoTaskId)
+    return { ok: true }
+  })
   server.register('workflow.feedback', async ({ repoTaskId, feedback }) => {
     engine.provideFeedback(repoTaskId, feedback).catch((err) => {
       process.stderr.write(`[workflow] feedback failed for ${repoTaskId}: ${err}\n`)
@@ -381,9 +386,36 @@ export function registerMethods(
     })
     return { ok: true }
   })
+  server.register('workflow.rollbackPaused', async ({ repoTaskId, targetStageId, targetPhaseId }) => {
+    engine.rollbackToPhase(repoTaskId, targetStageId, targetPhaseId, { pauseAfterRollback: true }).catch((err) => {
+      process.stderr.write(`[workflow] rollbackPaused to ${targetStageId}/${targetPhaseId} failed for ${repoTaskId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
+  server.register('workflow.rollbackToMessage', async ({ repoTaskId, messageId }) => {
+    engine.rollbackToMessage(repoTaskId, messageId).catch((err) => {
+      process.stderr.write(`[workflow] rollbackToMessage ${messageId} failed for ${repoTaskId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
 
   server.register('workflow.phases', async ({ workflowId }: { workflowId?: string } = {}) => {
     return { stages: engine.getStagesAndPhases(workflowId) }
+  })
+
+  server.register('workflow.reload', async ({ workflowId }: { workflowId?: string } = {}) => {
+    let yamlPath: string | undefined
+    if (!workflowId || workflowId === 'default') {
+      yamlPath = workflowPath
+    }
+    else if (workflowsDir) {
+      yamlPath = resolve(workflowsDir, workflowId, 'workflow.yaml')
+    }
+    if (!yamlPath || !existsSync(yamlPath))
+      throw new Error(`Workflow YAML not found for "${workflowId ?? 'default'}"`)
+    const yaml = readFileSync(yamlPath, 'utf-8')
+    engine.reloadWorkflow(workflowId ?? 'default', yaml)
+    return { ok: true }
   })
 
   server.register('workflow.requirementPhases', async () => {

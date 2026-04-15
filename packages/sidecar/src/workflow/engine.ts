@@ -22,7 +22,7 @@ import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { git, getHead, getMergeBase, resetHard } from '../git/operations'
+import { git, getHead, getMergeBase, resetHard, getCurrentBranch } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
 
@@ -91,6 +91,17 @@ export class WorkflowEngine {
     const config = parseWorkflow(yamlContent)
     this.configs.set(id, config)
     this.rawYamls.set(id, yamlContent)
+  }
+
+  reloadWorkflow(workflowId: string, yamlContent: string): void {
+    if (!workflowId || workflowId === 'default') {
+      this.config = parseWorkflow(yamlContent)
+      this.rawYaml = yamlContent
+    }
+    else {
+      this.configs.set(workflowId, parseWorkflow(yamlContent))
+      this.rawYamls.set(workflowId, yamlContent)
+    }
   }
 
   listWorkflows(): { id: string, name: string, description: string }[] {
@@ -557,6 +568,45 @@ export class WorkflowEngine {
     this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'suspended')
   }
 
+  async resumeTask(repoTaskId: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    elog(`resumeTask: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status}`)
+    if (!task || task.phase_status !== 'suspended')
+      throw new Error(`Task ${repoTaskId} is not suspended (current: ${task?.phase_status})`)
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, task.current_phase)
+    if (!found)
+      throw new Error(`Phase ${task.current_phase} not found in workflow config`)
+
+    try {
+      const currentBranch = (await getCurrentBranch(task.worktree_path)).trim()
+      if (currentBranch !== task.branch_name) {
+        elog(`resumeTask: branch mismatch current=${currentBranch} target=${task.branch_name}, switching`)
+        const status = await git(task.worktree_path, ['status', '--porcelain'])
+        if (status.trim()) {
+          await git(task.worktree_path, ['stash', 'push', '-m', `auto-stash before resume ${repoTaskId}`])
+          elog(`resumeTask: stashed uncommitted changes on branch ${currentBranch}`)
+        }
+        await git(task.worktree_path, ['checkout', task.branch_name])
+        elog(`resumeTask: checked out ${task.branch_name}`)
+      }
+    }
+    catch (err) {
+      elog(`resumeTask: branch switch failed: ${err}`)
+      throw new Error(`Failed to switch to branch ${task.branch_name}: ${err}`)
+    }
+
+    this.msgRepo.create({
+      repo_task_id: repoTaskId,
+      phase_id: task.current_phase,
+      role: 'system',
+      content: `需求已恢复，当前在阶段「${found.phase.name}」，你可以继续输入联调信息或其他指令。`,
+    })
+
+    this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'waiting_input')
+  }
+
   async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} feedback=${feedback.slice(0, 100)}`)
@@ -827,8 +877,9 @@ export class WorkflowEngine {
     repoTaskId: string,
     targetStageId: string,
     targetPhaseId: string,
+    options?: { pauseAfterRollback?: boolean },
   ): Promise<void> {
-    elog(`rollbackToPhase: task=${repoTaskId} targetStage=${targetStageId} targetPhase=${targetPhaseId}`)
+    elog(`rollbackToPhase: task=${repoTaskId} targetStage=${targetStageId} targetPhase=${targetPhaseId} pause=${options?.pauseAfterRollback ?? false}`)
     const task = this.taskRepo.findById(repoTaskId)
     if (!task)
       throw new Error(`Task not found: ${repoTaskId}`)
@@ -880,16 +931,70 @@ export class WorkflowEngine {
     this.runRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
 
-    this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'running')
-    await this.executePhase(repoTaskId, target.phase, target.stage, undefined, { skipEntryGate: true })
+    if (options?.pauseAfterRollback) {
+      this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'waiting_input')
+      this.msgRepo.create({
+        repo_task_id: repoTaskId,
+        phase_id: targetPhaseId,
+        role: 'system',
+        content: `已回滚到阶段「${target.phase.name}」，等待你的输入后继续。`,
+      })
+    }
+    else {
+      this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'running')
+      await this.executePhase(repoTaskId, target.phase, target.stage, undefined, { skipEntryGate: true })
+    }
   }
 
-  async rollbackToStage(repoTaskId: string, targetStageId: string): Promise<void> {
+  async rollbackToStage(repoTaskId: string, targetStageId: string, options?: { pauseAfterRollback?: boolean }): Promise<void> {
     const wf = this.resolveConfigForTask(repoTaskId)
     const stage = wf.stages.find(s => s.id === targetStageId)
     if (!stage)
       throw new Error(`Stage "${targetStageId}" not found`)
-    await this.rollbackToPhase(repoTaskId, targetStageId, stage.phases[0].id)
+    await this.rollbackToPhase(repoTaskId, targetStageId, stage.phases[0].id, options)
+  }
+
+  async rollbackToMessage(repoTaskId: string, messageId: string): Promise<void> {
+    elog(`rollbackToMessage: task=${repoTaskId} messageId=${messageId}`)
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task)
+      throw new Error(`Task not found: ${repoTaskId}`)
+
+    const msg = this.msgRepo.findById(messageId)
+    if (!msg || msg.repo_task_id !== repoTaskId)
+      throw new Error(`Message not found or does not belong to task: ${messageId}`)
+
+    await this.cancelCurrentAgent(repoTaskId)
+    this.liveOutputs.delete(repoTaskId)
+    this.liveActivityLogs.delete(repoTaskId)
+
+    this.msgRepo.deleteAfterMessage(repoTaskId, msg.phase_id, msg.created_at)
+    this.runRepo.deleteByTaskPhaseAfterTime(repoTaskId, msg.phase_id, msg.created_at)
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, msg.phase_id)
+    const phaseName = found?.phase.name ?? msg.phase_id
+
+    if (found) {
+      const laterPhases = this.collectPhaseIdsAfter(
+        found.stageIdx, found.phaseIdx + 1, wf,
+      )
+      if (laterPhases.length) {
+        this.msgRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+        this.runRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+        this.commitRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+      }
+    }
+
+    this.msgRepo.create({
+      repo_task_id: repoTaskId,
+      phase_id: msg.phase_id,
+      role: 'system',
+      content: `已回退到指定消息，阶段「${phaseName}」等待你的输入后继续。`,
+    })
+
+    const stageId = found?.stage.id ?? task.current_stage
+    this.taskRepo.updatePhase(repoTaskId, stageId, msg.phase_id, 'waiting_input')
   }
 
   getFullConfig(): WorkflowConfig {

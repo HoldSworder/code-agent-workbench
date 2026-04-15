@@ -57,6 +57,16 @@ export class MessageRepository {
       .all(taskId, phaseId) as Message[]
   }
 
+  findById(id: string): Message | undefined {
+    return this.db.prepare('SELECT * FROM conversation_messages WHERE id = ?').get(id) as Message | undefined
+  }
+
+  deleteAfterMessage(taskId: string, phaseId: string, afterCreatedAt: string): void {
+    this.db.prepare(
+      `DELETE FROM conversation_messages WHERE repo_task_id = ? AND phase_id = ? AND created_at > ?`,
+    ).run(taskId, phaseId, afterCreatedAt)
+  }
+
   findByTask(taskId: string): Message[] {
     return this.db
       .prepare(

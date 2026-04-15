@@ -466,7 +466,11 @@ async function pollLiveOutput() {
       if (t.phase_status !== 'running') {
         clearInterval(pollTimer!)
         pollTimer = null
-        await Promise.all([refreshMessages(), loadAgentRuns()])
+        const [, phasesRes] = await Promise.all([
+          Promise.all([refreshMessages(), loadAgentRuns()]),
+          rpc<{ stages: WorkflowStage[] }>('workflow.phases', { workflowId: selectedWorkflowId.value || undefined }),
+        ])
+        if (phasesRes?.stages) workflowStages.value = phasesRes.stages
         liveOutput.value = ''
         liveActivity.value = ''
         processExpanded.value = false
@@ -794,6 +798,26 @@ async function handleSuspend() {
   if (t) task.value = t
 }
 
+async function handleResume() {
+  if (!task.value) return
+  await rpc('workflow.resume', { repoTaskId: task.value.id })
+  await new Promise(r => setTimeout(r, 500))
+  const t = await rpc<RepoTask>('task.get', { id: taskId })
+  if (t) task.value = t
+}
+
+async function handleRollbackToMessage(messageId: string) {
+  if (!task.value) return
+  await rpc('workflow.rollbackToMessage', { repoTaskId: task.value.id, messageId })
+  await new Promise(r => setTimeout(r, 300))
+  const t = await rpc<RepoTask>('task.get', { id: taskId })
+  if (t) {
+    task.value = t
+    viewingPhaseId.value = t.current_phase
+  }
+  await refreshMessages()
+}
+
 const composing = ref(false)
 let compositionEndTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -871,9 +895,11 @@ async function handleAbort() {
 
 const resetting = ref(false)
 const showResetConfirm = ref(false)
+const rollbackPauseMode = ref(false)
 
 function requestReset() {
   if (!task.value || resetting.value) return
+  rollbackPauseMode.value = false
   showResetConfirm.value = true
 }
 
@@ -885,7 +911,8 @@ async function confirmReset() {
     if (isViewingPastPhase.value && viewingPhaseId.value) {
       rollingBack.value = true
       const targetPhase = flatPhases.value.find(p => p.id === viewingPhaseId.value)
-      await rpc('workflow.rollback', {
+      const rpcMethod = rollbackPauseMode.value ? 'workflow.rollbackPaused' : 'workflow.rollback'
+      await rpc(rpcMethod, {
         repoTaskId: task.value.id,
         targetStageId: targetPhase?.stageId ?? task.value.current_stage,
         targetPhaseId: viewingPhaseId.value,
@@ -905,7 +932,7 @@ async function confirmReset() {
       viewingPhaseId.value = t.current_phase
     }
     await refreshMessages()
-    startPolling()
+    if (!rollbackPauseMode.value) startPolling()
   }
   finally {
     resetting.value = false
@@ -1294,27 +1321,37 @@ async function handleCancel() {
                 <!-- User / Assistant bubbles -->
                 <div
                   v-else
-                  class="flex"
+                  class="flex group/msg"
                   :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
                 >
-                  <div
-                    class="max-w-[85%] min-w-0 rounded-2xl px-4 py-3 text-[13px] leading-relaxed overflow-hidden"
-                    :class="msg.role === 'user'
-                      ? 'bg-indigo-600 text-white rounded-br-md'
-                      : 'bg-white dark:bg-[#28282c] text-gray-700 dark:text-gray-200 rounded-bl-md shadow-sm shadow-black/[0.04] dark:shadow-none'"
-                  >
+                  <div class="flex flex-col max-w-[85%] min-w-0">
                     <div
-                      v-if="msg.role === 'assistant'"
-                      class="prose-chat"
-                      v-html="md.render(msg.content)"
-                    />
-                    <p v-else class="whitespace-pre-wrap">{{ msg.content }}</p>
-                    <div
-                      class="text-[11px] mt-1.5 text-right tabular-nums"
-                      :class="msg.role === 'user' ? 'text-indigo-300' : 'text-gray-300 dark:text-gray-600'"
+                      class="rounded-2xl px-4 py-3 text-[13px] leading-relaxed overflow-hidden"
+                      :class="msg.role === 'user'
+                        ? 'bg-indigo-600 text-white rounded-br-md'
+                        : 'bg-white dark:bg-[#28282c] text-gray-700 dark:text-gray-200 rounded-bl-md shadow-sm shadow-black/[0.04] dark:shadow-none'"
                     >
-                      {{ formatTime(msg.created_at) }}
+                      <div
+                        v-if="msg.role === 'assistant'"
+                        class="prose-chat"
+                        v-html="md.render(msg.content)"
+                      />
+                      <p v-else class="whitespace-pre-wrap">{{ msg.content }}</p>
+                      <div
+                        class="text-[11px] mt-1.5 text-right tabular-nums"
+                        :class="msg.role === 'user' ? 'text-indigo-300' : 'text-gray-300 dark:text-gray-600'"
+                      >
+                        {{ formatTime(msg.created_at) }}
+                      </div>
                     </div>
+                    <button
+                      v-if="!isRunning && !isPending && msg.role !== 'prompt'"
+                      class="self-end mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/msg:opacity-100 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-all"
+                      @click="handleRollbackToMessage(msg.id)"
+                    >
+                      <div class="i-carbon-undo w-3 h-3" />
+                      回滚到此处
+                    </button>
                   </div>
                 </div>
               </template>
@@ -1618,7 +1655,7 @@ async function handleCancel() {
                   </button>
                   <button
                     class="px-4 py-1.5 rounded-lg bg-indigo-500 text-white text-[12px] font-medium hover:bg-indigo-400 shadow-sm shadow-indigo-500/20 transition-all duration-150 active:scale-[0.97]"
-                    @click="handleConfirmAndAdvance"
+                    @click="handleResume"
                   >
                     恢复并继续
                   </button>
@@ -2073,7 +2110,7 @@ async function handleCancel() {
                 {{ isViewingPastPhase ? '确认回滚' : '确认重置当前阶段' }}
               </h3>
             </div>
-            <p class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed mb-5 pl-[42px]">
+            <p class="text-[13px] text-gray-500 dark:text-gray-400 leading-relaxed mb-4 pl-[42px]">
               <template v-if="isViewingPastPhase">
                 将回滚到「<span class="font-medium text-gray-700 dark:text-gray-200">{{ flatPhases.find(p => p.id === viewingPhaseId)?.name }}</span>」阶段，该阶段及之后的所有产出（对话、代码变更）将被清除且不可恢复。
               </template>
@@ -2081,6 +2118,32 @@ async function handleCancel() {
                 将重置当前阶段，该阶段的对话记录和代码变更将被清除并重新执行。
               </template>
             </p>
+            <div v-if="isViewingPastPhase" class="flex flex-col gap-1.5 mb-4 pl-[42px]">
+              <label
+                class="flex items-center gap-2 cursor-pointer group"
+                @click="rollbackPauseMode = false"
+              >
+                <span
+                  class="w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center transition-colors"
+                  :class="!rollbackPauseMode ? 'border-amber-500' : 'border-gray-300 dark:border-gray-600 group-hover:border-gray-400'"
+                >
+                  <span v-if="!rollbackPauseMode" class="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                </span>
+                <span class="text-[12px] text-gray-600 dark:text-gray-300">回滚并立即开始</span>
+              </label>
+              <label
+                class="flex items-center gap-2 cursor-pointer group"
+                @click="rollbackPauseMode = true"
+              >
+                <span
+                  class="w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center transition-colors"
+                  :class="rollbackPauseMode ? 'border-amber-500' : 'border-gray-300 dark:border-gray-600 group-hover:border-gray-400'"
+                >
+                  <span v-if="rollbackPauseMode" class="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                </span>
+                <span class="text-[12px] text-gray-600 dark:text-gray-300">回滚并等待输入</span>
+              </label>
+            </div>
             <div class="flex justify-end gap-2">
               <button
                 class="px-4 py-2 rounded-lg text-[13px] text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"

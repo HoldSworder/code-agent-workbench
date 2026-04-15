@@ -641,6 +641,7 @@ function pathToProjectKey(localPath: string): string {
     .split('/')
     .filter(seg => seg && /^[\x20-\x7e]+$/.test(seg))
     .join('-')
+    .replace(/_/g, '-')
 }
 
 function findMatchingProjectDirs(

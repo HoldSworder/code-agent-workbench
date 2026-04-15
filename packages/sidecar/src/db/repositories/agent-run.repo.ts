@@ -59,6 +59,12 @@ export class AgentRunRepository {
     ).run(repoTaskId, ...phaseIds)
   }
 
+  deleteByTaskPhaseAfterTime(repoTaskId: string, phaseId: string, afterTime: string): void {
+    this.db.prepare(
+      `DELETE FROM agent_runs WHERE repo_task_id = ? AND phase_id = ? AND started_at > ?`,
+    ).run(repoTaskId, phaseId, afterTime)
+  }
+
   findByTaskId(repoTaskId: string): AgentRun[] {
     return this.db
       .prepare('SELECT * FROM agent_runs WHERE repo_task_id = ? ORDER BY started_at DESC')

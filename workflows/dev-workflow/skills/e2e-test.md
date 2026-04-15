@@ -25,11 +25,37 @@
 
 ---
 
+## 浏览器工具
+
+使用 **playwright-cli** 执行浏览器自动化。常用命令：
+
+```bash
+playwright-cli open <url>              # 打开浏览器并导航到 URL
+playwright-cli goto <url>              # 导航到新 URL
+playwright-cli snapshot                # 获取页面快照（含元素 ref）
+playwright-cli click <ref>             # 点击元素
+playwright-cli fill <ref> <text>       # 填充输入框
+playwright-cli fill <ref> <text> --submit  # 填充并提交
+playwright-cli type <text>             # 键入文本
+playwright-cli press <key>             # 按键（Enter、Tab 等）
+playwright-cli select <ref> <value>    # 选择下拉选项
+playwright-cli check <ref>             # 勾选复选框
+playwright-cli screenshot              # 截图
+playwright-cli screenshot <ref>        # 对指定元素截图
+playwright-cli console                 # 查看控制台消息
+playwright-cli network                 # 查看网络请求
+playwright-cli close                   # 关闭浏览器
+```
+
+典型交互流程：`open` → `snapshot`（获取 ref） → `click`/`fill`/`select` → `snapshot`（验证结果） → `screenshot`（留证据）。
+
+运行 `playwright-cli --help` 可查看完整命令列表。
+
+---
+
 ## 执行验证流程
 
 **INVOKE SKILL: `fe-specflow:e2e-verify`**
-
-使用 **Cursor 内置浏览器**（`browser_*` 工具）执行完整验证流程：
 
 ### 步骤 1：定位验证依据
 
@@ -58,9 +84,15 @@
 
 运行测试命令，确认结果后再进入浏览器验证。
 
-### 步骤 4：用户确认后执行 Browser 自动化
+### 步骤 4：用户确认后执行浏览器自动化
 
-使用 Cursor 内置浏览器（`browser_navigate`、`browser_snapshot`、`browser_click`、`browser_fill` 等）逐场景执行。
+使用 `playwright-cli` 逐场景执行验证：
+
+1. `playwright-cli open <应用URL>` 打开目标页面
+2. `playwright-cli snapshot` 获取页面快照和元素 ref
+3. 根据验证清单，使用 `click`、`fill`、`select` 等命令模拟用户操作
+4. 每个场景操作后 `playwright-cli snapshot` 验证页面状态
+5. `playwright-cli screenshot` 保存关键截图作为验收证据
 
 ### 步骤 5：输出验证报告
 
@@ -83,6 +115,6 @@
 ## 护栏
 
 - 不得在未确认时自动执行浏览器自动化
-- 使用 Cursor 内置浏览器（cursor-ide-browser），不用 chrome-devtools-mcp
+- 使用 `playwright-cli` 作为浏览器自动化工具
 - 验收结论是进入归档与发布（`archive-deploy.md`）的主要门禁之一
 - **与测试 spec 冲突时，在报告中显著标明差异**
