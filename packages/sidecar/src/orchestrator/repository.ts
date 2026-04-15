@@ -85,6 +85,18 @@ export class OrchestratorRepository {
       .all(requirementId) as OrchestratorRun[]
   }
 
+  deleteByRequirementId(requirementId: string): void {
+    const runIds = this.db
+      .prepare('SELECT id FROM orchestrator_runs WHERE requirement_id = ?')
+      .all(requirementId) as { id: string }[]
+    if (runIds.length === 0) return
+    const ids = runIds.map(r => r.id)
+    const placeholders = ids.map(() => '?').join(',')
+    this.db.prepare(`DELETE FROM orchestrator_events WHERE run_id IN (${placeholders})`).run(...ids)
+    this.db.prepare(`DELETE FROM assignments WHERE run_id IN (${placeholders})`).run(...ids)
+    this.db.prepare('DELETE FROM orchestrator_runs WHERE requirement_id = ?').run(requirementId)
+  }
+
   findAllRuns(limit = 50, offset = 0): OrchestratorRun[] {
     return this.db
       .prepare('SELECT * FROM orchestrator_runs ORDER BY created_at DESC LIMIT ? OFFSET ?')

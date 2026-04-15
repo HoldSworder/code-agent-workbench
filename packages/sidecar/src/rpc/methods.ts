@@ -23,6 +23,7 @@ import { listRemoteSkills, searchRemoteSkills, getRemoteSkillDetail, installRemo
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import type { CreateMcpServerInput, UpdateMcpServerInput } from '../db/repositories/mcp-server.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
+import { OrchestratorRepository } from '../orchestrator/repository'
 import type { ConsultServer } from '../consult/server'
 import type { ConsultConfig } from '../consult/types'
 
@@ -70,6 +71,7 @@ export function registerMethods(
   const commitRepo = new PhaseCommitRepository(db)
   const mcpServerRepo = new McpServerRepository(db)
   const mcpBindingRepo = new McpBindingRepository(db)
+  const orchestratorRepo = new OrchestratorRepository(db)
 
   // ── Repo CRUD ──
   server.register('repo.list', async () => repoRepo.findAll())
@@ -109,23 +111,26 @@ export function registerMethods(
   // ── Requirement CRUD ──
   server.register('requirement.list', async () => reqRepo.findAll())
   server.register('requirement.create', async (params) => {
-    const req = reqRepo.create(params)
-    if (req.mode === 'orchestrator' && req.source === 'manual')
-      reqRepo.updateStatus(req.id, 'pending')
-    return reqRepo.findById(req.id)!
+    return reqRepo.create(params)
   })
   server.register('requirement.get', async ({ id }) => reqRepo.findById(id))
   server.register('requirement.update', async ({ id, data }: { id: string, data: { title?: string, description?: string, doc_url?: string | null, mode?: string } }) => {
-    const before = reqRepo.findById(id)
     reqRepo.update(id, data)
-    if (data.mode === 'orchestrator' && before?.status === 'draft') {
-      reqRepo.updateStatus(id, 'pending')
-    }
-    else if (data.mode === 'workflow' && before?.status === 'pending') {
-      reqRepo.updateStatus(id, 'draft')
-    }
     return reqRepo.findById(id)
   })
+  server.register('requirement.updateStatus', async ({ id, status }: { id: string, status: string }) => {
+    const req = reqRepo.findById(id)
+    if (!req) throw new Error(`Requirement not found: ${id}`)
+    const ALLOWED: Record<string, string[]> = {
+      draft: ['pending'],
+      pending: ['draft'],
+    }
+    if (!ALLOWED[req.status]?.includes(status))
+      throw new Error(`Cannot transition from ${req.status} to ${status}`)
+    reqRepo.updateStatus(id, status)
+    return reqRepo.findById(id)
+  })
+
   server.register('requirement.delete', async ({ id }) => {
     await engine.cancelRequirementFetch(id).catch(() => {})
     const tasks = taskRepo.findByRequirementId(id)
@@ -133,6 +138,7 @@ export function registerMethods(
       await engine.cancelCurrentAgent(task.id).catch(() => {})
     }
     taskRepo.deleteByRequirementId(id)
+    orchestratorRepo.deleteByRequirementId(id)
     reqRepo.delete(id)
     return { ok: true }
   })
@@ -593,7 +599,11 @@ export function registerMethods(
     try {
       const resp = await fetch(targetUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...headers },
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          ...headers,
+        },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent-test', version: '0.1.0' } } }),
         signal: AbortSignal.timeout(10_000),
       })

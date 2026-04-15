@@ -60,6 +60,7 @@ const PhaseSchema = z.object({
   invoke_commands: z.array(z.string()).optional(),
   tools: z.array(z.string()).optional(),
   mcp_config: z.string().nullable().optional(),
+  mcp_servers: z.array(z.string()).optional(),
   guardrails: z.array(z.string()).optional(),
 
   requires_confirm: z.boolean().optional().default(false),

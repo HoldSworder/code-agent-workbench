@@ -968,7 +968,9 @@ export class WorkflowEngine {
     const workDir = join(baseDir, requirementId)
     try { mkdirSync(workDir, { recursive: true }) } catch {}
 
-    const configWriter = getConfigWriter(this.cliType)
+    const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
+    const effectiveCliType = phaseAgentCfg.agent ?? this.cliType
+    const configWriter = getConfigWriter(effectiveCliType)
 
     try {
       if (mcpServerIds?.length) {
@@ -987,7 +989,8 @@ export class WorkflowEngine {
             headers: JSON.parse(s.headers),
           }))
           configWriter.write(workDir, serverConfigs)
-          elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId}`)
+          const mcpConfigPath = configWriter.getConfigPath(workDir)
+          elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${servers.map(s => s.name).join(',')})`)
         }
       }
 
@@ -1017,9 +1020,6 @@ export class WorkflowEngine {
         reqInfo,
         undefined,
       )
-
-      const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
-      const effectiveCliType = phaseAgentCfg.agent ?? this.cliType
       const provider = this.resolveProvider(phase.provider, {
         agentOverride: phaseAgentCfg.agent,
         modelOverride: phaseAgentCfg.model,
@@ -1445,7 +1445,8 @@ export class WorkflowEngine {
       this.liveOutputs.set(repoTaskId, '')
       this.liveActivityLogs.set(repoTaskId, '')
 
-      const canReadFiles = this.cliType === 'cursor-cli' || this.cliType === 'claude-code'
+      const effectiveCliType = phaseAgentCfg.agent ?? this.settingsRepo.get('agent.provider') ?? this.cliType
+      const canReadFiles = effectiveCliType === 'cursor-cli' || effectiveCliType === 'claude-code'
       const promptText = isResume && context.userMessage
         ? context.userMessage
         : buildPromptFromContext(context, canReadFiles)
@@ -1456,11 +1457,23 @@ export class WorkflowEngine {
         content: promptText,
       })
 
-      const mcpServers = this.mcpBindingRepo.resolveServersForPhase(stage.id, phase.id)
-      const configWriter = getConfigWriter(this.cliType)
+      let mcpServers = this.mcpBindingRepo.resolveServersForPhase(stage.id, phase.id)
+
+      // Fallback: resolve from YAML mcp_servers declaration when no DB bindings exist
+      if (mcpServers.length === 0 && phase.mcp_servers?.length) {
+        mcpServers = phase.mcp_servers
+          .map(name => this.mcpServerRepo.findByName(name))
+          .filter((s): s is NonNullable<typeof s> => !!s && s.enabled === 1)
+        if (mcpServers.length > 0)
+          elog(`executePhase: resolved ${mcpServers.length} MCP server(s) from YAML mcp_servers for ${stage.id}/${phase.id}`)
+      }
+
+      const configWriter = getConfigWriter(effectiveCliType)
       const cwd = task.worktree_path
 
-      if (mcpServers.length > 0) {
+      if (mcpServers.length === 0) {
+        elog(`executePhase: no MCP servers for ${stage.id}/${phase.id}`)
+      } else {
         const serverConfigs: McpServerConfig[] = mcpServers.map(s => ({
           name: s.name,
           transport: s.transport,
@@ -1472,7 +1485,8 @@ export class WorkflowEngine {
         }))
         configWriter.backup(cwd)
         configWriter.write(cwd, serverConfigs)
-        elog(`executePhase: injected ${mcpServers.length} MCP server(s) for ${stage.id}/${phase.id}`)
+        const mcpConfigPath = configWriter.getConfigPath(cwd)
+        elog(`executePhase: injected ${mcpServers.length} MCP server(s) for ${stage.id}/${phase.id} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${mcpServers.map(s => s.name).join(',')})`)
       }
 
       const MAX_ACTIVITY_SIZE = 50 * 1024

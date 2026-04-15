@@ -64,5 +64,12 @@ export const useRequirementsStore = defineStore('requirements', () => {
     if (idx >= 0) requirements.value[idx] = req
   }
 
-  return { requirements, loading, fetchAll, create, refreshOne, remove, updateMode }
+  async function updateStatus(id: string, status: string) {
+    const req = await rpc<Requirement>('requirement.updateStatus', { id, status })
+    if (!req) return
+    const idx = requirements.value.findIndex(r => r.id === id)
+    if (idx >= 0) requirements.value[idx] = req
+  }
+
+  return { requirements, loading, fetchAll, create, refreshOne, remove, updateMode, updateStatus }
 })

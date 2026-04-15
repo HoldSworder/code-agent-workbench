@@ -17,15 +17,18 @@ export interface McpConfigWriter {
   restore(cwd: string): void
   cleanup(cwd: string): void
   hasBackup(cwd: string): boolean
+  getConfigPath(cwd: string): string
 }
 
 const MANAGED_MARKER = '_managedBy'
 const MANAGED_VALUE = 'code-agent'
 const BACKUP_SUFFIX = '.code-agent-backup'
 
-export class CursorConfigWriter implements McpConfigWriter {
-  private configPath(cwd: string): string {
-    return join(cwd, '.cursor', 'mcp.json')
+abstract class BaseMcpConfigWriter implements McpConfigWriter {
+  protected abstract configPath(cwd: string): string
+
+  getConfigPath(cwd: string): string {
+    return this.configPath(cwd)
   }
 
   private backupPath(cwd: string): string {
@@ -46,14 +49,12 @@ export class CursorConfigWriter implements McpConfigWriter {
 
     const mcpServers = (existing.mcpServers ?? {}) as Record<string, Record<string, unknown>>
 
-    // Remove previously managed entries
     for (const [key, value] of Object.entries(mcpServers)) {
       if (value && typeof value === 'object' && (value as Record<string, unknown>)[MANAGED_MARKER] === MANAGED_VALUE) {
         delete mcpServers[key]
       }
     }
 
-    // Add new managed entries
     for (const server of servers) {
       const entry: Record<string, unknown> = { [MANAGED_MARKER]: MANAGED_VALUE }
 
@@ -105,16 +106,24 @@ export class CursorConfigWriter implements McpConfigWriter {
   }
 }
 
+export class CursorConfigWriter extends BaseMcpConfigWriter {
+  protected configPath(cwd: string): string {
+    return join(cwd, '.cursor', 'mcp.json')
+  }
+}
+
+export class ClaudeCodeConfigWriter extends BaseMcpConfigWriter {
+  protected configPath(cwd: string): string {
+    return join(cwd, '.mcp.json')
+  }
+}
+
 export function getConfigWriter(cliType: string): McpConfigWriter {
   switch (cliType) {
     case 'cursor-cli':
       return new CursorConfigWriter()
     case 'claude-code':
-      // Future: implement ClaudeCodeConfigWriter for .mcp.json
-      return new CursorConfigWriter()
-    case 'codex':
-      // Future: implement CodexConfigWriter for .codex/config.toml
-      return new CursorConfigWriter()
+      return new ClaudeCodeConfigWriter()
     default:
       return new CursorConfigWriter()
   }

@@ -291,7 +291,7 @@ export class ExternalCliProvider implements AgentProvider {
   private buildSpawnArgs(cwd: string, prompt: string): { args: string[], stdinData: string | null } {
     switch (this.config.type) {
       case 'cursor-cli': {
-        const args = ['-p', '--output-format', 'stream-json', '--stream-partial-output', '--yolo', '--trust', '--workspace', cwd]
+        const args = ['-p', '--output-format', 'stream-json', '--stream-partial-output', '--yolo', '--trust', '--approve-mcps', '--workspace', cwd]
         if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         if (this.config.resumeSessionId)

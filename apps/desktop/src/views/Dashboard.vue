@@ -87,9 +87,6 @@ const statusBadge: Record<string, { label: string, class: string }> = {
 }
 
 const statusGroupOrder = [
-  { key: 'fetching', icon: 'i-carbon-ai-status', dot: 'bg-violet-500' },
-  { key: 'orchestrating', icon: 'i-carbon-ai-status', dot: 'bg-violet-500' },
-  { key: 'pending', icon: 'i-carbon-pending', dot: 'bg-blue-500' },
   { key: 'draft', icon: 'i-carbon-document-blank', dot: 'bg-gray-400' },
   { key: 'active', icon: 'i-carbon-in-progress', dot: 'bg-indigo-500' },
   { key: 'suspended', icon: 'i-carbon-pause-outline', dot: 'bg-amber-500' },
@@ -109,8 +106,11 @@ function getReqSortTime(reqId: string, createdAt: string): number {
 }
 
 function deriveEffectiveStatus(req: { id: string, status: string }): string {
-  if (['fetching', 'fetch_failed', 'pending', 'orchestrating', 'pending_acceptance'].includes(req.status))
-    return req.status
+  if (req.status === 'pending_acceptance')
+    return 'active'
+
+  if (['fetching', 'fetch_failed', 'pending', 'orchestrating'].includes(req.status))
+    return 'draft'
 
   const tasks = taskMap.value[req.id] ?? []
   if (tasks.length === 0) return req.status
@@ -1350,7 +1350,7 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
 
               <!-- 面板主体 -->
               <div class="flex-1 overflow-y-auto">
-                <!-- 执行模式切换 -->
+                <!-- 草稿：执行模式选择 + 行动按钮 -->
                 <div v-if="selectedReq.status === 'draft'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
                   <div class="text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">执行模式</div>
                   <div class="flex gap-2">
@@ -1376,20 +1376,29 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                     </button>
                   </div>
                   <button
+                    v-if="selectedReq.mode === 'orchestrator'"
                     class="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-150 active:scale-[0.98] disabled:opacity-50 bg-violet-600 text-white hover:bg-violet-500 shadow-sm shadow-violet-600/20"
                     :disabled="orchestratorDispatching"
                     @click="dispatchToOrchestrator(selectedReq.id)"
                   >
                     <div v-if="orchestratorDispatching" class="i-carbon-circle-dash w-4 h-4 animate-spin" />
-                    <div v-else class="i-carbon-send-alt w-4 h-4" />
-                    派发给多 Agent 编排
+                    <div v-else class="i-carbon-play-filled w-4 h-4" />
+                    开始编排
+                  </button>
+                  <button
+                    v-else
+                    class="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-[13px] font-medium transition-all duration-150 active:scale-[0.98] disabled:opacity-50 bg-indigo-600 text-white hover:bg-indigo-500 shadow-sm shadow-indigo-600/20"
+                    @click="openMcpPicker(selectedReq.id)"
+                  >
+                    <div class="i-carbon-play-filled w-4 h-4" />
+                    开始执行
                   </button>
                   <div v-if="orchestratorDispatchError" class="mt-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-500/5 border border-red-200/60 dark:border-red-500/10 text-[12px] text-red-600 dark:text-red-400 break-all">
                     {{ orchestratorDispatchError }}
                   </div>
                 </div>
-                <!-- pending + orchestrator: 等待开始编排 -->
-                <div v-else-if="selectedReq.status === 'pending' && selectedReq.mode === 'orchestrator'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
+                <!-- 待编排：只读模式标签 + 开始编排 -->
+                <div v-else-if="selectedReq.status === 'pending'" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
                   <div class="flex items-center gap-2 mb-3">
                     <span class="text-[11px] text-gray-400">执行模式:</span>
                     <span class="px-2 py-0.5 rounded-md text-[11px] font-medium bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400">
@@ -1628,6 +1637,14 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                 >
                   <div class="i-carbon-chat w-3.5 h-3.5" />
                   对话记录
+                </button>
+                <button
+                  v-if="selectedReq.status === 'pending'"
+                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-gray-500 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                  @click="requirementsStore.updateStatus(selectedReq.id, 'draft')"
+                >
+                  <div class="i-carbon-undo w-3.5 h-3.5" />
+                  退回草稿
                 </button>
                 <div class="flex-1" />
                 <button
