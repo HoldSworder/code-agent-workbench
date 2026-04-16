@@ -1617,6 +1617,25 @@ export class WorkflowEngine {
         currentPhaseId: phase.id,
         worktreePath: task.worktree_path,
         dbPath: this.dbPath,
+        openspecPath: task.openspec_path,
+        gateDefinitions: wf.gate_definitions,
+        currentPhaseGates: {
+          entryGate: phase.entry_gate,
+          completionCheck: phase.completion_check,
+          stageGate: effectiveStageGate,
+        },
+        currentStageId: stage.id,
+        workflowStages: wf.stages.map(s => ({
+          id: s.id,
+          name: s.name,
+          gate: s.gate,
+          phases: s.phases.map(p => ({
+            id: p.id,
+            name: p.name,
+            optional: p.optional,
+            triggers: p.triggers,
+          })),
+        })),
       })
       const toolPrompts = injectedTools.length > 0
         ? injectedTools.map(t => t.promptSection)

@@ -1,11 +1,41 @@
 import type Database from 'better-sqlite3'
 
+export interface GateCheckDef {
+  type: string
+  path?: string
+  pattern?: string
+  after?: string
+  command?: string
+}
+
+export interface GateDefinitionDef {
+  description: string
+  checks: GateCheckDef[]
+}
+
+export interface WorkflowStageInfo {
+  id: string
+  name: string
+  gate?: string
+  phases: Array<{
+    id: string
+    name: string
+    optional?: boolean
+    triggers?: string[]
+  }>
+}
+
 export interface ToolInjectionContext {
   db: Database.Database
   repoTaskId: string
   currentPhaseId: string
   worktreePath: string
   dbPath: string
+  openspecPath?: string
+  gateDefinitions?: Record<string, GateDefinitionDef>
+  currentPhaseGates?: { entryGate?: string, completionCheck?: string, stageGate?: string }
+  currentStageId?: string
+  workflowStages?: WorkflowStageInfo[]
 }
 
 export interface InjectedTool {

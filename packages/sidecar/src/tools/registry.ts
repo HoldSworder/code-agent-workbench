@@ -3,6 +3,10 @@ import { historyQueryTool } from './history-query.tool'
 import { inspectLogsTool } from './inspect-logs.tool'
 import { taskProgressTool } from './task-progress.tool'
 import { phaseSignalTool } from './phase-signal.tool'
+import { gateStatusTool } from './gate-status.tool'
+import { openspecQueryTool } from './openspec-query.tool'
+import { taskChecklistTool } from './task-checklist.tool'
+import { workflowNavTool } from './workflow-nav.tool'
 
 const tools: WorkflowTool[] = []
 
@@ -33,3 +37,7 @@ registerTool(historyQueryTool)
 registerTool(inspectLogsTool)
 registerTool(taskProgressTool)
 registerTool(phaseSignalTool)
+registerTool(gateStatusTool)
+registerTool(openspecQueryTool)
+registerTool(taskChecklistTool)
+registerTool(workflowNavTool)
