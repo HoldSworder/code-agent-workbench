@@ -7,6 +7,7 @@ import { gateStatusTool } from './gate-status.tool'
 import { openspecQueryTool } from './openspec-query.tool'
 import { taskChecklistTool } from './task-checklist.tool'
 import { workflowNavTool } from './workflow-nav.tool'
+import { repoInfoTool } from './repo-info.tool'
 
 const tools: WorkflowTool[] = []
 
@@ -41,3 +42,4 @@ registerTool(gateStatusTool)
 registerTool(openspecQueryTool)
 registerTool(taskChecklistTool)
 registerTool(workflowNavTool)
+registerTool(repoInfoTool)
