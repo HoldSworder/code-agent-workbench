@@ -709,14 +709,15 @@ export class WorkflowEngine {
     defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
     optionalPhases: { phaseId: string, phaseName: string, stageId: string, entryInput?: { label: string, description?: string, placeholder?: string } }[]
     blocked: boolean
+    pendingInput: boolean
     phaseProgress?: { status: string, step?: string, stepName?: string, reason?: string }
   } {
     const task = this.taskRepo.findById(repoTaskId)
-    if (!task) return { defaultNext: null, optionalPhases: [], blocked: false }
+    if (!task) return { defaultNext: null, optionalPhases: [], blocked: false, pendingInput: false }
 
     const wf = this.resolveConfigForTask(repoTaskId)
     const loc = findPhaseInStages(wf.stages, task.current_stage, task.current_phase)
-    if (!loc) return { defaultNext: null, optionalPhases: [], blocked: false }
+    if (!loc) return { defaultNext: null, optionalPhases: [], blocked: false, pendingInput: false }
 
     if (task.phase_status === 'waiting_input' && loc.phase.completion_check) {
       const passed = this.evaluateGate(loc.phase.completion_check, task.worktree_path, task.openspec_path, wf)
@@ -726,6 +727,7 @@ export class WorkflowEngine {
           defaultNext: null,
           optionalPhases: [],
           blocked: true,
+          pendingInput: false,
           phaseProgress: signal ?? undefined,
         }
       }
@@ -738,6 +740,7 @@ export class WorkflowEngine {
           defaultNext: null,
           optionalPhases: [],
           blocked: true,
+          pendingInput: true,
           phaseProgress: { status: signal.status, step: signal.step, stepName: signal.stepName, reason: signal.reason },
         }
       }
@@ -782,7 +785,7 @@ export class WorkflowEngine {
       collectFromPhases(nextStage.phases, 0, nextStage)
     }
 
-    return { defaultNext, optionalPhases, blocked: false }
+    return { defaultNext, optionalPhases, blocked: false, pendingInput: false }
   }
 
   /**
@@ -1809,6 +1812,13 @@ export class WorkflowEngine {
 
     if (result.status === 'failed' || result.status === 'cancelled') {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, result.status)
+      return
+    }
+
+    const taskForCompleted = this.taskRepo.findById(repoTaskId)
+    if (taskForCompleted?.workflow_completed) {
+      elog(`handlePhaseResult: workflow already completed, restoring completed state`)
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
       return
     }
 

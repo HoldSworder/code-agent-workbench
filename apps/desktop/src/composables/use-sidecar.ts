@@ -97,6 +97,8 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
           stageId: 'development',
           entryInput: { label: '联调信息', description: '请提供后端 Spec / API 文档 URL 或直接粘贴内容', placeholder: '粘贴后端 Spec URL、API 文档内容、联调环境地址等...' },
         }],
+        blocked: false,
+        pendingInput: false,
       } as T
     case 'workflow.getPhaseEnabledMap':
       return {} as T

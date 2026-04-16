@@ -174,6 +174,7 @@ interface AdvanceOptions {
   defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
   optionalPhases: AdvanceOption[]
   blocked: boolean
+  pendingInput: boolean
   phaseProgress?: PhaseProgress
 }
 
@@ -1512,9 +1513,22 @@ async function handleCancel() {
                 </div>
               </template>
 
-              <!-- Inline action card for waiting_input phase (blocked: simplified, normal: full) -->
+              <!-- Inline hint for waiting_input + pendingInput (Agent awaiting user reply, no action buttons) -->
               <div
-                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId && advanceOptions?.blocked"
+                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId && advanceOptions?.blocked && advanceOptions?.pendingInput"
+                class="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-orange-50/60 dark:bg-orange-500/[0.06] border border-orange-200/40 dark:border-orange-500/10 text-[12px] text-orange-600 dark:text-orange-400 max-w-[85%]"
+              >
+                <div class="i-carbon-in-progress w-4 h-4 shrink-0" />
+                <span>
+                  阶段「{{ displayPhase }}」
+                  <template v-if="advanceOptions?.phaseProgress?.step">({{ advanceOptions.phaseProgress.step }}) </template>
+                  {{ advanceOptions?.phaseProgress?.reason || '等待你的反馈后继续执行。' }}
+                </span>
+              </div>
+
+              <!-- Inline action card for waiting_input + blocked but NOT pendingInput (completion gate failed) -->
+              <div
+                v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId && advanceOptions?.blocked && !advanceOptions?.pendingInput"
                 class="rounded-xl border border-orange-200/60 dark:border-orange-500/15 bg-orange-50/50 dark:bg-orange-500/[0.04] px-4 py-3 max-w-[85%]"
               >
                 <div class="flex items-center gap-2 mb-1">
