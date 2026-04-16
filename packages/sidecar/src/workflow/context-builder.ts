@@ -117,6 +117,7 @@ export function buildPhaseContext(
   requirement?: RequirementInfo,
   stageGate?: string,
   injectedToolPrompts?: string[],
+  mcpServerNames?: string[],
 ): PhaseContext {
   const templateVars: Record<string, string> = {
     openspec_path: openspecPath,
@@ -150,5 +151,6 @@ export function buildPhaseContext(
     requiresConfirm: phase.requires_confirm,
     suspendable: phase.suspendable,
     injectedToolPrompts: leanMode ? undefined : injectedToolPrompts,
+    mcpServerNames: mcpServerNames?.length ? mcpServerNames : undefined,
   }
 }

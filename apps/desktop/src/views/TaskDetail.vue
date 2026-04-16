@@ -164,10 +164,17 @@ interface AdvanceOption {
   stageId: string
   entryInput?: EntryInput
 }
+interface PhaseProgress {
+  status: 'in_progress' | 'ready' | 'blocked'
+  step?: string
+  stepName?: string
+  reason?: string
+}
 interface AdvanceOptions {
   defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
   optionalPhases: AdvanceOption[]
   blocked: boolean
+  phaseProgress?: PhaseProgress
 }
 
 const advanceOptions = ref<AdvanceOptions | null>(null)
@@ -819,6 +826,25 @@ async function handleRollbackToMessage(messageId: string) {
   await refreshMessages()
 }
 
+async function handleRetryFromPrompt(messageId: string) {
+  if (!task.value || retryingPrompt.value) return
+  retryingPrompt.value = messageId
+  try {
+    await rpc('workflow.retryFromPrompt', { repoTaskId: task.value.id, messageId })
+    await new Promise(r => setTimeout(r, 300))
+    const t = await rpc<RepoTask>('task.get', { id: taskId })
+    if (t) {
+      task.value = t
+      viewingPhaseId.value = t.current_phase
+    }
+    await refreshMessages()
+    startPolling()
+  }
+  finally {
+    retryingPrompt.value = null
+  }
+}
+
 const composing = ref(false)
 let compositionEndTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -845,6 +871,7 @@ async function handleFeedback() {
 }
 
 const expandedPrompts = ref<Set<string>>(new Set())
+const retryingPrompt = ref<string | null>(null)
 
 function togglePrompt(msgId: string) {
   const s = new Set(expandedPrompts.value)
@@ -1325,7 +1352,7 @@ async function handleCancel() {
               <!-- Messages for this phase -->
               <template v-for="msg in group.messages" :key="msg.id">
                 <!-- Prompt bubble (collapsible) -->
-                <div v-if="msg.role === 'prompt'" class="max-w-[85%]">
+                <div v-if="msg.role === 'prompt'" class="max-w-[85%] group/prompt">
                   <div class="rounded-xl overflow-hidden border border-violet-200/60 dark:border-violet-500/15">
                     <button
                       class="w-full flex items-center gap-2 px-3 py-2 text-left bg-violet-50/50 dark:bg-violet-500/[0.04] hover:bg-violet-50 dark:hover:bg-violet-500/[0.06] transition-colors"
@@ -1362,6 +1389,15 @@ async function handleCancel() {
                       <div class="prose-chat text-[12px] leading-relaxed text-gray-600 dark:text-gray-400" v-html="md.render(msg.content)" />
                     </div>
                   </div>
+                  <button
+                    v-if="!isRunning && !isPending"
+                    class="mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/prompt:opacity-100 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-all"
+                    :disabled="retryingPrompt === msg.id"
+                    @click="handleRetryFromPrompt(msg.id)"
+                  >
+                    <div class="w-3 h-3" :class="retryingPrompt === msg.id ? 'i-carbon-circle-dash animate-spin' : 'i-carbon-restart'" />
+                    {{ retryingPrompt === msg.id ? '重试中...' : '重试' }}
+                  </button>
                 </div>
 
                 <!-- System notification bubble -->
@@ -1481,12 +1517,22 @@ async function handleCancel() {
                 v-if="task?.phase_status === 'waiting_input' && task.current_phase === group.phaseId && advanceOptions?.blocked"
                 class="rounded-xl border border-orange-200/60 dark:border-orange-500/15 bg-orange-50/50 dark:bg-orange-500/[0.04] px-4 py-3 max-w-[85%]"
               >
-                <div class="flex items-center gap-2 mb-3">
+                <div class="flex items-center gap-2 mb-1">
                   <div class="i-carbon-in-progress w-4 h-4 text-orange-500" />
                   <span class="text-[13px] text-orange-700 dark:text-orange-400 font-medium">
-                    {{ displayPhase }} 完成条件未满足，可继续完成或输入反馈
+                    {{ displayPhase }}
+                    <template v-if="advanceOptions?.phaseProgress?.step">
+                      ({{ advanceOptions.phaseProgress.step }})
+                    </template>
+                    {{ advanceOptions?.phaseProgress?.stepName ?? '完成条件未满足，可继续完成或输入反馈' }}
                   </span>
                 </div>
+                <p
+                  v-if="advanceOptions?.phaseProgress?.reason"
+                  class="text-[11px] text-orange-600/70 dark:text-orange-400/60 ml-6 mb-2"
+                >
+                  {{ advanceOptions.phaseProgress.reason }}
+                </p>
                 <div class="flex items-center gap-2 justify-end">
                   <button
                     class="px-3 py-1.5 rounded-lg text-[12px] text-gray-500 hover:bg-white/80 dark:hover:bg-white/5 transition-colors"

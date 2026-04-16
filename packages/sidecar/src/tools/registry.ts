@@ -1,6 +1,8 @@
 import type { WorkflowTool, ToolInjectionContext, InjectedTool } from './types'
 import { historyQueryTool } from './history-query.tool'
 import { inspectLogsTool } from './inspect-logs.tool'
+import { taskProgressTool } from './task-progress.tool'
+import { phaseSignalTool } from './phase-signal.tool'
 
 const tools: WorkflowTool[] = []
 
@@ -29,3 +31,5 @@ export function collectTools(ctx: ToolInjectionContext): InjectedTool[] {
 
 registerTool(historyQueryTool)
 registerTool(inspectLogsTool)
+registerTool(taskProgressTool)
+registerTool(phaseSignalTool)

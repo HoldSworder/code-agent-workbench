@@ -342,9 +342,7 @@ export function registerMethods(
     return { ok: true }
   })
   server.register('workflow.suspend', async ({ repoTaskId }) => {
-    engine.suspendTask(repoTaskId).catch((err) => {
-      process.stderr.write(`[workflow] suspend failed for ${repoTaskId}: ${err}\n`)
-    })
+    await engine.suspendTask(repoTaskId)
     return { ok: true }
   })
   server.register('workflow.resume', async ({ repoTaskId }) => {
@@ -408,6 +406,12 @@ export function registerMethods(
   server.register('workflow.rollbackToMessage', async ({ repoTaskId, messageId }) => {
     engine.rollbackToMessage(repoTaskId, messageId).catch((err) => {
       process.stderr.write(`[workflow] rollbackToMessage ${messageId} failed for ${repoTaskId}: ${err}\n`)
+    })
+    return { ok: true }
+  })
+  server.register('workflow.retryFromPrompt', async ({ repoTaskId, messageId }) => {
+    engine.retryFromPrompt(repoTaskId, messageId).catch((err) => {
+      process.stderr.write(`[workflow] retryFromPrompt ${messageId} failed for ${repoTaskId}: ${err}\n`)
     })
     return { ok: true }
   })

@@ -15,6 +15,8 @@
 
 ### Step 0: 需求对齐（Brainstorming）
 
+> **进度信号**：`phase-signal --status in_progress --step "0/8" --step-name "需求对齐(Brainstorming)" --reason "与用户澄清需求" update`
+
 在写任何 OpenSpec 文档之前，先通过 `superpowers:brainstorming` 技能与用户对齐需求理解。
 
 **优先级声明：本 skill 中的覆盖约定优先于 brainstorming 技能原流程中的冲突指令。**
@@ -36,6 +38,8 @@
 
 ### Step 1: 创建变更目录
 
+> **进度信号**：`phase-signal --step "1/8" --step-name "创建变更目录" update`
+
 ```bash
 openspec new change "{{change_id}}"
 ```
@@ -44,6 +48,8 @@ openspec new change "{{change_id}}"
 
 ### Step 2: 查看 proposal 模板与指令
 
+> **进度信号**：`phase-signal --step "2/8" --step-name "查看 proposal 模板" update`
+
 ```bash
 openspec instructions proposal --change "{{change_id}}"
 ```
@@ -51,6 +57,8 @@ openspec instructions proposal --change "{{change_id}}"
 该命令输出 proposal artifact 的详细创建指令和模板结构，Agent 按此指令填写。
 
 ### Step 3: 编写 proposal.md
+
+> **进度信号**：`phase-signal --step "3/8" --step-name "编写 proposal.md" update`
 
 根据需求内容和 `openspec instructions` 输出的模板，将需求结构化写入：
 
@@ -66,11 +74,15 @@ proposal.md 须包含以下章节：
 
 ### Step 4: 查看 specs 模板与指令
 
+> **进度信号**：`phase-signal --step "4/8" --step-name "查看 specs 模板" update`
+
 ```bash
 openspec instructions specs --change "{{change_id}}"
 ```
 
 ### Step 5: 编写 specs
+
+> **进度信号**：`phase-signal --step "5/8" --step-name "编写 specs" update`
 
 根据 proposal 中列出的 Capabilities，为每个 capability 创建对应的 spec 文件：
 
@@ -85,6 +97,8 @@ spec.md 使用 WHEN/THEN Scenario 风格描述行为规格：
 
 ### Step 6: 编写 design.md（按需）
 
+> **进度信号**：`phase-signal --step "6/8" --step-name "编写 design.md（按需）" update`
+
 如果变更涉及跨模块架构、新依赖引入、数据模型变更等复杂场景，可选创建 design 文档：
 
 ```bash
@@ -97,6 +111,8 @@ openspec instructions design --change "{{change_id}}"
 
 ### Step 7: 校验
 
+> **进度信号**：`phase-signal --step "7/8" --step-name "校验" update`
+
 ```bash
 openspec validate "{{change_id}}"
 ```
@@ -104,6 +120,8 @@ openspec validate "{{change_id}}"
 确保所有产出符合 OpenSpec 规范。
 
 ### Step 8: 确认产出状态
+
+> **进度信号**：`phase-signal --status ready --step "8/8" --step-name "产出就绪" update`
 
 ```bash
 openspec status --change "{{change_id}}"

@@ -45,6 +45,8 @@ export interface PhaseContext {
   requirementSourceUrl?: string
   /** 由 WorkflowTool 插件自动注入的工具说明段落 */
   injectedToolPrompts?: string[]
+  /** 已注入到工作目录的 MCP server 名称列表 */
+  mcpServerNames?: string[]
 }
 
 export interface PhaseResult {

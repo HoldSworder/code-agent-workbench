@@ -11,7 +11,8 @@
 ## 输出
 
 - 实现代码与测试（L1/L2），`tasks.md` 中对应项标记为 `[x]`
-- 有意义的变更在用户确认后带 **代码审查** 的 Git commit
+- 迭代中的变更在用户确认后带 **代码审查** 的 Git commit
+- 全部任务完成时自动执行最终 Git commit（含代码审查），无需等待用户确认
 - 全部任务完成后进入等待联调或下一阶段（如 `integration.md`）
 
 ---
@@ -74,13 +75,26 @@ Agent 必须直接调用 TDD 技能，对每个 task 严格执行 **RED → GREE
 
 ## Git Commit
 
-完成有意义的 task 后，遵循外部规则中注入的「Git Commit 流程」执行提交。
+Git commit 分两种场景，规则不同：
+
+### 迭代中 commit（任务进行中）
+
+开发过程中完成有意义的 task 后，遵循外部规则中注入的「Git Commit 流程」执行提交。此场景需要用户确认后再提交。
+
+### 阶段完成 commit（全部任务完成时，必须自动执行）
+
+当 `tasks.md` 中所有任务标记为 `[x]` 且验证全部通过后，**必须立即自动执行** Git commit 流程（含代码审查），**不得反问用户是否需要 commit**。
+
+流程：`git add .` → 代码审查 → `git commit` → 标记 `<<PHASE_COMPLETE>>`
+
+> 这确保了用户在阶段完成后无论选择「挂起需求」还是「进入下一阶段」，代码都已安全提交。
 
 ---
 
 ## 完成条件
 
 - `tasks.md` 中所有任务标记为 `[x]`
+- 最终 Git commit 已执行（工作区干净）
 - 进入 `waiting_event` 状态（等待后端 spec 或联调触发，见 `integration.md`）
 
 **关键**：系统会通过检查 `tasks.md` 文件内容判定本阶段是否完成（不含 `- [ ]` 且含 `- [x]`）。若存在未勾选项，本阶段将无法推进到下一步。
@@ -91,5 +105,5 @@ Agent 必须直接调用 TDD 技能，对每个 task 严格执行 **RED → GREE
 
 - 不跳过 TDD 循环（必须调用 `superpowers:test-driven-development` 技能）
 - 不在没有运行验证命令的情况下声称完成（必须调用 `superpowers:verification-before-completion` 技能）
-- 不在用户未确认时执行 `git commit`
+- 迭代中的 commit 需用户确认；全部任务完成后的最终 commit 必须自动执行，不得询问用户
 - **每完成一个 task 必须立即将 `tasks.md` 中对应的 `- [ ]` 改为 `- [x]`**，不得攒到最后批量勾选

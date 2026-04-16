@@ -12,8 +12,8 @@ const __dirname = dirname(__filename)
  *   prod: packages/sidecar/dist/       -> 3 levels up -> <root>/tools/
  */
 function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'inspect-logs.sh')
-  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'inspect-logs.sh')
+  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'inspect-logs', 'run.sh')
+  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'inspect-logs', 'run.sh')
   try {
     // eslint-disable-next-line ts/no-require-imports
     const { existsSync } = require('node:fs') as typeof import('node:fs')

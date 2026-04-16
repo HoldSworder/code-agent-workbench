@@ -203,6 +203,7 @@ const manualDescription = ref('')
 const feishuUrl = ref('')
 const feishuParsed = ref<{ projectKey: string, workItemType: string, workItemId: string } | null>(null)
 const feishuError = ref('')
+const createError = ref('')
 
 function parseFeishuUrl(url: string) {
   feishuError.value = ''
@@ -253,6 +254,7 @@ function resetCreateDialog() {
   feishuUrl.value = ''
   feishuParsed.value = null
   feishuError.value = ''
+  createError.value = ''
   createMcpSelectedIds.value = new Set()
 }
 
@@ -264,49 +266,55 @@ const canSubmit = computed(() => {
 
 async function submitRequirement() {
   if (!canSubmit.value) return
+  createError.value = ''
 
-  if (createMode.value === 'manual') {
-    await requirementsStore.create({
-      title: manualTitle.value.trim() || undefined,
-      description: manualDescription.value.trim(),
-      source: 'manual',
-      mode: requirementMode.value,
-    })
-  }
-  else {
-    const req = await requirementsStore.create({
-      description: feishuParsed.value
-        ? `飞书项目 ${feishuParsed.value.projectKey} #${feishuParsed.value.workItemId} (${feishuParsed.value.workItemType})`
-        : '',
-      source: 'feishu',
-      source_url: feishuUrl.value.trim(),
-      mode: requirementMode.value,
-    })
+  try {
+    if (createMode.value === 'manual') {
+      await requirementsStore.create({
+        title: manualTitle.value.trim() || undefined,
+        description: manualDescription.value.trim(),
+        source: 'manual',
+        mode: requirementMode.value,
+      })
+    }
+    else {
+      const req = await requirementsStore.create({
+        description: feishuParsed.value
+          ? `飞书项目 ${feishuParsed.value.projectKey} #${feishuParsed.value.workItemId} (${feishuParsed.value.workItemType})`
+          : '',
+        source: 'feishu',
+        source_url: feishuUrl.value.trim(),
+        mode: requirementMode.value,
+      })
 
-    const mcpIds = [...createMcpSelectedIds.value]
+      const mcpIds = [...createMcpSelectedIds.value]
 
-    if (mcpIds.length > 0) {
-      const firstPhase = requirementPhases.value.find(p => !p.optional)
-      if (firstPhase) {
-        await rpc('mcp.setBindings', {
-          stageId: '_requirements',
-          phaseId: firstPhase.id,
-          mcpServerIds: mcpIds,
-        })
-        await loadMcpData()
+      if (mcpIds.length > 0) {
+        const firstPhase = requirementPhases.value.find(p => !p.optional)
+        if (firstPhase) {
+          await rpc('mcp.setBindings', {
+            stageId: '_requirements',
+            phaseId: firstPhase.id,
+            mcpServerIds: mcpIds,
+          })
+          await loadMcpData()
+        }
       }
+
+      await rpc('requirement.startFetch', {
+        requirementId: req.id,
+        mcpServerIds: mcpIds.length > 0 ? mcpIds : undefined,
+      })
+      await requirementsStore.refreshOne(req.id)
     }
 
-    await rpc('requirement.startFetch', {
-      requirementId: req.id,
-      mcpServerIds: mcpIds.length > 0 ? mcpIds : undefined,
-    })
-    await requirementsStore.refreshOne(req.id)
+    showDialog.value = false
+    resetCreateDialog()
+    await refreshTaskMap()
   }
-
-  showDialog.value = false
-  resetCreateDialog()
-  await refreshTaskMap()
+  catch (err) {
+    createError.value = err instanceof Error ? err.message : String(err)
+  }
 }
 
 // ── 分发到仓库弹窗 ──
@@ -1083,6 +1091,16 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                     多 Agent 编排
                     <div class="text-[10px] opacity-60 mt-0.5">自动分配执行</div>
                   </button>
+                </div>
+              </div>
+
+              <div
+                v-if="createError"
+                class="mt-4 px-3 py-2.5 rounded-lg bg-red-50 dark:bg-red-500/5 border border-red-200 dark:border-red-500/15"
+              >
+                <div class="flex items-center gap-2">
+                  <div class="i-carbon-warning-alt w-3.5 h-3.5 text-red-500 shrink-0" />
+                  <span class="text-[12px] text-red-600 dark:text-red-400">{{ createError }}</span>
                 </div>
               </div>
 

@@ -406,6 +406,12 @@ export function buildPromptFromContext(context: PhaseContext, canReadFiles = tru
     sections.push(reqSection)
   }
 
+  if (context.mcpServerNames?.length) {
+    sections.push(
+      `---\n\n## 可用 MCP Server\n\n以下 MCP Server 已注入到当前工作目录，你可以直接通过 MCP tool 调用它们：\n\n${context.mcpServerNames.map(n => `- \`${n}\``).join('\n')}\n\n**重要**：直接使用 MCP tool 调用上述 server，不要尝试读取技能文件或通过子代理间接调用。`,
+    )
+  }
+
   if (context.skillContent)
     sections.push(context.skillContent)
 

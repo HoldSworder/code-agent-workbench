@@ -202,6 +202,48 @@ export class WorkflowEngine {
   }
 
   /**
+   * 读取 Agent 写入的阶段进度信号文件。
+   * 返回 null 表示无信号（向后兼容：不影响现有 phase 行为）。
+   */
+  private readPhaseSignal(
+    worktreePath: string,
+    phaseId: string,
+  ): { status: string, step?: string, stepName?: string, reason?: string } | null {
+    try {
+      const signalPath = join(worktreePath, '.code-agent', 'phase-signal.json')
+      if (!existsSync(signalPath)) return null
+      const raw = JSON.parse(readFileSync(signalPath, 'utf-8'))
+      if (raw.phaseId !== phaseId) return null
+      return {
+        status: raw.status ?? 'in_progress',
+        step: raw.step,
+        stepName: raw.stepName,
+        reason: raw.reason,
+      }
+    }
+    catch (err) {
+      elog(`readPhaseSignal: failed to read signal for phase "${phaseId}": ${err}`)
+      return null
+    }
+  }
+
+  /**
+   * 清除阶段进度信号文件（phase 切换时调用）。
+   */
+  private clearPhaseSignal(worktreePath: string): void {
+    try {
+      const signalPath = join(worktreePath, '.code-agent', 'phase-signal.json')
+      if (existsSync(signalPath)) {
+        rmSync(signalPath)
+        elog(`clearPhaseSignal: removed signal file`)
+      }
+    }
+    catch (err) {
+      elog(`clearPhaseSignal: failed: ${err}`)
+    }
+  }
+
+  /**
    * 通用门禁求值器：根据 gate_definitions 中的声明式 checks 判断条件是否满足。
    * 所有 checks 之间为 AND 关系，全部通过则条件满足。
    */
@@ -548,15 +590,23 @@ export class WorkflowEngine {
     if (!found)
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
 
+    let commitInfo = ''
     try {
       const status = await git(task.worktree_path, ['status', '--porcelain'])
       if (status.trim()) {
         await git(task.worktree_path, ['add', '-A'])
         await git(task.worktree_path, ['commit', '-m', `wip: suspend at ${found.phase.name} (${task.current_phase})`])
-        elog(`suspendTask: auto-committed WIP changes`)
+        const hash = (await git(task.worktree_path, ['rev-parse', '--short', 'HEAD'])).trim()
+        commitInfo = `，变更已自动提交（commit: ${hash}）`
+        elog(`suspendTask: auto-committed WIP changes, hash=${hash}`)
+      }
+      else {
+        commitInfo = '，工作区无未提交的变更'
       }
     }
     catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      commitInfo = `，但自动提交失败：${errMsg}。请注意工作区仍有未提交的变更`
       elog(`suspendTask: git commit failed: ${err}`)
     }
 
@@ -564,7 +614,7 @@ export class WorkflowEngine {
       repo_task_id: repoTaskId,
       phase_id: task.current_phase,
       role: 'system',
-      content: `需求已挂起，当前进度保存在阶段「${found.phase.name}」。恢复后将从此处继续。`,
+      content: `需求已挂起${commitInfo}。当前进度保存在阶段「${found.phase.name}」，恢复后将从此处继续。`,
     })
 
     this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'suspended')
@@ -659,6 +709,7 @@ export class WorkflowEngine {
     defaultNext: { phaseId: string, phaseName: string, stageId: string } | null
     optionalPhases: { phaseId: string, phaseName: string, stageId: string, entryInput?: { label: string, description?: string, placeholder?: string } }[]
     blocked: boolean
+    phaseProgress?: { status: string, step?: string, stepName?: string, reason?: string }
   } {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) return { defaultNext: null, optionalPhases: [], blocked: false }
@@ -670,7 +721,25 @@ export class WorkflowEngine {
     if (task.phase_status === 'waiting_input' && loc.phase.completion_check) {
       const passed = this.evaluateGate(loc.phase.completion_check, task.worktree_path, task.openspec_path, wf)
       if (!passed) {
-        return { defaultNext: null, optionalPhases: [], blocked: true }
+        const signal = this.readPhaseSignal(task.worktree_path, task.current_phase)
+        return {
+          defaultNext: null,
+          optionalPhases: [],
+          blocked: true,
+          phaseProgress: signal ?? undefined,
+        }
+      }
+    }
+
+    if (task.phase_status === 'waiting_input') {
+      const signal = this.readPhaseSignal(task.worktree_path, task.current_phase)
+      if (signal && signal.status !== 'ready') {
+        return {
+          defaultNext: null,
+          optionalPhases: [],
+          blocked: true,
+          phaseProgress: { status: signal.status, step: signal.step, stepName: signal.stepName, reason: signal.reason },
+        }
       }
     }
 
@@ -990,6 +1059,42 @@ export class WorkflowEngine {
     this.taskRepo.updatePhase(repoTaskId, stageId, msg.phase_id, 'waiting_input')
   }
 
+  async retryFromPrompt(repoTaskId: string, messageId: string): Promise<void> {
+    elog(`retryFromPrompt: task=${repoTaskId} messageId=${messageId}`)
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task)
+      throw new Error(`Task not found: ${repoTaskId}`)
+
+    const msg = this.msgRepo.findById(messageId)
+    if (!msg || msg.repo_task_id !== repoTaskId)
+      throw new Error(`Message not found or does not belong to task: ${messageId}`)
+
+    await this.cancelCurrentAgent(repoTaskId)
+    this.liveOutputs.delete(repoTaskId)
+    this.liveActivityLogs.delete(repoTaskId)
+
+    this.msgRepo.deleteAfterMessage(repoTaskId, msg.phase_id, msg.created_at)
+    this.runRepo.deleteByTaskPhaseAfterTime(repoTaskId, msg.phase_id, msg.created_at)
+
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, msg.phase_id)
+    if (!found)
+      throw new Error(`Phase ${msg.phase_id} not found in workflow config`)
+
+    const laterPhases = this.collectPhaseIdsAfter(
+      found.stageIdx, found.phaseIdx + 1, wf,
+    )
+    if (laterPhases.length) {
+      this.msgRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+      this.runRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+      this.commitRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+    }
+
+    const { stage, phase } = found
+    this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+    await this.executePhase(repoTaskId, phase, stage)
+  }
+
   getFullConfig(): WorkflowConfig {
     return this.config
   }
@@ -1071,12 +1176,15 @@ export class WorkflowEngine {
     const configWriter = getConfigWriter(effectiveCliType)
 
     try {
+      let injectedMcpNames: string[] = []
+
       if (mcpServerIds?.length) {
         const servers = mcpServerIds
           .map(id => this.mcpServerRepo.findById(id))
           .filter((s): s is NonNullable<typeof s> => !!s)
 
         if (servers.length > 0) {
+          injectedMcpNames = servers.map(s => s.name)
           const serverConfigs: McpServerConfig[] = servers.map(s => ({
             name: s.name,
             transport: s.transport,
@@ -1088,8 +1196,16 @@ export class WorkflowEngine {
           }))
           configWriter.write(workDir, serverConfigs)
           const mcpConfigPath = configWriter.getConfigPath(workDir)
-          elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${servers.map(s => s.name).join(',')})`)
+          elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${injectedMcpNames.join(',')})`)
         }
+      }
+
+      if (injectedMcpNames.length === 0) {
+        this.reqRepo.updateFetchError(requirementId, '未配置飞书项目 MCP Server。请在「MCP 管理」中添加飞书项目 MCP，然后重新获取。')
+        this.reqRepo.updateStatus(requirementId, 'fetch_failed')
+        this.requirementLiveOutputs.delete(requirementId)
+        elog(`startRequirementFetch: aborted for ${requirementId} — no MCP servers available`)
+        return
       }
 
       const reqInfo = {
@@ -1117,6 +1233,7 @@ export class WorkflowEngine {
         false,
         reqInfo,
         undefined,
+        injectedMcpNames,
       )
       const provider = this.resolveProvider(phase.provider, {
         agentOverride: phaseAgentCfg.agent,
@@ -1445,6 +1562,7 @@ export class WorkflowEngine {
 
     try {
       const task = this.taskRepo.findById(repoTaskId)!
+      this.clearPhaseSignal(task.worktree_path)
       const wf = this.resolveConfigForTask(repoTaskId)
 
       if (phase.entry_gate && !options?.skipEntryGate) {

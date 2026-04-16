@@ -57,5 +57,16 @@ export function buildSignalPrompt(context: PhaseContext): string {
   lines.push('')
   lines.push('**不要遗漏此标记，它决定了工作流引擎如何推进。**')
 
+  lines.push('')
+  lines.push('### 阶段进度信号（与文本标记并行）')
+  lines.push('')
+  lines.push('如果本次会话中注入了「阶段进度信号工具」（phase-signal），你应该在执行过程中通过该工具报告步骤级进度。')
+  lines.push('两者的分工如下：')
+  lines.push('')
+  lines.push('- **phase-signal tool**：控制用户界面是否显示"进入下一阶段"按钮。每当进入新步骤时调用 `update`，产出就绪时设为 `ready`。')
+  lines.push('- **文本标记**（`<<PHASE_COMPLETE>>` / `<<PENDING_INPUT>>`）：控制工作流引擎的状态机推进，在回复末尾添加。')
+  lines.push('')
+  lines.push('两者互补：tool 提供细粒度进度展示，文本标记驱动最终的状态转换。')
+
   return `---\n\n${lines.join('\n')}`
 }

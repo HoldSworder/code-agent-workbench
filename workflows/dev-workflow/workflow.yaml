@@ -49,6 +49,14 @@ gate_definitions:
       - type: not_exists
         path: "{{openspec_path}}/proposal.md"
 
+  has_proposal_and_specs:
+    description: proposal.md 和 specs 目录已存在
+    checks:
+      - type: exists
+        path: "{{openspec_path}}/proposal.md"
+      - type: exists
+        path: "{{openspec_path}}/specs"
+
   has_proposal_and_specs_no_tasks:
     description: proposal.md 和 specs/ 已存在，但 tasks.md 尚未创建
     checks:
@@ -204,6 +212,7 @@ stages:
         provider: external-cli
         skill: skills/spec-create.md
         requires_confirm: true
+        completion_check: has_proposal_and_specs
         invoke_skills:
           - superpowers:brainstorming
         invoke_commands:
