@@ -9,6 +9,14 @@ export interface ContextBuilderDeps {
   externalRules?: ExternalRuleConfig[]
   /** 根据规则路径解析规则文件内容 */
   resolveRuleContent?: (rulePath: string) => string
+  /**
+   * 解析根级 skill（`skills/<id>/`）内容。
+   * skill 节点类型的 phase 通过此回调加载 SKILL.md 并完成变量插值。
+   */
+  resolveWorkflowSkill?: (id: string, vars: Record<string, string>) => {
+    content: string
+    missingVars: string[]
+  } | null
 }
 
 function resolveInvokedSkills(
@@ -73,6 +81,33 @@ function resolveGates(
   return lines.length > 0 ? lines : undefined
 }
 
+function resolveWorkflowSkillContent(
+  phase: PhaseConfig,
+  workflowVars: Record<string, string>,
+  deps: ContextBuilderDeps,
+): string {
+  if (!phase.skill_ref || !deps.resolveWorkflowSkill) return ''
+
+  // phase.skill_inputs 中的 value 本身支持 {{workflow_var}} 占位符，先插值一次再传给 skill
+  const inputs: Record<string, string> = { ...workflowVars }
+  if (phase.skill_inputs) {
+    for (const [k, tpl] of Object.entries(phase.skill_inputs)) {
+      inputs[k] = tpl.replace(/\{\{(\w+)\}\}/g, (_, key: string) =>
+        workflowVars[key] ?? `{{${key}}}`,
+      )
+    }
+  }
+
+  const rendered = deps.resolveWorkflowSkill(phase.skill_ref, inputs)
+  if (!rendered) return `# Skill 未找到: ${phase.skill_ref}\n\n请在 skills/ 目录下检查该 skill 是否存在。`
+
+  const header = `# Skill: ${phase.skill_ref}\n\n`
+  const warn = rendered.missingVars.length
+    ? `> ⚠️ 未填充的变量：${rendered.missingVars.join(', ')}\n\n`
+    : ''
+  return header + warn + rendered.content
+}
+
 function resolveExternalRules(
   ruleConfigs: ExternalRuleConfig[] | undefined,
   resolveContent?: (rulePath: string) => string,
@@ -118,13 +153,26 @@ export function buildPhaseContext(
   stageGate?: string,
   injectedToolPrompts?: string[],
   mcpServerNames?: string[],
+  planMode?: boolean,
 ): PhaseContext {
   const templateVars: Record<string, string> = {
     openspec_path: openspecPath,
     change_id: changeId,
     branch_name: branchName,
     repo_path: repoPath,
+    requirement_title: requirement?.title ?? '',
+    requirement_description: requirement?.description ?? '',
+    requirement_doc_url: requirement?.docUrl ?? '',
+    requirement_source_url: requirement?.sourceUrl ?? '',
   }
+
+  const skillContent = leanMode
+    ? ''
+    : phase.type === 'skill' && phase.skill_ref
+      ? resolveWorkflowSkillContent(phase, templateVars, deps)
+      : phase.skill
+        ? deps.resolveSkillContent(phase.skill)
+        : ''
 
   return {
     stageId,
@@ -138,7 +186,7 @@ export function buildPhaseContext(
     requirementDescription: requirement?.description,
     requirementDocUrl: requirement?.docUrl,
     requirementSourceUrl: requirement?.sourceUrl,
-    skillContent: leanMode ? '' : (phase.skill ? deps.resolveSkillContent(phase.skill) : ''),
+    skillContent,
     tools: phase.tools,
     mcpConfig: phase.mcp_config ?? undefined,
     userMessage,
@@ -152,5 +200,6 @@ export function buildPhaseContext(
     suspendable: phase.suspendable,
     injectedToolPrompts: leanMode ? undefined : injectedToolPrompts,
     mcpServerNames: mcpServerNames?.length ? mcpServerNames : undefined,
+    planMode: planMode || undefined,
   }
 }

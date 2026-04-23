@@ -51,39 +51,68 @@ const EntryInputSchema = z.object({
 
 // ── Phase 配置（Stage 内子阶段） ──
 
-const PhaseSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  provider: z.enum(['api', 'external-cli', 'codex']),
-  skill: z.string().optional(),
-  invoke_skills: z.array(z.string()).optional(),
-  invoke_commands: z.array(z.string()).optional(),
-  tools: z.array(z.string()).optional(),
-  mcp_config: z.string().nullable().optional(),
-  mcp_servers: z.array(z.string()).optional(),
-  guardrails: z.array(z.string()).optional(),
+const PhaseSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    /**
+     * Phase 节点类型：
+     * - 'phase'（默认）：常规 agent 执行节点，由 provider + skill 文件驱动
+     * - 'skill'：引用根级 `skills/<id>/` 的可复用 skill，由 engine 加载并插值
+     */
+    type: z.enum(['phase', 'skill']).optional().default('phase'),
+    /** 当 type=skill 时必填：根级 skill 的 id（即 `skills/<id>/`） */
+    skill_ref: z.string().optional(),
+    /** 当 type=skill 时传入 skill 模板的变量（支持 {{workflow_var}} 占位符） */
+    skill_inputs: z.record(z.string(), z.string()).optional(),
 
-  requires_confirm: z.boolean().optional().default(false),
-  confirm_files: z.array(z.string()).optional(),
-  completion_check: z.string().optional(),
-  entry_gate: z.string().optional(),
-  is_terminal: z.boolean().optional(),
+    /** 常规节点必填；skill 节点可省略（默认 external-cli） */
+    provider: z.enum(['api', 'external-cli', 'codex']).optional(),
+    skill: z.string().optional(),
+    invoke_skills: z.array(z.string()).optional(),
+    invoke_commands: z.array(z.string()).optional(),
+    tools: z.array(z.string()).optional(),
+    mcp_config: z.string().nullable().optional(),
+    mcp_servers: z.array(z.string()).optional(),
+    guardrails: z.array(z.string()).optional(),
 
-  /** 完成后允许用户挂起需求（auto-commit 后进入 suspended 状态） */
-  suspendable: z.boolean().optional(),
-  /** 默认跳过，需要 trigger 激活才执行 */
-  optional: z.boolean().optional(),
-  /** 默认执行，用户可选择跳过 */
-  skippable: z.boolean().optional(),
-  /** 完成后可跳回 loop_target 重新执行 */
-  loopable: z.boolean().optional(),
-  /** loopable 为 true 时，循环回到的目标 phase id */
-  loop_target: z.string().optional(),
-  /** 激活 optional phase 的触发短语 */
-  triggers: z.array(z.string()).optional(),
-  /** optional phase 被激活进入时需要收集的用户输入 */
-  entry_input: EntryInputSchema.optional(),
-})
+    requires_confirm: z.boolean().optional().default(false),
+    confirm_files: z.array(z.string()).optional(),
+    completion_check: z.string().optional(),
+    entry_gate: z.string().optional(),
+    is_terminal: z.boolean().optional(),
+
+    /** 完成后允许用户挂起需求（auto-commit 后进入 suspended 状态） */
+    suspendable: z.boolean().optional(),
+    /** 默认跳过，需要 trigger 激活才执行 */
+    optional: z.boolean().optional(),
+    /** 默认执行，用户可选择跳过 */
+    skippable: z.boolean().optional(),
+    /** 完成后可跳回 loop_target 重新执行 */
+    loopable: z.boolean().optional(),
+    /** loopable 为 true 时，循环回到的目标 phase id */
+    loop_target: z.string().optional(),
+    /** 激活 optional phase 的触发短语 */
+    triggers: z.array(z.string()).optional(),
+    /** optional phase 被激活进入时需要收集的用户输入 */
+    entry_input: EntryInputSchema.optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.type === 'skill' && !val.skill_ref) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['skill_ref'],
+        message: 'skill 节点必须提供 skill_ref',
+      })
+    }
+    if ((val.type ?? 'phase') === 'phase' && !val.provider) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['provider'],
+        message: '常规 phase 节点必须提供 provider',
+      })
+    }
+  })
 
 // ── Stage 配置（顶层阶段） ──
 

@@ -47,6 +47,8 @@ export interface PhaseContext {
   injectedToolPrompts?: string[]
   /** 已注入到工作目录的 MCP server 名称列表 */
   mcpServerNames?: string[]
+  /** Agent 以只读 plan 模式运行，仅分析输出方案，不修改文件 */
+  planMode?: boolean
 }
 
 export interface PhaseResult {

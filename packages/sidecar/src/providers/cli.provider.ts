@@ -92,7 +92,7 @@ export class ExternalCliProvider implements AgentProvider {
     const prompt = this.buildPrompt(context)
     const binary = this.config.binaryPath ?? this.defaultBinary()
     const useStreamJson = this.config.type !== 'codex'
-    const { args, stdinData } = this.buildSpawnArgs(context.repoPath, prompt)
+    const { args, stdinData } = this.buildSpawnArgs(context.repoPath, prompt, { planMode: context.planMode })
 
     this.abortController = new AbortController()
     const { signal } = this.abortController
@@ -288,10 +288,13 @@ export class ExternalCliProvider implements AgentProvider {
 
   // ── Spawn args per backend ──
 
-  private buildSpawnArgs(cwd: string, prompt: string): { args: string[], stdinData: string | null } {
+  private buildSpawnArgs(cwd: string, prompt: string, options?: { planMode?: boolean }): { args: string[], stdinData: string | null } {
+    const planMode = options?.planMode ?? false
     switch (this.config.type) {
       case 'cursor-cli': {
         const args = ['-p', '--output-format', 'stream-json', '--stream-partial-output', '--yolo', '--trust', '--approve-mcps', '--workspace', cwd]
+        if (planMode)
+          args.push('--plan')
         if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         if (this.config.resumeSessionId)
@@ -300,6 +303,8 @@ export class ExternalCliProvider implements AgentProvider {
       }
       case 'claude-code': {
         const args = ['--print', '-', '--output-format', 'stream-json', '--verbose']
+        if (planMode)
+          args.push('--permission-mode', 'plan')
         if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
         if (this.config.resumeSessionId)
@@ -310,7 +315,10 @@ export class ExternalCliProvider implements AgentProvider {
         const args = ['exec', '-', '--full-auto', '-C', cwd]
         if (this.config.model && this.config.model !== 'auto')
           args.push('--model', this.config.model)
-        return { args, stdinData: prompt }
+        const effectivePrompt = planMode
+          ? `[PLAN MODE] 你只能分析和输出方案，不得修改任何文件。请输出详细的实施计划。\n\n${prompt}`
+          : prompt
+        return { args, stdinData: effectivePrompt }
       }
     }
   }

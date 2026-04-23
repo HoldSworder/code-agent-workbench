@@ -20,6 +20,16 @@ import { readTranscript, listSessionsForRepo } from '../transcript/reader'
 import { scanAllSkills, readSkillContent, enableSkill, disableSkill, ENV_LABELS } from '../skill/scanner'
 import type { ManageableEnv } from '../skill/scanner'
 import { listRemoteSkills, searchRemoteSkills, getRemoteSkillDetail, installRemoteSkill, uninstallRemoteSkill } from '../skill/store'
+import {
+  scanWorkflowSkills,
+  getWorkflowSkill,
+  createWorkflowSkill,
+  updateWorkflowSkill,
+  deleteWorkflowSkill,
+  renderWorkflowSkill,
+  getWorkflowSkillsRoot,
+} from '../workflow-skills/registry'
+import type { WorkflowSkillMeta } from '../workflow-skills/types'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import type { CreateMcpServerInput, UpdateMcpServerInput } from '../db/repositories/mcp-server.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
@@ -349,8 +359,8 @@ export function registerMethods(
     await engine.resumeTask(repoTaskId)
     return { ok: true }
   })
-  server.register('workflow.feedback', async ({ repoTaskId, feedback }) => {
-    engine.provideFeedback(repoTaskId, feedback).catch((err) => {
+  server.register('workflow.feedback', async ({ repoTaskId, feedback, planMode }) => {
+    engine.provideFeedback(repoTaskId, feedback, planMode).catch((err) => {
       process.stderr.write(`[workflow] feedback failed for ${repoTaskId}: ${err}\n`)
     })
     return { ok: true }
@@ -555,6 +565,26 @@ export function registerMethods(
     }).map(t => ({ id: t.id }))
   })
 
+  // ── UI Elements ──
+
+  server.register('ui.getPending', async ({ taskId }: { taskId: string }) => {
+    const task = taskRepo.findById(taskId)
+    if (!task) throw new Error(`Task not found: ${taskId}`)
+    const all = engine.readUIElements(task.worktree_path)
+    return all.filter((e: any) => e.response == null)
+  })
+
+  server.register('ui.getAll', async ({ taskId }: { taskId: string }) => {
+    const task = taskRepo.findById(taskId)
+    if (!task) throw new Error(`Task not found: ${taskId}`)
+    return engine.readUIElements(task.worktree_path)
+  })
+
+  server.register('ui.submitResponse', async ({ taskId, elementId, data }: { taskId: string, elementId: string, data: unknown }) => {
+    engine.submitUIResponse(taskId, elementId, data)
+    return { ok: true }
+  })
+
   // ── Skills ──
   server.register('skill.scan', async () => {
     return { skills: scanAllSkills(), envLabels: ENV_LABELS }
@@ -572,6 +602,58 @@ export function registerMethods(
   server.register('skill.disable', async ({ dirName, env }: { dirName: string, env: ManageableEnv }) => {
     disableSkill(dirName, env)
     return { ok: true }
+  })
+
+  // ── Workflow Skills（根级 skills/ 目录，工作流节点引用） ──
+  server.register('workflowSkill.list', async () => {
+    const skills = scanWorkflowSkills()
+    return {
+      root: getWorkflowSkillsRoot(),
+      skills: skills.map(s => ({ ...s.meta, dir: s.dir })),
+    }
+  })
+
+  server.register('workflowSkill.get', async ({ id }: { id: string }) => {
+    const s = getWorkflowSkill(id)
+    if (!s) return { found: false, meta: null, content: '' }
+    return { found: true, meta: s.meta, content: s.content, dir: s.dir }
+  })
+
+  server.register('workflowSkill.create', async (input: {
+    id: string
+    name: string
+    description?: string
+    content?: string
+    inputs?: WorkflowSkillMeta['inputs']
+    mcp_dependencies?: string[]
+    tags?: string[]
+  }) => {
+    const s = createWorkflowSkill(input)
+    return { meta: s.meta, content: s.content, dir: s.dir }
+  })
+
+  server.register('workflowSkill.update', async (input: {
+    id: string
+    name?: string
+    description?: string
+    content?: string
+    inputs?: WorkflowSkillMeta['inputs']
+    mcp_dependencies?: string[]
+    tags?: string[]
+  }) => {
+    const s = updateWorkflowSkill(input)
+    return { meta: s.meta, content: s.content, dir: s.dir }
+  })
+
+  server.register('workflowSkill.delete', async ({ id }: { id: string }) => {
+    deleteWorkflowSkill(id)
+    return { ok: true }
+  })
+
+  server.register('workflowSkill.preview', async ({ id, vars }: { id: string, vars?: Record<string, string> }) => {
+    const r = renderWorkflowSkill(id, vars ?? {})
+    if (!r) return { found: false, content: '', missingVars: [] }
+    return { found: true, content: r.content, missingVars: r.missingVars, meta: r.meta }
   })
 
   // ── Skill Store ──

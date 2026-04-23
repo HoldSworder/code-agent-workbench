@@ -9,7 +9,13 @@ import { useModelList } from '../composables/use-model-list'
 interface PhaseConfig {
   id: string
   name: string
-  provider: 'api' | 'external-cli'
+  /** 节点类型：'phase'（默认，常规 agent 节点）或 'skill'（引用根级 skills/） */
+  type?: 'phase' | 'skill'
+  /** 当 type=skill 时：引用的根级 skill id */
+  skill_ref?: string
+  /** 当 type=skill 时：传入 skill 模板的变量 */
+  skill_inputs?: Record<string, string>
+  provider?: 'api' | 'external-cli'
   skill?: string
   invoke_skills?: string[]
   invoke_commands?: string[]
@@ -25,6 +31,14 @@ interface PhaseConfig {
   loopable?: boolean
   loop_target?: string
   triggers?: string[]
+}
+
+interface WorkflowSkillSummary {
+  id: string
+  name: string
+  description: string
+  inputs?: Array<{ key: string, label?: string, required?: boolean, default?: string }>
+  mcp_dependencies?: string[]
 }
 
 interface StageConfig {
@@ -439,6 +453,23 @@ function closePanel() {
 }
 
 async function loadPhaseSkill(phase: PhaseConfig) {
+  if (phase.type === 'skill' && phase.skill_ref) {
+    skillLoading.value = true
+    try {
+      const res = await rpc<{ found: boolean, content: string, missingVars: string[] }>(
+        'workflowSkill.preview',
+        { id: phase.skill_ref, vars: phase.skill_inputs ?? {} },
+      )
+      skillContent.value = res?.found
+        ? res.content
+        : `# Skill 未找到: ${phase.skill_ref}\n\n请在 skills/ 目录下检查该 skill 是否存在。`
+    } catch {
+      skillContent.value = ''
+    } finally {
+      skillLoading.value = false
+    }
+    return
+  }
   if (!phase.skill) { skillContent.value = ''; return }
   skillLoading.value = true
   try {
@@ -554,7 +585,11 @@ function toggleYaml() {
               <div class="text-[13px] font-medium text-gray-800 dark:text-gray-100 mb-0.5">{{ phase.name }}</div>
               <div class="text-[11px] text-gray-400 font-mono mb-2">{{ phase.id }}</div>
               <div class="flex items-center gap-1 flex-wrap">
-                <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
+                <span v-if="phase.type === 'skill'" class="phase-badge phase-badge--skill" title="Skill 节点">
+                  <div class="i-carbon-rule w-3 h-3" />
+                  skill
+                </span>
+                <span v-else-if="phase.provider" class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
                 <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
               </div>
             </div>
@@ -685,7 +720,11 @@ function toggleYaml() {
                       </div>
                       <div class="text-[11px] text-gray-400 font-mono mb-1.5">{{ phase.id }}</div>
                       <div class="flex items-center gap-1 flex-wrap mb-1.5">
-                        <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
+                        <span v-if="phase.type === 'skill'" class="phase-badge phase-badge--skill" title="Skill 节点">
+                          <div class="i-carbon-rule w-3 h-3" />
+                          skill
+                        </span>
+                        <span v-else-if="phase.provider" class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
                         <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
                       </div>
                       <!-- Agent/Model override indicator -->
@@ -699,7 +738,11 @@ function toggleYaml() {
                           {{ phaseAgentMap[phase.id].model }}
                         </span>
                       </div>
-                      <div v-if="phase.skill" class="text-[11px] text-gray-400 font-mono truncate flex items-center gap-1">
+                      <div v-if="phase.type === 'skill' && phase.skill_ref" class="text-[11px] text-indigo-500 dark:text-indigo-400 font-mono truncate flex items-center gap-1">
+                        <div class="i-carbon-rule w-3 h-3 shrink-0 opacity-70" />
+                        {{ phase.skill_ref }}
+                      </div>
+                      <div v-else-if="phase.skill" class="text-[11px] text-gray-400 font-mono truncate flex items-center gap-1">
                         <div class="i-carbon-document w-3 h-3 shrink-0 opacity-50" />
                         {{ phase.skill }}
                       </div>
@@ -950,11 +993,36 @@ function toggleYaml() {
             <section>
               <h3 class="panel-title">基本信息</h3>
               <div class="panel-grid">
-                <span class="panel-k">Provider</span>
-                <span class="phase-badge inline-block" :class="panelTarget.phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ panelTarget.phase.provider }}</span>
-                <template v-if="panelTarget.phase.skill">
-                  <span class="panel-k">Skill</span>
-                  <code class="text-[11px] font-mono text-gray-600 dark:text-gray-400 break-all">{{ panelTarget.phase.skill }}</code>
+                <template v-if="panelTarget.phase.type === 'skill'">
+                  <span class="panel-k">类型</span>
+                  <span class="phase-badge phase-badge--skill inline-flex">
+                    <div class="i-carbon-rule w-3 h-3" />
+                    Skill 节点
+                  </span>
+                  <span class="panel-k">Skill Ref</span>
+                  <router-link
+                    to="/workflow-skills"
+                    class="text-[11px] font-mono text-indigo-600 dark:text-indigo-400 hover:underline break-all"
+                  >
+                    {{ panelTarget.phase.skill_ref }}
+                  </router-link>
+                  <template v-if="panelTarget.phase.skill_inputs && Object.keys(panelTarget.phase.skill_inputs).length">
+                    <span class="panel-k">Inputs</span>
+                    <div class="text-[11px] font-mono text-gray-600 dark:text-gray-400 space-y-0.5">
+                      <div v-for="(v, k) in panelTarget.phase.skill_inputs" :key="k">
+                        <span class="text-gray-500">{{ k }}</span> = <span class="text-gray-700 dark:text-gray-300">{{ v }}</span>
+                      </div>
+                    </div>
+                  </template>
+                </template>
+                <template v-else>
+                  <span class="panel-k">Provider</span>
+                  <span v-if="panelTarget.phase.provider" class="phase-badge inline-block" :class="panelTarget.phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ panelTarget.phase.provider }}</span>
+                  <span v-else class="text-[11px] text-gray-400">未设置</span>
+                  <template v-if="panelTarget.phase.skill">
+                    <span class="panel-k">Skill</span>
+                    <code class="text-[11px] font-mono text-gray-600 dark:text-gray-400 break-all">{{ panelTarget.phase.skill }}</code>
+                  </template>
                 </template>
               </div>
             </section>
@@ -1326,15 +1394,19 @@ function toggleYaml() {
             </section>
 
             <!-- Skill content -->
-            <section v-if="panelTarget.phase.skill" class="skill-section">
+            <section v-if="panelTarget.phase.skill || (panelTarget.phase.type === 'skill' && panelTarget.phase.skill_ref)" class="skill-section">
               <div class="skill-section-header">
                 <div class="flex items-center gap-2">
                   <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-indigo-500 flex items-center justify-center shadow-sm">
                     <div class="i-carbon-document w-3.5 h-3.5 text-white" />
                   </div>
                   <div>
-                    <h3 class="text-[13px] font-semibold text-gray-800 dark:text-gray-100 m-0">SKILL 内容</h3>
-                    <p class="text-[11px] text-gray-400 font-mono mt-0.5 truncate max-w-[280px]">{{ panelTarget.phase.skill }}</p>
+                    <h3 class="text-[13px] font-semibold text-gray-800 dark:text-gray-100 m-0">
+                      {{ panelTarget.phase.type === 'skill' ? '根级 Skill 渲染预览' : 'SKILL 内容' }}
+                    </h3>
+                    <p class="text-[11px] text-gray-400 font-mono mt-0.5 truncate max-w-[280px]">
+                      {{ panelTarget.phase.type === 'skill' ? panelTarget.phase.skill_ref : panelTarget.phase.skill }}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -1577,7 +1649,11 @@ function toggleYaml() {
                   </div>
                   <div class="text-[11px] font-mono text-gray-400 mb-1.5">{{ phase.id }}</div>
                   <div class="flex items-center gap-1 flex-wrap">
-                    <span class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
+                    <span v-if="phase.type === 'skill'" class="phase-badge phase-badge--skill">
+                      <div class="i-carbon-rule w-3 h-3" />
+                      skill
+                    </span>
+                    <span v-else-if="phase.provider" class="phase-badge" :class="phase.provider === 'api' ? 'phase-badge--api' : 'phase-badge--cli'">{{ phase.provider }}</span>
                     <span v-for="f in getPhaseFlags(phase)" :key="f.label" class="phase-badge" :class="f.color">{{ f.label }}</span>
                   </div>
                   <div v-if="phase.completion_check || phase.entry_gate || carriesStageGate(phase, panelTarget.stage.id) || phase.guardrails?.length" class="mt-1.5 space-y-0.5">
@@ -1625,11 +1701,13 @@ function toggleYaml() {
 :is(.dark) .phase-card:hover { border-color: rgba(255, 255, 255, 0.14); }
 
 /* ── Badges ── */
-.phase-badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 500; line-height: 1.5; }
+.phase-badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 500; line-height: 1.5; display: inline-flex; align-items: center; gap: 2px; }
 .phase-badge--api { background: rgba(99, 102, 241, 0.1); color: #6366f1; }
 .phase-badge--cli { background: rgba(16, 185, 129, 0.1); color: #059669; }
+.phase-badge--skill { background: rgba(139, 92, 246, 0.12); color: #7c3aed; }
 :is(.dark) .phase-badge--api { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
 :is(.dark) .phase-badge--cli { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+:is(.dark) .phase-badge--skill { background: rgba(139, 92, 246, 0.2); color: #c4b5fd; }
 /* ── Pills ── */
 .pill { font-size: 11px; padding: 1px 7px; border-radius: 5px; font-weight: 500; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
 .pill--gray { background: #f3f4f6; color: #6b7280; }

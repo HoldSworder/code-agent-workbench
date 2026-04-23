@@ -207,6 +207,19 @@ stages:
         skill: skills/create-branch.md
         entry_gate: working_tree_clean
 
+      # Skill 节点：复用根级 skills/feishu-branch-link/ 可复用能力包
+      # 由 engine 直接加载 SKILL.md + 执行变量插值，无需在 workflow 中重复编写
+      - id: link-feishu
+        name: 关联飞书工作项
+        type: skill
+        skill_ref: feishu-branch-link
+        skill_inputs:
+          branch_name: "{{branch_name}}"
+          task_url: "{{requirement_source_url}}"
+        optional: true
+        mcp_servers:
+          - lark-project
+
       - id: spec-create
         name: 需求对齐 & Spec 落盘
         provider: external-cli

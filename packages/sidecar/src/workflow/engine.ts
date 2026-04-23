@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, appendFileSync, readFileSync, mkdirSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import { tmpdir, homedir } from 'node:os'
@@ -23,10 +23,11 @@ import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { git, getHead, getMergeBase, resetHard, stashIfDirty, getCurrentBranch } from '../git/operations'
+import { git, getHead, getMergeBase, resetHard, resetHardClean, stashIfDirty, getCurrentBranch } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
 import { collectTools } from '../tools/registry'
+import { renderWorkflowSkill } from '../workflow-skills/registry'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
@@ -67,7 +68,15 @@ export class WorkflowEngine {
   private liveActivityLogs = new Map<string, string>()
   private requirementLiveOutputs = new Map<string, string>()
   private activeRequirementProviders = new Map<string, AgentProvider>()
-  private pendingAdvance = new Set<string>()
+  private pendingAdvance = new Map<string, string>()
+  private pendingPlanMode = new Set<string>()
+
+  /** 供 context-builder 加载根级 skill（skills/<id>/）的回调 */
+  private resolveWorkflowSkill = (id: string, vars: Record<string, string>) => {
+    const rendered = renderWorkflowSkill(id, vars)
+    if (!rendered) return null
+    return { content: rendered.content, missingVars: rendered.missingVars }
+  }
 
   private rawYaml: string
   private configs = new Map<string, WorkflowConfig>()
@@ -240,6 +249,56 @@ export class WorkflowEngine {
     }
     catch (err) {
       elog(`clearPhaseSignal: failed: ${err}`)
+    }
+  }
+
+  // ── UI 元素文件读写 ──
+
+  readUIElements(worktreePath: string): Array<Record<string, unknown>> {
+    const dir = join(worktreePath, '.code-agent', 'ui-elements')
+    if (!existsSync(dir)) return []
+    const results: Array<Record<string, unknown>> = []
+    for (const f of readdirSync(dir).filter(n => n.endsWith('.json'))) {
+      try {
+        results.push(JSON.parse(readFileSync(join(dir, f), 'utf-8')))
+      }
+      catch { /* skip malformed */ }
+    }
+    return results
+  }
+
+  submitUIResponse(repoTaskId: string, elementId: string, data: unknown): void {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
+
+    const filePath = join(task.worktree_path, '.code-agent', 'ui-elements', `${elementId}.json`)
+    if (!existsSync(filePath)) throw new Error(`UI element not found: ${elementId}`)
+
+    const element = JSON.parse(readFileSync(filePath, 'utf-8'))
+    element.response = data
+    element.respondedAt = Math.floor(Date.now() / 1000)
+    writeFileSync(filePath, JSON.stringify(element, null, 2) + '\n')
+
+    this.msgRepo.create({
+      repo_task_id: repoTaskId,
+      phase_id: task.current_phase,
+      role: 'user',
+      content: `[UI Response] ${element.title ?? elementId}: ${JSON.stringify(data)}`,
+    })
+    elog(`submitUIResponse: task=${repoTaskId} element=${elementId}`)
+  }
+
+  private clearUIElements(worktreePath: string): void {
+    const dir = join(worktreePath, '.code-agent', 'ui-elements')
+    if (!existsSync(dir)) return
+    try {
+      for (const f of readdirSync(dir).filter(n => n.endsWith('.json'))) {
+        rmSync(join(dir, f))
+      }
+      elog('clearUIElements: cleared all')
+    }
+    catch (err) {
+      elog(`clearUIElements: failed: ${err}`)
     }
   }
 
@@ -641,9 +700,9 @@ export class WorkflowEngine {
     this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'waiting_input')
   }
 
-  async provideFeedback(repoTaskId: string, feedback: string): Promise<void> {
+  async provideFeedback(repoTaskId: string, feedback: string, planMode?: boolean): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
-    elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} feedback=${feedback.slice(0, 100)}`)
+    elog(`provideFeedback: task=${repoTaskId} phase=${task?.current_phase} status=${task?.phase_status} planMode=${!!planMode} feedback=${feedback.slice(0, 100)}`)
     const allowedStates = ['waiting_confirm', 'waiting_input', 'suspended', 'failed', 'cancelled', 'completed', 'waiting_event']
     if (!task || !allowedStates.includes(task.phase_status))
       throw new Error(`Task ${repoTaskId} is not in a feedbackable state (current: ${task?.phase_status})`)
@@ -667,7 +726,7 @@ export class WorkflowEngine {
     })
 
     this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
-    await this.executePhase(repoTaskId, phase, stage, feedback)
+    await this.executePhase(repoTaskId, phase, stage, feedback, { planMode })
   }
 
   async confirmAndExecute(repoTaskId: string): Promise<void> {
@@ -696,7 +755,7 @@ export class WorkflowEngine {
       content: feedback,
     })
 
-    this.pendingAdvance.add(repoTaskId)
+    this.pendingAdvance.set(repoTaskId, phase.id)
     this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
     await this.executePhase(repoTaskId, phase, stage, feedback)
   }
@@ -839,7 +898,6 @@ export class WorkflowEngine {
       content: feedback,
     })
 
-    this.pendingAdvance.add(repoTaskId)
     this.taskRepo.updatePhase(repoTaskId, targetFound.stage.id, targetFound.phase.id, 'running')
     await this.executePhase(repoTaskId, targetFound.phase, targetFound.stage, feedback)
   }
@@ -912,7 +970,7 @@ export class WorkflowEngine {
       if (initialSha) {
         if (!this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID))
           this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, initialSha)
-        try { await resetHard(task.worktree_path, initialSha) }
+        try { await resetHardClean(task.worktree_path, initialSha) }
         catch (e) { process.stderr.write(`[workflow] git reset failed on resetTask: ${e}\n`) }
       }
     }
@@ -962,33 +1020,38 @@ export class WorkflowEngine {
     this.liveOutputs.delete(repoTaskId)
     this.liveActivityLogs.delete(repoTaskId)
 
-    let resetSha: string | null = null
-    if (target.stageIdx === 0 && target.phaseIdx === 0) {
-      resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
-    }
-    else {
-      const allPhases = flattenPhases(wf)
-      const flatIdx = allPhases.findIndex(
-        p => p.id === targetPhaseId && p.stageId === targetStageId,
-      )
-      for (let i = flatIdx - 1; i >= 0 && !resetSha; i--) {
-        resetSha = this.commitRepo.get(repoTaskId, allPhases[i].id)
-      }
-      if (!resetSha)
+    const isCurrentPhase = targetStageId === task.current_stage
+      && targetPhaseId === task.current_phase
+
+    if (!isCurrentPhase) {
+      let resetSha: string | null = null
+      if (target.stageIdx === 0 && target.phaseIdx === 0) {
         resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
-    }
-
-    if (!resetSha) {
-      resetSha = await getMergeBase(task.worktree_path)
-      if (resetSha) this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, resetSha)
-    }
-
-    if (resetSha) {
-      try {
-        await stashIfDirty(task.worktree_path, `auto-stash before rollback to ${targetStageId}/${targetPhaseId}`)
-        await resetHard(task.worktree_path, resetSha)
       }
-      catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
+      else {
+        const allPhases = flattenPhases(wf)
+        const flatIdx = allPhases.findIndex(
+          p => p.id === targetPhaseId && p.stageId === targetStageId,
+        )
+        for (let i = flatIdx - 1; i >= 0 && !resetSha; i--) {
+          resetSha = this.commitRepo.get(repoTaskId, allPhases[i].id)
+        }
+        if (!resetSha)
+          resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
+      }
+
+      if (!resetSha) {
+        resetSha = await getMergeBase(task.worktree_path)
+        if (resetSha) this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, resetSha)
+      }
+
+      if (resetSha) {
+        try {
+          await stashIfDirty(task.worktree_path, `auto-stash before rollback to ${targetStageId}/${targetPhaseId}`)
+          await resetHard(task.worktree_path, resetSha)
+        }
+        catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
+      }
     }
 
     const phasesToClear = this.collectPhaseIdsAfter(target.stageIdx, target.phaseIdx, wf)
@@ -1230,6 +1293,7 @@ export class WorkflowEngine {
           resolveSkillContent: this.resolveSkillContent,
           externalRules: this.config.external_rules,
           resolveRuleContent: this.resolveSkillContent,
+          resolveWorkflowSkill: this.resolveWorkflowSkill,
         },
         undefined,
         undefined,
@@ -1238,7 +1302,7 @@ export class WorkflowEngine {
         undefined,
         injectedMcpNames,
       )
-      const provider = this.resolveProvider(phase.provider, {
+      const provider = this.resolveProvider(phase.provider ?? 'external-cli', {
         agentOverride: phaseAgentCfg.agent,
         modelOverride: phaseAgentCfg.model,
       })
@@ -1461,6 +1525,7 @@ export class WorkflowEngine {
       gateDefinitions: wf.gate_definitions,
       externalRules: wf.external_rules,
       resolveRuleContent: this.resolveSkillContent,
+      resolveWorkflowSkill: this.resolveWorkflowSkill,
     }
 
     const stageTyped = stage as StageConfig
@@ -1524,6 +1589,7 @@ export class WorkflowEngine {
       gateDefinitions: wf.gate_definitions,
       externalRules: wf.external_rules,
       resolveRuleContent: this.resolveSkillContent,
+      resolveWorkflowSkill: this.resolveWorkflowSkill,
     }
 
     const stageTyped = stage as StageConfig
@@ -1558,14 +1624,15 @@ export class WorkflowEngine {
     phase: PhaseConfig,
     stage: StageConfig,
     userMessage?: string,
-    options?: { skipEntryGate?: boolean },
+    options?: { skipEntryGate?: boolean, planMode?: boolean },
   ): Promise<void> {
-    elog(`executePhase: task=${repoTaskId} stage=${stage.id} phase=${phase.id} provider=${phase.provider} hasUserMsg=${!!userMessage} skipEntryGate=${options?.skipEntryGate ?? false}`)
+    elog(`executePhase: task=${repoTaskId} stage=${stage.id} phase=${phase.id} provider=${phase.provider} hasUserMsg=${!!userMessage} skipEntryGate=${options?.skipEntryGate ?? false} planMode=${options?.planMode ?? false}`)
     let agentRunId: string | null = null
 
     try {
       const task = this.taskRepo.findById(repoTaskId)!
       this.clearPhaseSignal(task.worktree_path)
+      this.clearUIElements(task.worktree_path)
       const wf = this.resolveConfigForTask(repoTaskId)
 
       if (phase.entry_gate && !options?.skipEntryGate) {
@@ -1594,9 +1661,19 @@ export class WorkflowEngine {
       const previousSessionId = this.runRepo.findLastSessionId(repoTaskId, phase.id)
       const isResume = !!previousSessionId && !!userMessage
 
-      const history = this.msgRepo
+      const MAX_HISTORY_CHARS = 30_000
+      let history = this.msgRepo
         .findByTaskAndPhase(repoTaskId, phase.id)
+        .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+
+      let totalChars = 0
+      const keepCount = [...history].reverse().findIndex((h) => {
+        totalChars += h.content.length
+        return totalChars > MAX_HISTORY_CHARS
+      })
+      if (keepCount > 0)
+        history = history.slice(-keepCount)
 
       const reqInfo = requirement
         ? { title: requirement.title, description: requirement.description, docUrl: requirement.doc_url ?? undefined, sourceUrl: requirement.source_url ?? undefined }
@@ -1608,6 +1685,7 @@ export class WorkflowEngine {
         gateDefinitions: wf.gate_definitions,
         externalRules: wf.external_rules,
         resolveRuleContent: this.resolveSkillContent,
+        resolveWorkflowSkill: this.resolveWorkflowSkill,
       }
 
       const shouldInjectStageGate = stage.gate
@@ -1644,6 +1722,9 @@ export class WorkflowEngine {
         ? injectedTools.map(t => t.promptSection)
         : undefined
 
+      const planMode = options?.planMode
+      if (planMode) this.pendingPlanMode.add(repoTaskId)
+
       const context = isResume
         ? buildPhaseContext(
             phase,
@@ -1660,6 +1741,8 @@ export class WorkflowEngine {
             reqInfo,
             effectiveStageGate,
             toolPrompts,
+            undefined,
+            planMode,
           )
         : buildPhaseContext(
             phase,
@@ -1676,16 +1759,18 @@ export class WorkflowEngine {
             reqInfo,
             effectiveStageGate,
             toolPrompts,
+            undefined,
+            planMode,
           )
 
       const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
-      const provider = this.resolveProvider(phase.provider, {
+      const provider = this.resolveProvider(phase.provider ?? 'external-cli', {
         resumeSessionId: previousSessionId ?? undefined,
         agentOverride: phaseAgentCfg.agent,
         modelOverride: phaseAgentCfg.model,
       })
 
-      const actualAgent = phaseAgentCfg.agent ?? this.settingsRepo.get('agent.provider') ?? phase.provider
+      const actualAgent = phaseAgentCfg.agent ?? this.settingsRepo.get('agent.provider') ?? phase.provider ?? 'external-cli'
       const agentRun = this.runRepo.create({
         repo_task_id: repoTaskId,
         phase_id: phase.id,
@@ -1806,12 +1891,26 @@ export class WorkflowEngine {
   ): Promise<void> {
     const wf = this.resolveConfigForTask(repoTaskId)
     const agentSignal = this.parsePhaseSignal(result.output)
-    const shouldAutoAdvance = this.pendingAdvance.has(repoTaskId)
-    if (shouldAutoAdvance) this.pendingAdvance.delete(repoTaskId)
-    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} agentSignal=${agentSignal} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} autoAdvance=${shouldAutoAdvance} error=${result.error?.slice(0, 200) ?? 'none'}`)
+    const shouldAutoAdvance = this.pendingAdvance.get(repoTaskId) === phase.id
+    if (this.pendingAdvance.has(repoTaskId)) this.pendingAdvance.delete(repoTaskId)
+    const isPlanMode = this.pendingPlanMode.has(repoTaskId)
+    if (isPlanMode) this.pendingPlanMode.delete(repoTaskId)
+    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} agentSignal=${agentSignal} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} autoAdvance=${shouldAutoAdvance} planMode=${isPlanMode} error=${result.error?.slice(0, 200) ?? 'none'}`)
 
     if (result.status === 'failed' || result.status === 'cancelled') {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, result.status)
+      return
+    }
+
+    if (isPlanMode) {
+      elog(`handlePhaseResult: plan mode, forcing waiting_input without advancing`)
+      this.msgRepo.create({
+        repo_task_id: repoTaskId,
+        phase_id: phase.id,
+        role: 'system',
+        content: `以上为 Plan 模式的分析方案（未修改任何文件）。你可以确认执行、调整方案或继续对话。`,
+      })
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
       return
     }
 

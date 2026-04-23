@@ -1,0 +1,19 @@
+{
+  "id": "feishu-branch-link",
+  "name": "关联飞书工作项分支",
+  "description": "通过飞书项目 MCP，将当前分支名写入工作项的「开发分支」字段，打通代码与需求的关联",
+  "inputs": [
+    {
+      "key": "branch_name",
+      "label": "分支名",
+      "required": true
+    },
+    {
+      "key": "task_url",
+      "label": "飞书工作项链接",
+      "required": true
+    }
+  ],
+  "mcp_dependencies": ["lark-project"],
+  "tags": ["feishu", "git", "integration"]
+}

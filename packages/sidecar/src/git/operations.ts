@@ -79,6 +79,10 @@ export async function stashIfDirty(cwd: string, message: string): Promise<boolea
 
 export async function resetHard(cwd: string, commitSha: string): Promise<void> {
   await git(cwd, ['reset', '--hard', commitSha])
+}
+
+export async function resetHardClean(cwd: string, commitSha: string): Promise<void> {
+  await git(cwd, ['reset', '--hard', commitSha])
   await git(cwd, ['clean', '-fd'])
 }
 

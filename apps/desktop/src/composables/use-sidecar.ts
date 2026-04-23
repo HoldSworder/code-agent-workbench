@@ -274,6 +274,47 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'skill.enable':
     case 'skill.disable':
       return { ok: true } as T
+    case 'workflowSkill.list':
+      return {
+        root: '/mock/skills',
+        skills: [
+          {
+            id: 'feishu-branch-link',
+            name: '关联飞书工作项分支',
+            description: '通过飞书项目 MCP 将分支名写入工作项',
+            inputs: [
+              { key: 'branch_name', label: '分支名', required: true },
+              { key: 'task_url', label: '飞书工作项链接', required: true },
+            ],
+            mcp_dependencies: ['lark-project'],
+            tags: ['feishu', 'git'],
+            dir: '/mock/skills/feishu-branch-link',
+          },
+        ],
+      } as T
+    case 'workflowSkill.get':
+      return {
+        found: params.id === 'feishu-branch-link',
+        meta: {
+          id: 'feishu-branch-link',
+          name: '关联飞书工作项分支',
+          description: '通过飞书项目 MCP 将分支名写入工作项',
+          inputs: [
+            { key: 'branch_name', label: '分支名', required: true },
+            { key: 'task_url', label: '飞书工作项链接', required: true },
+          ],
+          mcp_dependencies: ['lark-project'],
+        },
+        content: '# Mock Skill 内容\n\n分支：{{branch_name}}\n链接：{{task_url}}',
+        dir: '/mock/skills/feishu-branch-link',
+      } as T
+    case 'workflowSkill.create':
+    case 'workflowSkill.update':
+      return { meta: { id: params.id, name: params.name, description: params.description ?? '' }, content: params.content ?? '', dir: `/mock/skills/${params.id}` } as T
+    case 'workflowSkill.delete':
+      return { ok: true } as T
+    case 'workflowSkill.preview':
+      return { found: true, content: '预览内容（mock）', missingVars: [], meta: { id: params.id, name: 'mock', description: '' } } as T
     case 'skillStore.list': {
       const isSkillsSh = (params.apiBase as string)?.includes('skills.sh')
       return {

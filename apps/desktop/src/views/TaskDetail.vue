@@ -2,6 +2,9 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch, type ComponentPublicInstance } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { rpc } from '../composables/use-sidecar'
+import UIRenderer from '../components/UIRenderer.vue'
+import type { UIElement } from '../components/UIRenderer.vue'
+import TranscriptBlocks from '../components/TranscriptBlocks.vue'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -42,6 +45,7 @@ const task = ref<RepoTask | null>(null)
 const messages = ref<ChatMessage[]>([])
 const chatInput = ref('')
 const chatInputEl = ref<HTMLTextAreaElement>()
+const planMode = ref(false)
 const liveOutput = ref('')
 const liveActivity = ref('')
 const processExpanded = ref(false)
@@ -428,6 +432,24 @@ function findRunForPrompt(msg: ChatMessage): AgentRun | undefined {
   return promptRunMap.value.get(msg.id)
 }
 
+const assistantRunMap = computed<Map<string, AgentRun>>(() => {
+  const map = new Map<string, AgentRun>()
+  const allMsgs = messages.value
+  for (let i = 0; i < allMsgs.length; i++) {
+    const msg = allMsgs[i]
+    if (msg.role !== 'assistant') continue
+    for (let j = i - 1; j >= 0; j--) {
+      if (allMsgs[j].role === 'prompt') {
+        const run = promptRunMap.value.get(allMsgs[j].id)
+        if (run) map.set(msg.id, run)
+        break
+      }
+      if (allMsgs[j].role === 'assistant') break
+    }
+  }
+  return map
+})
+
 function normalizeTime(iso: string) {
   return iso.includes('T') || iso.includes('Z') ? iso : `${iso.replace(' ', 'T')}Z`
 }
@@ -497,6 +519,45 @@ function startPolling() {
   pollTimer = setInterval(pollLiveOutput, 400)
 }
 
+// ── UI 元素 ──
+const pendingUIElements = ref<UIElement[]>([])
+const respondedUIElements = ref<UIElement[]>([])
+let uiPollTimer: ReturnType<typeof setInterval> | null = null
+
+async function fetchUIElements() {
+  try {
+    const all = await rpc<UIElement[]>('ui.getAll', { taskId })
+    if (!all) return
+    pendingUIElements.value = all.filter(e => e.response == null)
+    respondedUIElements.value = all.filter(e => e.response != null)
+  }
+  catch { /* ignore */ }
+}
+
+function startUIPoll() {
+  if (uiPollTimer) return
+  fetchUIElements()
+  uiPollTimer = setInterval(fetchUIElements, 1500)
+}
+
+function stopUIPoll() {
+  if (uiPollTimer) {
+    clearInterval(uiPollTimer)
+    uiPollTimer = null
+  }
+}
+
+async function handleUISubmit(elementId: string, data: unknown) {
+  try {
+    await rpc('ui.submitResponse', { taskId, elementId, data })
+    await fetchUIElements()
+    await refreshMessages()
+  }
+  catch (err) {
+    console.error('UI submit failed:', err)
+  }
+}
+
 function stopPolling() {
   if (pollTimer) {
     clearInterval(pollTimer)
@@ -529,6 +590,13 @@ watch(activeTab, (tab) => {
   if (tab === 'files') loadChangedFiles()
   if (tab === 'sessions') loadAgentRuns()
 })
+
+watch(assistantRunMap, (map) => {
+  for (const [msgId, run] of map) {
+    if (run.session_id && !inlineTranscripts.value.has(msgId) && !inlineTranscriptLoading.value.has(msgId))
+      loadInlineTranscript(msgId)
+  }
+}, { immediate: true })
 
 async function refreshMessages() {
   if (!task.value) return
@@ -576,10 +644,11 @@ onMounted(async () => {
   if (!isPending.value) {
     await Promise.all([refreshMessages(), loadAgentRuns(), loadInjectedTools()])
     if (isRunning.value) startPolling()
+    startUIPoll()
   }
 })
 
-onUnmounted(() => stopPolling())
+onUnmounted(() => { stopPolling(); stopUIPoll() })
 
 async function loadChangedFiles() {
   if (!task.value) return
@@ -626,6 +695,41 @@ async function selectAgentRun(run: AgentRun) {
   finally { loadingTranscript.value = false }
 }
 
+const inlineTranscripts = ref<Map<string, TranscriptTurn[]>>(new Map())
+const inlineTranscriptLoading = ref<Set<string>>(new Set())
+
+function getInlineBlocks(msgId: string): AssistantBlock[] | null {
+  const turns = inlineTranscripts.value.get(msgId)
+  if (!turns?.length) return null
+  return turns.flatMap(t => t.blocks)
+}
+
+async function loadInlineTranscript(msgId: string) {
+  if (inlineTranscripts.value.has(msgId)) return
+  const run = assistantRunMap.value.get(msgId)
+  if (!run?.session_id) return
+
+  const loading = new Set(inlineTranscriptLoading.value)
+  loading.add(msgId)
+  inlineTranscriptLoading.value = loading
+
+  try {
+    const res = await rpc<{ turns: TranscriptTurn[], format: string, filePath: string | null }>(
+      'task.sessionTranscript',
+      { sessionId: run.session_id },
+    )
+    const updated = new Map(inlineTranscripts.value)
+    updated.set(msgId, res?.turns ?? [])
+    inlineTranscripts.value = updated
+  }
+  catch { /* keep empty */ }
+  finally {
+    const done = new Set(inlineTranscriptLoading.value)
+    done.delete(msgId)
+    inlineTranscriptLoading.value = done
+  }
+}
+
 function toggleBlock(id: string) {
   const s = new Set(expandedBlocks.value)
   if (s.has(id)) s.delete(id)
@@ -638,22 +742,6 @@ function truncateText(text: string, maxLen = 200): string {
   return `${text.slice(0, maxLen)}...`
 }
 
-function formatToolInput(input: Record<string, any>): string {
-  try { return JSON.stringify(input, null, 2) }
-  catch { return String(input) }
-}
-
-function toolSummary(tc: ToolCall): string {
-  const inp = tc.input
-  if (inp.description) return truncateText(inp.description, 60)
-  if (inp.command) return truncateText(inp.command, 60)
-  if (inp.path) return inp.path.split('/').pop() ?? inp.path
-  if (inp.query) return truncateText(inp.query, 60)
-  if (inp.pattern) return truncateText(inp.pattern, 60)
-  if (inp.glob_pattern) return truncateText(inp.glob_pattern, 60)
-  if (inp.search_term) return truncateText(inp.search_term, 60)
-  return ''
-}
 
 async function selectChangedFile(filePath: string) {
   if (selectedFilePath.value === filePath) return
@@ -693,13 +781,15 @@ async function sendMessage() {
   if (!chatInput.value.trim() || !task.value) return
 
   const content = chatInput.value.trim()
+  const isPlan = planMode.value
   chatInput.value = ''
+  planMode.value = false
 
   messages.value.push({
     id: `local-${Date.now()}`,
     phase_id: task.value.current_phase,
     role: 'user',
-    content,
+    content: isPlan ? `[Plan] ${content}` : content,
     created_at: new Date().toISOString(),
   })
   scrollToBottom()
@@ -707,9 +797,9 @@ async function sendMessage() {
   await rpc('workflow.feedback', {
     repoTaskId: task.value.id,
     feedback: content,
+    planMode: isPlan || undefined,
   })
 
-  // 引擎是 fire-and-forget，给一点时间让状态更新到 running
   await new Promise(r => setTimeout(r, 300))
   const t = await rpc<RepoTask>('task.get', { id: taskId })
   if (t) task.value = t
@@ -1412,34 +1502,61 @@ async function handleCancel() {
                   </div>
                 </div>
 
-                <!-- User / Assistant bubbles -->
+                <!-- User bubble -->
                 <div
-                  v-else
-                  class="flex group/msg"
-                  :class="msg.role === 'user' ? 'justify-end' : 'justify-start'"
+                  v-else-if="msg.role === 'user'"
+                  class="flex group/msg justify-end"
                 >
                   <div class="flex flex-col max-w-[85%] min-w-0">
-                    <div
-                      class="rounded-2xl px-4 py-3 text-[13px] leading-relaxed overflow-hidden"
-                      :class="msg.role === 'user'
-                        ? 'bg-indigo-600 text-white rounded-br-md'
-                        : 'bg-white dark:bg-[#28282c] text-gray-700 dark:text-gray-200 rounded-bl-md shadow-sm shadow-black/[0.04] dark:shadow-none'"
-                    >
-                      <div
-                        v-if="msg.role === 'assistant'"
-                        class="prose-chat"
-                        v-html="md.render(msg.content)"
-                      />
-                      <p v-else class="whitespace-pre-wrap">{{ msg.content }}</p>
-                      <div
-                        class="text-[11px] mt-1.5 text-right tabular-nums"
-                        :class="msg.role === 'user' ? 'text-indigo-300' : 'text-gray-300 dark:text-gray-600'"
-                      >
+                    <div class="rounded-2xl rounded-br-md px-4 py-3 text-[13px] leading-relaxed overflow-hidden bg-indigo-600 text-white">
+                      <p class="whitespace-pre-wrap">{{ msg.content }}</p>
+                      <div class="text-[11px] mt-1.5 text-right tabular-nums text-indigo-300">
                         {{ formatTime(msg.created_at) }}
                       </div>
                     </div>
                     <button
-                      v-if="!isRunning && !isPending && msg.role !== 'prompt'"
+                      v-if="!isRunning && !isPending"
+                      class="self-end mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/msg:opacity-100 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-all"
+                      @click="handleRollbackToMessage(msg.id)"
+                    >
+                      <div class="i-carbon-undo w-3 h-3" />
+                      回滚到此处
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Assistant bubble with full transcript -->
+                <div
+                  v-else-if="msg.role === 'assistant'"
+                  class="flex group/msg justify-start"
+                >
+                  <div class="flex flex-col max-w-[85%] min-w-0">
+                    <!-- Structured transcript blocks -->
+                    <div v-if="getInlineBlocks(msg.id)" class="space-y-2">
+                      <TranscriptBlocks
+                        :blocks="getInlineBlocks(msg.id)!"
+                        :block-key-prefix="`chat-${msg.id}`"
+                        v-model:expanded-blocks="expandedBlocks"
+                      />
+                      <div class="text-[11px] mt-1 text-right tabular-nums text-gray-300 dark:text-gray-600">
+                        {{ formatTime(msg.created_at) }}
+                      </div>
+                    </div>
+
+                    <!-- Fallback: plain text (loading or no transcript) -->
+                    <div v-else class="rounded-2xl rounded-bl-md px-4 py-3 text-[13px] leading-relaxed overflow-hidden bg-white dark:bg-[#28282c] text-gray-700 dark:text-gray-200 shadow-sm shadow-black/[0.04] dark:shadow-none">
+                      <div v-if="inlineTranscriptLoading.has(msg.id)" class="flex items-center gap-1.5 text-[12px] text-gray-400 mb-2">
+                        <div class="i-carbon-circle-dash w-3 h-3 animate-spin" />
+                        加载完整记录...
+                      </div>
+                      <div class="prose-chat" v-html="md.render(msg.content)" />
+                      <div class="text-[11px] mt-1.5 text-right tabular-nums text-gray-300 dark:text-gray-600">
+                        {{ formatTime(msg.created_at) }}
+                      </div>
+                    </div>
+
+                    <button
+                      v-if="!isRunning && !isPending"
                       class="self-end mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/msg:opacity-100 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-all"
                       @click="handleRollbackToMessage(msg.id)"
                     >
@@ -1512,6 +1629,20 @@ async function handleCancel() {
                   </div>
                 </div>
               </template>
+
+              <!-- Dynamic UI elements emitted by agent -->
+              <UIRenderer
+                v-for="el in (task?.current_phase === group.phaseId ? pendingUIElements : [])"
+                :key="el.id"
+                :element="el"
+                @submit="handleUISubmit"
+              />
+              <UIRenderer
+                v-for="el in respondedUIElements.filter(e => e.phaseId === group.phaseId || (!e.phaseId && task?.current_phase === group.phaseId))"
+                :key="`done-${el.id}`"
+                :element="el"
+                readonly
+              />
 
               <!-- Inline hint for waiting_input + pendingInput (Agent awaiting user reply, no action buttons) -->
               <div
@@ -1815,12 +1946,25 @@ async function handleCancel() {
         <!-- Input bar -->
         <div class="border-t border-gray-200 dark:border-white/5 p-4 bg-white/60 dark:bg-[#1e1e22]/60 backdrop-blur-sm">
           <div class="max-w-5xl mx-auto flex items-end gap-2">
+            <button
+              class="px-2.5 py-2.5 rounded-xl text-[12px] font-medium transition-all duration-150 border shrink-0"
+              :class="planMode
+                ? 'bg-blue-50 dark:bg-blue-500/10 border-blue-300 dark:border-blue-500/30 text-blue-600 dark:text-blue-400'
+                : 'bg-transparent border-gray-200 dark:border-white/10 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 hover:border-gray-300 dark:hover:border-white/20'"
+              title="Plan 模式：Agent 仅分析输出方案，不修改文件"
+              @click="planMode = !planMode"
+            >
+              <div class="i-carbon-flow w-4 h-4" />
+            </button>
             <textarea
               ref="chatInputEl"
               v-model="chatInput"
               rows="1"
-              placeholder="输入反馈或指令..."
-              class="flex-1 px-4 py-2.5 rounded-xl bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors resize-none leading-relaxed max-h-[160px]"
+              :placeholder="planMode ? 'Plan 模式：Agent 仅分析输出方案，不修改文件...' : '输入反馈或指令...'"
+              class="flex-1 px-4 py-2.5 rounded-xl text-[13px] border transition-colors resize-none leading-relaxed max-h-[160px]"
+              :class="planMode
+                ? 'bg-blue-50/50 dark:bg-blue-500/[0.04] border-blue-200 dark:border-blue-500/15 placeholder-blue-300 dark:placeholder-blue-500/40 focus:border-blue-400 focus:ring-1 focus:ring-blue-400/20'
+                : 'bg-gray-50 dark:bg-white/5 border-gray-200 dark:border-white/10 placeholder-gray-300 dark:placeholder-gray-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20'"
               style="field-sizing: content"
               @compositionstart="onCompositionStart"
               @compositionend="onCompositionEnd"
@@ -1836,10 +1980,13 @@ async function handleCancel() {
             </button>
             <button
               v-else
-              class="px-4 py-2.5 rounded-xl bg-indigo-600 text-white text-[13px] font-medium hover:bg-indigo-500 shadow-sm shadow-indigo-600/20 transition-all duration-150 active:scale-[0.97]"
+              class="px-4 py-2.5 rounded-xl text-white text-[13px] font-medium shadow-sm transition-all duration-150 active:scale-[0.97]"
+              :class="planMode
+                ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-600/20'
+                : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/20'"
               @click="sendMessage"
             >
-              <div class="i-carbon-send w-4 h-4" />
+              <div class="w-4 h-4" :class="planMode ? 'i-carbon-flow' : 'i-carbon-send'" />
             </button>
           </div>
         </div>
@@ -1981,83 +2128,11 @@ async function handleCancel() {
 
                 <!-- Assistant blocks -->
                 <div class="space-y-2 pl-3 border-l-2 border-emerald-200 dark:border-emerald-500/20">
-                  <template v-for="(block, bIdx) in turn.blocks" :key="bIdx">
-                    <!-- Text block -->
-                    <div v-if="block.kind === 'text'" class="rounded-xl px-4 py-3 bg-white dark:bg-[#28282c] border border-gray-100 dark:border-white/[0.04] shadow-sm shadow-black/[0.02] dark:shadow-none">
-                      <div class="prose-chat text-[13px] leading-relaxed text-gray-700 dark:text-gray-200" v-html="md.render(block.text)" />
-                    </div>
-
-                    <!-- Thinking block -->
-                    <div v-else-if="block.kind === 'thinking'" class="rounded-lg overflow-hidden border border-purple-200/50 dark:border-purple-500/10">
-                      <button
-                        class="w-full flex items-center gap-2 px-3 py-2 text-left bg-purple-50/50 dark:bg-purple-500/[0.03] hover:bg-purple-50 dark:hover:bg-purple-500/5 transition-colors"
-                        @click="toggleBlock(`think-${turn.index}-${bIdx}`)"
-                      >
-                        <div
-                          class="i-carbon-chevron-right w-3 h-3 text-gray-400 transition-transform duration-150"
-                          :class="expandedBlocks.has(`think-${turn.index}-${bIdx}`) && 'rotate-90'"
-                        />
-                        <div class="i-carbon-idea w-3.5 h-3.5 text-purple-500" />
-                        <span class="text-[12px] font-medium text-purple-600 dark:text-purple-400">Thinking</span>
-                        <span class="text-[11px] text-gray-400 dark:text-gray-500 truncate flex-1">
-                          {{ truncateText(block.text, 80) }}
-                        </span>
-                      </button>
-                      <div v-if="expandedBlocks.has(`think-${turn.index}-${bIdx}`)" class="px-4 py-3 bg-purple-50/30 dark:bg-purple-500/[0.02]">
-                        <div class="prose-chat text-[12px] leading-relaxed text-gray-600 dark:text-gray-400" v-html="md.render(block.text)" />
-                      </div>
-                    </div>
-
-                    <!-- Tool use block -->
-                    <div
-                      v-else-if="block.kind === 'tool_use' && block.tool_call"
-                      class="rounded-lg overflow-hidden border"
-                      :class="block.tool_call.is_error
-                        ? 'border-red-200 dark:border-red-500/15'
-                        : 'border-gray-200 dark:border-white/[0.06]'"
-                    >
-                      <!-- Tool header -->
-                      <button
-                        class="w-full flex items-center gap-2 px-3 py-2 text-left transition-colors"
-                        :class="block.tool_call.is_error
-                          ? 'bg-red-50/50 dark:bg-red-500/[0.03] hover:bg-red-50 dark:hover:bg-red-500/5'
-                          : 'bg-gray-50 dark:bg-[#1a1a1e] hover:bg-gray-100 dark:hover:bg-white/5'"
-                        @click="toggleBlock(`tool-${turn.index}-${bIdx}`)"
-                      >
-                        <div
-                          class="i-carbon-chevron-right w-3 h-3 text-gray-400 transition-transform duration-150"
-                          :class="expandedBlocks.has(`tool-${turn.index}-${bIdx}`) && 'rotate-90'"
-                        />
-                        <div class="w-3.5 h-3.5" :class="block.tool_call.is_error ? 'i-carbon-warning-alt text-red-500' : 'i-carbon-terminal text-blue-500'" />
-                        <span
-                          class="text-[12px] font-medium"
-                          :class="block.tool_call.is_error ? 'text-red-600 dark:text-red-400' : 'text-blue-600 dark:text-blue-400'"
-                        >{{ block.tool_call.name }}</span>
-                        <span class="text-[11px] text-gray-400 dark:text-gray-500 truncate flex-1 font-mono">
-                          {{ toolSummary(block.tool_call) }}
-                        </span>
-                        <span v-if="block.tool_call.result !== null" class="shrink-0">
-                          <div v-if="block.tool_call.is_error" class="i-carbon-close-filled w-3 h-3 text-red-400" />
-                          <div v-else class="i-carbon-checkmark-filled w-3 h-3 text-emerald-400" />
-                        </span>
-                      </button>
-                      <!-- Expanded: input + result -->
-                      <div v-if="expandedBlocks.has(`tool-${turn.index}-${bIdx}`)" class="border-t border-gray-100 dark:border-white/[0.04]">
-                        <!-- Input -->
-                        <div class="px-3 py-2 bg-[#fafafa] dark:bg-[#161618]">
-                          <div class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-1">Input</div>
-                          <pre class="text-[11px] font-mono text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-all leading-relaxed max-h-60 overflow-y-auto">{{ formatToolInput(block.tool_call.input) }}</pre>
-                        </div>
-                        <!-- Result -->
-                        <div v-if="block.tool_call.result !== null" class="px-3 py-2 border-t border-gray-100 dark:border-white/[0.04]" :class="block.tool_call.is_error ? 'bg-red-50/30 dark:bg-red-500/[0.02]' : 'bg-emerald-50/30 dark:bg-emerald-500/[0.02]'">
-                          <div class="text-[10px] font-bold uppercase tracking-wider mb-1" :class="block.tool_call.is_error ? 'text-red-400' : 'text-emerald-500'">
-                            {{ block.tool_call.is_error ? 'Error' : 'Result' }}
-                          </div>
-                          <pre class="text-[11px] font-mono whitespace-pre-wrap break-all leading-relaxed max-h-60 overflow-y-auto" :class="block.tool_call.is_error ? 'text-red-600 dark:text-red-400' : 'text-gray-600 dark:text-gray-400'">{{ block.tool_call.result }}</pre>
-                        </div>
-                      </div>
-                    </div>
-                  </template>
+                  <TranscriptBlocks
+                    :blocks="turn.blocks"
+                    :block-key-prefix="`session-${turn.index}`"
+                    v-model:expanded-blocks="expandedBlocks"
+                  />
                 </div>
               </div>
             </div>

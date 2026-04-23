@@ -12,6 +12,7 @@ const router = createRouter({
     { path: '/repo/:repoId/task/:taskId', component: () => import('./views/TaskDetail.vue') },
     { path: '/workflow', component: () => import('./views/WorkflowEditor.vue') },
     { path: '/skills', component: () => import('./views/SkillsView.vue') },
+    { path: '/workflow-skills', component: () => import('./views/WorkflowSkillsView.vue') },
     { path: '/tools', component: () => import('./views/ToolsView.vue') },
     { path: '/mcp', component: () => import('./views/McpView.vue') },
     { path: '/orchestrator', component: () => import('./views/orchestrator/OrchestratorView.vue') },

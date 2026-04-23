@@ -98,11 +98,12 @@ export class AgentRunRepository {
   findLastSessionId(repoTaskId: string, phaseId: string): string | null {
     const row = this.db
       .prepare(
-        `SELECT session_id FROM agent_runs
-         WHERE repo_task_id = ? AND phase_id = ? AND session_id IS NOT NULL AND status = 'success'
+        `SELECT session_id, status FROM agent_runs
+         WHERE repo_task_id = ? AND phase_id = ? AND session_id IS NOT NULL
          ORDER BY started_at DESC LIMIT 1`,
       )
-      .get(repoTaskId, phaseId) as { session_id: string } | undefined
-    return row?.session_id ?? null
+      .get(repoTaskId, phaseId) as { session_id: string, status: string } | undefined
+    if (!row || row.status !== 'success') return null
+    return row.session_id
   }
 }
