@@ -2,6 +2,7 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
+import { initOAuthDeepLinkBridge } from './composables/use-oauth-deep-link'
 import 'virtual:uno.css'
 
 const router = createRouter({
@@ -24,4 +25,5 @@ const router = createRouter({
 const app = createApp(App)
 app.use(createPinia())
 app.use(router)
+void initOAuthDeepLinkBridge()
 app.mount('#app')

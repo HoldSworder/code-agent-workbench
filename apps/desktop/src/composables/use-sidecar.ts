@@ -236,7 +236,41 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
       ] } as T
     case 'mcp.list':
       return [
-        { id: 'mock-2', name: 'feishu-project', description: '飞书项目管理 MCP（体积大）', transport: 'stdio', command: 'npx', args: '["@anthropic/feishu-mcp"]', env: '{}', url: null, headers: '{}', enabled: 1, created_at: '2026-04-01', updated_at: '2026-04-01' },
+        {
+          id: 'mock-2',
+          name: 'feishu-project',
+          description: '飞书项目管理 MCP（体积大）',
+          transport: 'http',
+          command: null,
+          args: '[]',
+          env: '{}',
+          url: 'https://mcp.example.com/team/mcp',
+          headers: '{}',
+          enabled: 1,
+          auth_type: null,
+          oauth_client_id: 'dcr-client-id',
+          oauth_scope: null,
+          oauth_audience: null,
+          oauth_token_endpoint_auth_method: null,
+          oauth_access_token: null,
+          oauth_refresh_token: null,
+          oauth_token_type: null,
+          oauth_expires_at: null,
+          oauth_id_token: null,
+          oauth_metadata_json: '{"authorizationServer":{"issuer":"https://auth.example.com","registration_endpoint":"https://auth.example.com/register"}}',
+          oauth_registration_json: '{"client_id":"dcr-client-id","redirect_uris":["code-agent://oauth/callback","http://127.0.0.1:43199/oauth/callback"]}',
+          oauth_auth_state: 'required',
+          oauth_redirect_mode: 'deeplink',
+          oauth_last_error: null,
+          oauth_connected_at: null,
+          last_test_status: 'error',
+          last_test_error: 'OAuth login required',
+          last_tested_at: '2026-04-23T10:00:00.000Z',
+          capabilities_json: null,
+          capabilities_summary: null,
+          created_at: '2026-04-01',
+          updated_at: '2026-04-01',
+        },
       ] as T
     case 'mcp.getAllBindings':
       return [
@@ -247,6 +281,23 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'mcp.toggle':
       return { id: `mock-${Date.now()}`, ...params } as T
     case 'mcp.test':
+      return { ok: true } as T
+    case 'mcp.oauthStart':
+      return {
+        requestId: `oauth-${Date.now()}`,
+        authUrl: 'https://auth.example.com/authorize?client_id=dcr-client-id',
+        redirectUri: 'code-agent://oauth/callback',
+        redirectMode: 'deeplink',
+        deepLinkRedirectUri: 'code-agent://oauth/callback',
+        loopbackRedirectUri: 'http://127.0.0.1:43199/oauth/callback',
+        callbackPort: 43199,
+        state: 'mock-state',
+      } as T
+    case 'mcp.oauthPoll':
+      return { status: 'success' } as T
+    case 'mcp.oauthComplete':
+      return { ok: true } as T
+    case 'mcp.oauthDisconnect':
       return { ok: true } as T
     case 'mcp.delete':
     case 'mcp.setBindings':

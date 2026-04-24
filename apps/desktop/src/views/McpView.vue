@@ -1,20 +1,175 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { isTauri } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-shell'
 import { rpc } from '../composables/use-sidecar'
 
-interface McpServer {
+type McpTransport = 'stdio' | 'http' | 'sse'
+type McpLastTestStatus = 'success' | 'error' | null
+type McpAuthType = 'oauth' | null
+type McpOAuthAuthState = 'none' | 'required' | 'connected' | 'unsupported' | 'error' | null
+type McpOAuthRedirectMode = 'deeplink' | 'loopback' | null
+type CapabilitySectionKey = 'tools' | 'resources' | 'prompts'
+
+interface McpCapabilityItem {
+  name: string
+  description?: string | null
+  uri?: string | null
+  mimeType?: string | null
+  inputSchema?: unknown
+  arguments?: unknown
+}
+
+interface McpCapabilityGroup {
+  count: number
+  items: McpCapabilityItem[]
+}
+
+interface McpCapabilityDetails {
+  protocolVersion?: string | null
+  serverInfo?: {
+    name?: string
+    version?: string
+  } | null
+  capabilities: Record<CapabilitySectionKey, McpCapabilityGroup>
+}
+
+interface McpCapabilitySummary {
+  tools: string[]
+  resources: string[]
+  prompts: string[]
+}
+
+interface McpOAuthMetadata {
+  resource?: {
+    resource?: string
+    authorization_servers?: string[]
+    scopes_supported?: string[]
+  }
+  authorizationServer?: {
+    issuer?: string
+    authorization_endpoint?: string
+    token_endpoint?: string
+  }
+  protectedResourceMetadataUrl?: string
+  authorizationServerMetadataUrl?: string
+  scopeHint?: string | null
+}
+
+interface McpOAuthRegistration {
+  client_id?: string
+  redirect_uris?: string[]
+}
+
+interface RawMcpServer {
   id: string
   name: string
   description: string
-  transport: 'stdio' | 'http' | 'sse'
+  transport: McpTransport
   command: string | null
   args: string
   env: string
   url: string | null
   headers: string
   enabled: number
+  last_test_status?: McpLastTestStatus
+  last_test_error?: string | null
+  last_tested_at?: string | null
+  capabilities_json?: string | null
+  capabilities_summary?: string | null
+  auth_type?: McpAuthType
+  oauth_client_id?: string | null
+  oauth_scope?: string | null
+  oauth_audience?: string | null
+  oauth_token_endpoint_auth_method?: string | null
+  oauth_access_token?: string | null
+  oauth_refresh_token?: string | null
+  oauth_token_type?: string | null
+  oauth_expires_at?: string | null
+  oauth_id_token?: string | null
+  oauth_metadata_json?: string | null
+  oauth_registration_json?: string | null
+  oauth_auth_state?: McpOAuthAuthState
+  oauth_redirect_mode?: McpOAuthRedirectMode
+  oauth_last_error?: string | null
+  oauth_connected_at?: string | null
   created_at: string
   updated_at: string
+}
+
+interface McpServer extends Omit<RawMcpServer, 'last_test_status' | 'last_test_error' | 'last_tested_at' | 'capabilities_json' | 'capabilities_summary' | 'oauth_metadata_json'> {
+  last_test_status: McpLastTestStatus
+  last_test_error: string | null
+  last_tested_at: string | null
+  capabilities_json: string | null
+  capabilities_summary: string | null
+  capabilityDetails: McpCapabilityDetails | null
+  capabilitySummary: McpCapabilitySummary
+  auth_type: McpAuthType
+  oauth_client_id: string | null
+  oauth_scope: string | null
+  oauth_audience: string | null
+  oauth_token_endpoint_auth_method: string | null
+  oauth_access_token: string | null
+  oauth_refresh_token: string | null
+  oauth_token_type: string | null
+  oauth_expires_at: string | null
+  oauth_id_token: string | null
+  oauth_metadata_json: string | null
+  oauth_registration_json: string | null
+  oauth_auth_state: McpOAuthAuthState
+  oauth_redirect_mode: McpOAuthRedirectMode
+  oauth_last_error: string | null
+  oauth_connected_at: string | null
+  oauthMetadata: McpOAuthMetadata | null
+  oauthRegistration: McpOAuthRegistration | null
+}
+
+interface McpTestResult {
+  ok: boolean
+  error?: string
+  testedAt?: string
+}
+
+interface McpOAuthStartResult {
+  requestId: string
+  authUrl: string
+  redirectUri: string
+  callbackPort: number
+  state: string
+}
+
+interface McpOAuthPollResult {
+  status: 'pending' | 'success' | 'error'
+  error?: string
+}
+
+interface ParsedServer {
+  name: string
+  transport: McpTransport
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+}
+
+const capabilitySectionMeta: Array<{ key: CapabilitySectionKey, label: string }> = [
+  { key: 'tools', label: 'Tools' },
+  { key: 'resources', label: 'Resources' },
+  { key: 'prompts', label: 'Prompts' },
+]
+
+const transportLabel: Record<McpTransport, string> = {
+  stdio: 'Stdio',
+  http: 'HTTP',
+  sse: 'SSE',
+}
+
+const transportColor: Record<McpTransport, string> = {
+  stdio: 'bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400',
+  http: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+  sse: 'bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400',
 }
 
 const servers = ref<McpServer[]>([])
@@ -27,7 +182,7 @@ const saving = ref(false)
 const form = ref({
   name: '',
   description: '',
-  transport: 'stdio' as 'stdio' | 'http' | 'sse',
+  transport: 'stdio' as McpTransport,
   command: '',
   args: '',
   env: '',
@@ -35,27 +190,303 @@ const form = ref({
   headers: '',
 })
 
-// ── Test connectivity ──
-const testingIds = ref<Set<string>>(new Set())
-const testResults = ref<Map<string, { ok: boolean, error?: string }>>(new Map())
+const testingIds = ref(new Set<string>())
+const testResults = ref(new Map<string, McpTestResult>())
+const expandedIds = ref(new Set<string>())
+const authorizingIds = ref(new Set<string>())
+const oauthErrors = ref(new Map<string, string>())
 
-async function testServer(server: McpServer) {
-  testingIds.value.add(server.id)
-  testResults.value.delete(server.id)
-  try {
-    const result = await rpc<{ ok: boolean, error?: string }>('mcp.test', { id: server.id })
-    testResults.value.set(server.id, result)
-  } catch (err: any) {
-    testResults.value.set(server.id, { ok: false, error: err?.message || 'RPC failed' })
-  } finally {
-    testingIds.value.delete(server.id)
-  }
-}
-
-// ── JSON import ──
 const showJsonImport = ref(false)
 const jsonInput = ref('')
 const jsonError = ref('')
+
+function parseJsonSafely<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback
+  try {
+    return JSON.parse(value) as T
+  } catch {
+    return fallback
+  }
+}
+
+function normalizeCapabilityGroup(raw: any): McpCapabilityGroup {
+  const items = Array.isArray(raw?.items) ? raw.items : []
+  return {
+    count: typeof raw?.count === 'number' ? raw.count : items.length,
+    items: items.map((item: any) => ({
+      name: typeof item?.name === 'string' ? item.name : '',
+      description: typeof item?.description === 'string' ? item.description : null,
+      uri: typeof item?.uri === 'string' ? item.uri : null,
+      mimeType: typeof item?.mimeType === 'string' ? item.mimeType : null,
+      inputSchema: item?.inputSchema,
+      arguments: item?.arguments,
+    })),
+  }
+}
+
+function normalizeCapabilityDetails(raw: any): McpCapabilityDetails | null {
+  if (!raw || typeof raw !== 'object') return null
+  return {
+    protocolVersion: typeof raw.protocolVersion === 'string' ? raw.protocolVersion : null,
+    serverInfo: raw.serverInfo && typeof raw.serverInfo === 'object'
+      ? {
+          name: typeof raw.serverInfo.name === 'string' ? raw.serverInfo.name : undefined,
+          version: typeof raw.serverInfo.version === 'string' ? raw.serverInfo.version : undefined,
+        }
+      : null,
+    capabilities: {
+      tools: normalizeCapabilityGroup(raw.capabilities?.tools),
+      resources: normalizeCapabilityGroup(raw.capabilities?.resources),
+      prompts: normalizeCapabilityGroup(raw.capabilities?.prompts),
+    },
+  }
+}
+
+function buildSummaryFromDetails(details: McpCapabilityDetails | null): McpCapabilitySummary {
+  if (!details) return { tools: [], resources: [], prompts: [] }
+  return {
+    tools: details.capabilities.tools.items.slice(0, 3).map(item => item.name).filter(Boolean),
+    resources: details.capabilities.resources.items.slice(0, 3).map(item => item.name || item.uri || '').filter(Boolean),
+    prompts: details.capabilities.prompts.items.slice(0, 3).map(item => item.name).filter(Boolean),
+  }
+}
+
+function normalizeCapabilitySummary(raw: any, details: McpCapabilityDetails | null): McpCapabilitySummary {
+  if (!raw || typeof raw !== 'object') return buildSummaryFromDetails(details)
+  return {
+    tools: Array.isArray(raw.tools) ? raw.tools.filter((item: unknown): item is string => typeof item === 'string') : [],
+    resources: Array.isArray(raw.resources) ? raw.resources.filter((item: unknown): item is string => typeof item === 'string') : [],
+    prompts: Array.isArray(raw.prompts) ? raw.prompts.filter((item: unknown): item is string => typeof item === 'string') : [],
+  }
+}
+
+function normalizeServer(raw: RawMcpServer): McpServer {
+  const capabilityDetails = normalizeCapabilityDetails(parseJsonSafely(raw.capabilities_json, null))
+  const capabilitySummary = normalizeCapabilitySummary(parseJsonSafely(raw.capabilities_summary, null), capabilityDetails)
+  const oauthMetadata = parseJsonSafely<McpOAuthMetadata | null>(raw.oauth_metadata_json, null)
+  const oauthRegistration = parseJsonSafely<McpOAuthRegistration | null>(raw.oauth_registration_json, null)
+
+  return {
+    ...raw,
+    last_test_status: raw.last_test_status ?? null,
+    last_test_error: raw.last_test_error ?? null,
+    last_tested_at: raw.last_tested_at ?? null,
+    capabilities_json: raw.capabilities_json ?? null,
+    capabilities_summary: raw.capabilities_summary ?? null,
+    auth_type: raw.auth_type ?? null,
+    oauth_client_id: raw.oauth_client_id ?? null,
+    oauth_scope: raw.oauth_scope ?? null,
+    oauth_audience: raw.oauth_audience ?? null,
+    oauth_token_endpoint_auth_method: raw.oauth_token_endpoint_auth_method ?? null,
+    oauth_access_token: raw.oauth_access_token ?? null,
+    oauth_refresh_token: raw.oauth_refresh_token ?? null,
+    oauth_token_type: raw.oauth_token_type ?? null,
+    oauth_expires_at: raw.oauth_expires_at ?? null,
+    oauth_id_token: raw.oauth_id_token ?? null,
+    oauth_metadata_json: raw.oauth_metadata_json ?? null,
+    oauth_registration_json: raw.oauth_registration_json ?? null,
+    oauth_auth_state: raw.oauth_auth_state ?? null,
+    oauth_redirect_mode: raw.oauth_redirect_mode ?? null,
+    oauth_last_error: raw.oauth_last_error ?? null,
+    oauth_connected_at: raw.oauth_connected_at ?? null,
+    capabilityDetails,
+    capabilitySummary,
+    oauthMetadata,
+    oauthRegistration,
+  }
+}
+
+function updateTestingState(id: string, active: boolean) {
+  const next = new Set(testingIds.value)
+  if (active) next.add(id)
+  else next.delete(id)
+  testingIds.value = next
+}
+
+function updateTestResult(id: string, result: McpTestResult | null) {
+  const next = new Map(testResults.value)
+  if (result) next.set(id, result)
+  else next.delete(id)
+  testResults.value = next
+}
+
+function toggleExpanded(id: string) {
+  const next = new Set(expandedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedIds.value = next
+}
+
+function isExpanded(id: string): boolean {
+  return expandedIds.value.has(id)
+}
+
+function formatDateTime(value: string | null): string {
+  if (!value) return '未测试'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function hasSummary(server: McpServer): boolean {
+  return capabilitySectionMeta.some(section => server.capabilitySummary[section.key].length > 0)
+}
+
+function getSummaryText(server: McpServer, key: CapabilitySectionKey): string {
+  return server.capabilitySummary[key].join(', ')
+}
+
+function getCapabilityGroup(server: McpServer, key: CapabilitySectionKey): McpCapabilityGroup {
+  return server.capabilityDetails?.capabilities[key] ?? { count: 0, items: [] }
+}
+
+function stringifyStructuredContent(value: unknown, maxLength = 280): string {
+  if (value == null) return ''
+  const text = JSON.stringify(value, null, 2)
+  if (!text) return ''
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text
+}
+
+function getCapabilityExtra(item: McpCapabilityItem): string {
+  if (item.inputSchema) return stringifyStructuredContent(item.inputSchema)
+  if (item.arguments) return stringifyStructuredContent(item.arguments)
+  return ''
+}
+
+function updateAuthorizingState(id: string, active: boolean) {
+  const next = new Set(authorizingIds.value)
+  if (active) next.add(id)
+  else next.delete(id)
+  authorizingIds.value = next
+}
+
+function updateOAuthError(id: string, message: string | null) {
+  const next = new Map(oauthErrors.value)
+  if (message) next.set(id, message)
+  else next.delete(id)
+  oauthErrors.value = next
+}
+
+function isOAuthServer(server: McpServer): boolean {
+  return server.transport !== 'stdio' && (server.oauth_auth_state !== null || server.oauth_metadata_json !== null || server.oauth_client_id !== null)
+}
+
+function isTokenExpired(expiresAt: string | null): boolean {
+  if (!expiresAt) return false
+  const ms = new Date(expiresAt).getTime()
+  if (Number.isNaN(ms)) return false
+  return ms <= Date.now()
+}
+
+function isOAuthConnected(server: McpServer): boolean {
+  return server.oauth_auth_state === 'connected' && Boolean(server.oauth_access_token) && !isTokenExpired(server.oauth_expires_at)
+}
+
+function getOAuthStatusLabel(server: McpServer): string {
+  if (server.transport === 'stdio') return '本地进程'
+  if (authorizingIds.value.has(server.id)) return '授权中'
+  if (server.oauth_auth_state === 'unsupported') return '不支持零配置登录'
+  if (isOAuthConnected(server)) return '已登录'
+  if (server.oauth_auth_state === 'error' || server.oauth_last_error) return '登录失败'
+  if (server.oauth_auth_state === 'required') return '需要登录'
+  if (server.oauth_access_token && isTokenExpired(server.oauth_expires_at)) return '需要重新登录'
+  return '无需登录'
+}
+
+function getOAuthStatusClass(server: McpServer): string {
+  if (server.transport === 'stdio' || server.oauth_auth_state === 'none' || server.oauth_auth_state === null)
+    return 'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400'
+  if (authorizingIds.value.has(server.id))
+    return 'bg-indigo-50 text-indigo-500 dark:bg-indigo-500/10 dark:text-indigo-400'
+  if (server.oauth_auth_state === 'unsupported')
+    return 'bg-red-50 text-red-500 dark:bg-red-500/10 dark:text-red-400'
+  if (isOAuthConnected(server))
+    return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400'
+  return 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400'
+}
+
+function getOAuthActionLabel(server: McpServer): string {
+  if (authorizingIds.value.has(server.id)) return '授权中…'
+  return isOAuthConnected(server) ? '重新登录' : '登录'
+}
+
+function getOAuthIssuer(server: McpServer): string | null {
+  return server.oauthMetadata?.authorizationServer?.issuer ?? null
+}
+
+async function openExternalUrl(url: string) {
+  if (isTauri()) await open(url)
+  else window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function startOAuthLogin(server: McpServer) {
+  if (!isOAuthServer(server) || authorizingIds.value.has(server.id) || server.oauth_auth_state === 'unsupported') return
+
+  updateAuthorizingState(server.id, true)
+  updateOAuthError(server.id, null)
+  try {
+    const started = await rpc<McpOAuthStartResult>('mcp.oauthStart', { id: server.id })
+    await openExternalUrl(started.authUrl)
+
+    let finished = false
+    for (let attempt = 0; attempt < 120; attempt++) {
+      await sleep(1000)
+      const polled = await rpc<McpOAuthPollResult>('mcp.oauthPoll', { id: server.id, requestId: started.requestId })
+      if (polled.status === 'pending') continue
+
+      finished = true
+      await loadData()
+      if (polled.status === 'success') {
+        const updated = servers.value.find(item => item.id === server.id)
+        if (updated) await testServer(updated)
+      }
+      break
+    }
+
+    if (!finished) {
+      updateOAuthError(server.id, 'OAuth 登录超时，请重试')
+    }
+  } catch (err) {
+    updateOAuthError(server.id, (err as Error)?.message || 'OAuth 登录失败')
+    await loadData()
+  } finally {
+    updateAuthorizingState(server.id, false)
+  }
+}
+
+async function disconnectOAuth(server: McpServer) {
+  if (!isOAuthServer(server)) return
+  try {
+    updateOAuthError(server.id, null)
+    await rpc('mcp.oauthDisconnect', { id: server.id })
+    await loadData()
+  } catch (err) {
+    updateOAuthError(server.id, (err as Error)?.message || '断开 OAuth 授权失败')
+  }
+}
+
+async function testServer(server: McpServer) {
+  updateTestingState(server.id, true)
+  updateTestResult(server.id, null)
+  try {
+    const result = await rpc<McpTestResult>('mcp.test', { id: server.id })
+    updateTestResult(server.id, result)
+    await loadData()
+  } catch (err: any) {
+    updateTestResult(server.id, { ok: false, error: err?.message || 'RPC failed' })
+  } finally {
+    updateTestingState(server.id, false)
+  }
+}
 
 function openJsonImport() {
   jsonInput.value = ''
@@ -73,35 +504,25 @@ const parsedJsonServers = computed(() => {
   }
 })
 
-interface ParsedServer {
-  name: string
-  transport: 'stdio' | 'http' | 'sse'
-  command?: string
-  args?: string[]
-  env?: Record<string, string>
-  url?: string
-  headers?: Record<string, string>
-}
-
 function extractServersFromJson(raw: any): ParsedServer[] {
-  const servers: ParsedServer[] = []
+  const parsedServers: ParsedServer[] = []
 
   const entries = raw.mcpServers ?? raw.servers ?? raw
   if (typeof entries !== 'object' || entries === null) return []
 
   if (Array.isArray(entries)) {
     for (const item of entries) {
-      if (item.name) servers.push(normalizeServerEntry(item.name, item))
+      if (item.name) parsedServers.push(normalizeServerEntry(item.name, item))
     }
-    return servers
+    return parsedServers
   }
 
   for (const [name, cfg] of Object.entries(entries)) {
     if (typeof cfg === 'object' && cfg !== null) {
-      servers.push(normalizeServerEntry(name, cfg as any))
+      parsedServers.push(normalizeServerEntry(name, cfg as any))
     }
   }
-  return servers
+  return parsedServers
 }
 
 function normalizeServerEntry(name: string, cfg: any): ParsedServer {
@@ -145,11 +566,11 @@ async function importJsonServers() {
   }
 }
 
-// ── CRUD ──
 async function loadData() {
   loading.value = true
   try {
-    servers.value = await rpc<McpServer[]>('mcp.list')
+    const result = await rpc<RawMcpServer[]>('mcp.list')
+    servers.value = (result ?? []).map(normalizeServer)
   } catch (err) {
     console.error('Failed to load MCP data:', err)
   } finally {
@@ -161,7 +582,16 @@ onMounted(loadData)
 
 function openCreate() {
   editingServer.value = null
-  form.value = { name: '', description: '', transport: 'stdio', command: '', args: '', env: '', url: '', headers: '' }
+  form.value = {
+    name: '',
+    description: '',
+    transport: 'stdio',
+    command: '',
+    args: '',
+    env: '',
+    url: '',
+    headers: '',
+  }
   showEditor.value = true
 }
 
@@ -197,7 +627,12 @@ async function saveServer() {
       payload.command = form.value.command || undefined
       payload.args = form.value.args ? JSON.parse(form.value.args) : []
       payload.env = form.value.env ? JSON.parse(form.value.env) : {}
+      payload.url = null
+      payload.headers = {}
     } else {
+      payload.command = null
+      payload.args = []
+      payload.env = {}
       payload.url = form.value.url || undefined
       payload.headers = form.value.headers ? JSON.parse(form.value.headers) : {}
     }
@@ -227,23 +662,11 @@ async function deleteServer(id: string) {
 
 async function toggleServer(id: string) {
   try {
-    await rpc<McpServer>('mcp.toggle', { id })
+    await rpc<RawMcpServer>('mcp.toggle', { id })
     await loadData()
   } catch (err) {
     console.error('Failed to toggle MCP server:', err)
   }
-}
-
-const transportLabel: Record<string, string> = {
-  stdio: 'Stdio',
-  http: 'HTTP',
-  sse: 'SSE',
-}
-
-const transportColor: Record<string, string> = {
-  stdio: 'bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400',
-  http: 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
-  sse: 'bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400',
 }
 </script>
 
@@ -301,7 +724,7 @@ const transportColor: Record<string, string> = {
         :key="server.id"
         class="bg-white dark:bg-[#28282c] rounded-xl shadow-sm shadow-black/[0.04] dark:shadow-none px-4 py-3 group transition-all duration-150 hover:shadow-md hover:shadow-black/[0.06]"
       >
-        <div class="flex items-center gap-3">
+        <div class="flex items-start gap-3">
           <button
             class="w-9 h-9 rounded-full flex items-center justify-center transition-all duration-150 shrink-0"
             :class="server.enabled
@@ -325,6 +748,98 @@ const transportColor: Record<string, string> = {
             </p>
             <p v-else-if="server.url" class="text-[10px] text-gray-300 dark:text-gray-600 font-mono mt-0.5 truncate">
               {{ server.url }}
+            </p>
+
+            <div class="mt-2 flex flex-wrap items-center gap-1.5">
+              <span
+                class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                :class="getOAuthStatusClass(server)"
+              >
+                <div
+                  class="w-1.5 h-1.5 rounded-full"
+                  :class="isOAuthConnected(server)
+                    ? 'bg-emerald-500'
+                    : authorizingIds.has(server.id)
+                      ? 'bg-indigo-500'
+                      : 'bg-amber-500'"
+                />
+                {{ getOAuthStatusLabel(server) }}
+              </span>
+              <span
+                v-if="isOAuthServer(server) && server.oauth_expires_at"
+                class="text-[10px] text-gray-400 tabular-nums"
+              >
+                过期 {{ formatDateTime(server.oauth_expires_at) }}
+              </span>
+              <span
+                class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                :class="server.last_test_status === 'success'
+                  ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400'
+                  : server.last_test_status === 'error'
+                    ? 'bg-red-50 text-red-500 dark:bg-red-500/10 dark:text-red-400'
+                    : 'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400'"
+              >
+                <div
+                  class="w-1.5 h-1.5 rounded-full"
+                  :class="server.last_test_status === 'success'
+                    ? 'bg-emerald-500'
+                    : server.last_test_status === 'error'
+                      ? 'bg-red-500'
+                      : 'bg-gray-400'"
+                />
+                {{
+                  server.last_test_status === 'success'
+                    ? '最近探测成功'
+                    : server.last_test_status === 'error'
+                      ? '最近探测失败'
+                      : '尚未探测'
+                }}
+              </span>
+              <span class="text-[10px] text-gray-400 tabular-nums">
+                {{ formatDateTime(server.last_tested_at) }}
+              </span>
+              <span
+                v-for="section in capabilitySectionMeta"
+                :key="section.key"
+                class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400"
+              >
+                <span>{{ section.label }}</span>
+                <span class="tabular-nums">{{ getCapabilityGroup(server, section.key).count }}</span>
+              </span>
+            </div>
+
+            <div
+              v-if="isOAuthServer(server) && server.oauth_auth_state !== 'none'"
+              class="mt-2 flex flex-wrap items-center gap-2"
+            >
+              <button
+                v-if="server.oauth_auth_state !== 'unsupported'"
+                class="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium text-indigo-500 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-500/10 dark:hover:bg-indigo-500/15 transition-colors disabled:opacity-50"
+                :disabled="authorizingIds.has(server.id)"
+                @click="startOAuthLogin(server)"
+              >
+                <div
+                  v-if="authorizingIds.has(server.id)"
+                  class="w-3 h-3 border-2 border-indigo-300 border-t-indigo-500 rounded-full animate-spin"
+                />
+                <div v-else class="i-carbon-login w-3 h-3" />
+                {{ getOAuthActionLabel(server) }}
+              </button>
+              <button
+                v-if="server.oauth_access_token || server.oauth_last_error || isOAuthConnected(server)"
+                class="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium text-gray-500 bg-gray-100 hover:bg-gray-200 dark:bg-white/5 dark:hover:bg-white/10 transition-colors"
+                @click="disconnectOAuth(server)"
+              >
+                <div class="i-carbon-logout w-3 h-3" />
+                断开授权
+              </button>
+            </div>
+
+            <p
+              v-if="oauthErrors.has(server.id)"
+              class="mt-1 text-[11px] text-red-500 dark:text-red-400 leading-relaxed break-all"
+            >
+              {{ oauthErrors.get(server.id) }}
             </p>
 
             <!-- Test result -->
@@ -351,6 +866,175 @@ const transportColor: Record<string, string> = {
                 </span>
               </div>
             </Transition>
+
+            <div v-if="hasSummary(server)" class="mt-2 space-y-1">
+              <template
+                v-for="section in capabilitySectionMeta"
+                :key="`summary-${server.id}-${section.key}`"
+              >
+                <div
+                  v-if="server.capabilitySummary[section.key].length > 0"
+                  class="flex items-start gap-2 text-[11px]"
+                >
+                  <span class="text-gray-400 shrink-0 w-16">
+                    {{ section.label }}
+                  </span>
+                  <span class="text-gray-600 dark:text-gray-300 min-w-0 truncate">
+                    {{ getSummaryText(server, section.key) }}
+                  </span>
+                </div>
+              </template>
+            </div>
+            <p
+              v-else-if="server.last_test_status === 'success'"
+              class="mt-2 text-[11px] text-gray-400"
+            >
+              已连接，但未发现可枚举的 tools/resources/prompts 能力。
+            </p>
+
+            <p
+              v-if="server.last_test_status === 'error' && server.last_test_error"
+              class="mt-2 text-[11px] text-red-500 dark:text-red-400 leading-relaxed break-all"
+            >
+              {{ server.last_test_error }}
+            </p>
+
+            <button
+              v-if="server.capabilityDetails || server.last_test_error || isOAuthServer(server)"
+              class="mt-2 inline-flex items-center gap-1 text-[11px] text-indigo-500 hover:text-indigo-600 transition-colors"
+              @click="toggleExpanded(server.id)"
+            >
+              <div
+                class="i-carbon-chevron-down w-3 h-3 transition-transform duration-150"
+                :class="isExpanded(server.id) ? 'rotate-180' : ''"
+              />
+              {{ isExpanded(server.id) ? '收起明细' : '展开明细' }}
+            </button>
+
+            <div
+              v-if="isExpanded(server.id)"
+              class="mt-3 rounded-xl border border-gray-200 dark:border-white/8 bg-gray-50/80 dark:bg-white/3 px-3 py-3 space-y-3"
+            >
+              <div class="flex flex-wrap items-center gap-2 text-[10px] text-gray-400">
+                <span v-if="server.capabilityDetails?.serverInfo?.name">
+                  Server: {{ server.capabilityDetails.serverInfo.name }}
+                </span>
+                <span v-if="server.capabilityDetails?.serverInfo?.version">
+                  Version: {{ server.capabilityDetails.serverInfo.version }}
+                </span>
+                <span v-if="server.capabilityDetails?.protocolVersion">
+                  Protocol: {{ server.capabilityDetails.protocolVersion }}
+                </span>
+              </div>
+
+              <div
+                v-if="isOAuthServer(server)"
+                class="rounded-lg border border-gray-200/70 dark:border-white/6 bg-white dark:bg-[#2f2f34] px-3 py-2 space-y-1.5"
+              >
+                <div class="flex items-center justify-between">
+                  <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wide">
+                    OAuth
+                  </h3>
+                  <span class="text-[10px]" :class="getOAuthStatusClass(server)">
+                    {{ getOAuthStatusLabel(server) }}
+                  </span>
+                </div>
+                <p class="text-[11px] text-gray-500 dark:text-gray-300">
+                  Client ID: <span class="font-mono break-all">{{ server.oauthRegistration?.client_id || server.oauth_client_id || '未注册' }}</span>
+                </p>
+                <p v-if="server.oauth_redirect_mode" class="text-[11px] text-gray-500 dark:text-gray-300">
+                  回调模式: <span class="break-all">{{ server.oauth_redirect_mode === 'deeplink' ? 'Deep Link' : 'Loopback' }}</span>
+                </p>
+                <p v-if="getOAuthIssuer(server)" class="text-[11px] text-gray-500 dark:text-gray-300">
+                  Issuer: <span class="break-all">{{ getOAuthIssuer(server) }}</span>
+                </p>
+                <p v-if="server.oauth_connected_at" class="text-[11px] text-gray-500 dark:text-gray-300">
+                  最近授权: {{ formatDateTime(server.oauth_connected_at) }}
+                </p>
+                <p v-if="server.oauth_expires_at" class="text-[11px] text-gray-500 dark:text-gray-300">
+                  Token 过期: {{ formatDateTime(server.oauth_expires_at) }}
+                </p>
+                <p
+                  v-if="server.oauth_last_error"
+                  class="text-[11px] text-red-500 dark:text-red-400 leading-relaxed break-all"
+                >
+                  {{ server.oauth_last_error }}
+                </p>
+              </div>
+
+              <div
+                v-if="server.last_test_status === 'error' && server.last_test_error"
+                class="rounded-lg border border-red-200/70 dark:border-red-500/20 bg-red-50/80 dark:bg-red-500/5 px-3 py-2"
+              >
+                <p class="text-[11px] font-medium text-red-500 dark:text-red-400">最近一次探测失败</p>
+                <p class="mt-1 text-[11px] text-red-500 dark:text-red-400 leading-relaxed break-all">
+                  {{ server.last_test_error }}
+                </p>
+              </div>
+
+              <div
+                v-for="section in capabilitySectionMeta"
+                :key="`detail-${server.id}-${section.key}`"
+                class="space-y-1.5"
+              >
+                <div class="flex items-center justify-between">
+                  <h3 class="text-[11px] font-medium text-gray-500 uppercase tracking-wide">
+                    {{ section.label }}
+                  </h3>
+                  <span class="text-[10px] text-gray-400 tabular-nums">
+                    {{ getCapabilityGroup(server, section.key).count }}
+                  </span>
+                </div>
+
+                <div
+                  v-if="getCapabilityGroup(server, section.key).items.length > 0"
+                  class="space-y-2"
+                >
+                  <div
+                    v-for="item in getCapabilityGroup(server, section.key).items"
+                    :key="item.uri || item.name"
+                    class="rounded-lg bg-white dark:bg-[#2f2f34] border border-gray-200/70 dark:border-white/6 px-3 py-2"
+                  >
+                    <div class="flex items-start justify-between gap-2">
+                      <div class="min-w-0">
+                        <p class="text-[12px] font-medium text-gray-700 dark:text-gray-100 break-all">
+                          {{ item.name || item.uri }}
+                        </p>
+                        <p
+                          v-if="item.uri && item.uri !== item.name"
+                          class="mt-0.5 text-[10px] text-gray-400 font-mono break-all"
+                        >
+                          {{ item.uri }}
+                        </p>
+                      </div>
+                      <span
+                        v-if="item.mimeType"
+                        class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400 shrink-0"
+                      >
+                        {{ item.mimeType }}
+                      </span>
+                    </div>
+                    <p
+                      v-if="item.description"
+                      class="mt-1 text-[11px] text-gray-500 dark:text-gray-300 leading-relaxed"
+                    >
+                      {{ item.description }}
+                    </p>
+                    <pre
+                      v-if="getCapabilityExtra(item)"
+                      class="mt-2 text-[10px] text-gray-500 dark:text-gray-300 font-mono whitespace-pre-wrap break-all rounded-lg bg-gray-50 dark:bg-black/20 px-2.5 py-2 overflow-hidden"
+                    >{{ getCapabilityExtra(item) }}</pre>
+                  </div>
+                </div>
+
+                <p
+                  v-else
+                  class="text-[11px] text-gray-400"
+                >
+                  未提供此类能力。
+                </p>
+              </div>
+            </div>
           </div>
 
           <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
@@ -477,6 +1161,9 @@ const transportColor: Record<string, string> = {
                   placeholder='{"Authorization": "Bearer ..."}'
                 >
               </div>
+              <p class="text-[11px] text-gray-400 leading-relaxed">
+                OAuth 登录已改为零配置模式。若服务器支持 DCR，会在测试或登录时自动识别并完成注册；若不支持，会在卡片上直接显示“不支持零配置登录”。
+              </p>
             </template>
           </div>
 

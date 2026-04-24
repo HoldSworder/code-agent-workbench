@@ -92,6 +92,27 @@ export function applySchema(db: Database.Database): void {
       url         TEXT,
       headers     TEXT NOT NULL DEFAULT '{}',
       enabled     INTEGER NOT NULL DEFAULT 1,
+      last_test_status TEXT CHECK (last_test_status IN ('success', 'error')),
+      last_test_error TEXT,
+      last_tested_at TEXT,
+      capabilities_json TEXT,
+      capabilities_summary TEXT,
+      auth_type TEXT CHECK (auth_type IN ('oauth')),
+      oauth_client_id TEXT,
+      oauth_scope TEXT,
+      oauth_audience TEXT,
+      oauth_token_endpoint_auth_method TEXT,
+      oauth_access_token TEXT,
+      oauth_refresh_token TEXT,
+      oauth_token_type TEXT,
+      oauth_expires_at TEXT,
+      oauth_id_token TEXT,
+      oauth_metadata_json TEXT,
+      oauth_registration_json TEXT,
+      oauth_auth_state TEXT CHECK (oauth_auth_state IN ('none', 'required', 'connected', 'unsupported', 'error')),
+      oauth_redirect_mode TEXT CHECK (oauth_redirect_mode IN ('deeplink', 'loopback')),
+      oauth_last_error TEXT,
+      oauth_connected_at TEXT,
       created_at  TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -272,5 +293,71 @@ export function applySchema(db: Database.Database): void {
   const taskCols3 = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
   if (!taskCols3.some(c => c.name === 'workflow_completed')) {
     db.exec(`ALTER TABLE repo_tasks ADD COLUMN workflow_completed INTEGER NOT NULL DEFAULT 0`)
+  }
+
+  // Migration: add MCP probe result columns
+  const mcpCols = db.prepare(`PRAGMA table_info(mcp_servers)`).all() as { name: string }[]
+  if (!mcpCols.some(c => c.name === 'last_test_status')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN last_test_status TEXT CHECK (last_test_status IN ('success', 'error'))`)
+  }
+  if (!mcpCols.some(c => c.name === 'last_test_error')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN last_test_error TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'last_tested_at')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN last_tested_at TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'capabilities_json')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN capabilities_json TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'capabilities_summary')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN capabilities_summary TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'auth_type')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN auth_type TEXT CHECK (auth_type IN ('oauth'))`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_client_id')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_client_id TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_scope')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_scope TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_audience')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_audience TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_token_endpoint_auth_method')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_token_endpoint_auth_method TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_access_token')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_access_token TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_refresh_token')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_refresh_token TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_token_type')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_token_type TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_expires_at')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_expires_at TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_id_token')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_id_token TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_metadata_json')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_metadata_json TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_registration_json')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_registration_json TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_auth_state')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_auth_state TEXT CHECK (oauth_auth_state IN ('none', 'required', 'connected', 'unsupported', 'error'))`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_redirect_mode')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_redirect_mode TEXT CHECK (oauth_redirect_mode IN ('deeplink', 'loopback'))`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_last_error')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_last_error TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'oauth_connected_at')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_connected_at TEXT`)
   }
 }

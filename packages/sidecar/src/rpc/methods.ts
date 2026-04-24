@@ -37,6 +37,8 @@ import { OrchestratorRepository } from '../orchestrator/repository'
 import type { ConsultServer } from '../consult/server'
 import type { ConsultConfig } from '../consult/types'
 import { getAllTools, collectTools } from '../tools/registry'
+import { probeMcpServer } from '../mcp/probe'
+import { McpOAuthService } from '../mcp/oauth'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -85,6 +87,100 @@ export function registerMethods(
   const mcpServerRepo = new McpServerRepository(db)
   const mcpBindingRepo = new McpBindingRepository(db)
   const orchestratorRepo = new OrchestratorRepository(db)
+  const mcpOAuthService = new McpOAuthService()
+
+  function parseJsonSafely<T>(value: string | null | undefined, fallback: T): T {
+    if (!value) return fallback
+    try {
+      return JSON.parse(value) as T
+    }
+    catch {
+      return fallback
+    }
+  }
+
+  function buildStoredRegistration(srv: ReturnType<typeof mcpServerRepo.findById>) {
+    if (!srv?.oauth_client_id) return null
+    const raw = parseJsonSafely<Record<string, unknown> | null>(srv.oauth_registration_json, null)
+    const redirectUris = Array.isArray(raw?.redirect_uris)
+      ? raw.redirect_uris.filter((item): item is string => typeof item === 'string')
+      : []
+    return {
+      clientId: srv.oauth_client_id,
+      redirectUris,
+      raw,
+    }
+  }
+
+  function buildProbePayload(serverId: string) {
+    const srv = mcpServerRepo.findById(serverId)
+    if (!srv) throw new Error(`MCP server not found: ${serverId}`)
+
+    return {
+      server: srv,
+      target: {
+        transport: srv.transport,
+        command: srv.command,
+        args: JSON.parse(srv.args || '[]') as string[],
+        env: JSON.parse(srv.env || '{}') as Record<string, string>,
+        url: srv.url,
+        headers: JSON.parse(srv.headers || '{}') as Record<string, string>,
+        oauth: (srv.oauth_access_token || srv.oauth_refresh_token || srv.oauth_metadata_json || srv.oauth_client_id)
+          ? {
+              clientId: srv.oauth_client_id,
+              accessToken: srv.oauth_access_token,
+              refreshToken: srv.oauth_refresh_token,
+              expiresAt: srv.oauth_expires_at,
+              audience: srv.oauth_audience,
+              metadata: parseJsonSafely(srv.oauth_metadata_json, null),
+              refreshAccessToken: (input) => mcpOAuthService.refreshToken(input),
+              onRefresh: async (tokens) => {
+                mcpServerRepo.updateOAuthSession(serverId, {
+                  accessToken: tokens.accessToken,
+                  refreshToken: tokens.refreshToken,
+                  tokenType: tokens.tokenType,
+                  expiresAt: tokens.expiresAt,
+                  idToken: tokens.idToken,
+                  lastError: null,
+                  connectedAt: srv.oauth_connected_at ?? new Date().toISOString(),
+                })
+              },
+            }
+          : undefined,
+      },
+    }
+  }
+
+  async function probeAndPersistMcpServer(serverId: string) {
+    const { server: srv, target } = buildProbePayload(serverId)
+    const testedAt = new Date().toISOString()
+    const probe = await probeMcpServer(target)
+    let updated = mcpServerRepo.updateProbeResult(serverId, {
+      ok: probe.ok,
+      error: probe.error ?? null,
+      testedAt,
+      capabilitiesJson: probe.ok
+        ? JSON.stringify({
+            protocolVersion: probe.protocolVersion ?? null,
+            serverInfo: probe.serverInfo ?? null,
+            capabilities: probe.capabilities,
+          })
+        : null,
+      capabilitiesSummary: probe.ok ? JSON.stringify(probe.summary) : null,
+    })
+
+    const derivedAuthState = probe.auth?.state ?? (probe.ok ? (srv.oauth_access_token ? 'connected' : 'none') : 'error')
+    updated = mcpServerRepo.updateOAuthSession(serverId, {
+      metadataJson: probe.auth?.metadata ? JSON.stringify(probe.auth.metadata) : (probe.ok ? null : srv.oauth_metadata_json),
+      authState: derivedAuthState,
+      lastError: probe.ok ? null : (probe.error ?? null),
+      connectedAt: derivedAuthState === 'connected'
+        ? (srv.oauth_connected_at ?? new Date().toISOString())
+        : srv.oauth_connected_at,
+    })
+
+    return { probe: { ...probe, testedAt }, updated }
+  }
 
   // ── Repo CRUD ──
   server.register('repo.list', async () => repoRepo.findAll())
@@ -680,7 +776,11 @@ export function registerMethods(
   // ── MCP Management ──
   server.register('mcp.list', async () => mcpServerRepo.findAll())
 
-  server.register('mcp.create', async (params: CreateMcpServerInput) => mcpServerRepo.create(params))
+  server.register('mcp.create', async (params: CreateMcpServerInput) => {
+    const created = mcpServerRepo.create(params)
+    const { updated } = await probeAndPersistMcpServer(created.id)
+    return updated
+  })
 
   server.register('mcp.update', async ({ id, ...input }: { id: string } & UpdateMcpServerInput) =>
     mcpServerRepo.update(id, input),
@@ -693,90 +793,90 @@ export function registerMethods(
 
   server.register('mcp.toggle', async ({ id }: { id: string }) => mcpServerRepo.toggle(id))
 
-  server.register('mcp.test', async ({ id }: { id: string }): Promise<{ ok: boolean, error?: string, tools?: number }> => {
+  server.register('mcp.test', async ({ id }: { id: string }) => {
     const srv = mcpServerRepo.findById(id)
     if (!srv) return { ok: false, error: 'Server not found' }
+    const { probe } = await probeAndPersistMcpServer(id)
+    return probe
+  })
 
-    if (srv.transport === 'stdio') {
-      const command = srv.command
-      if (!command) return { ok: false, error: 'No command configured' }
-      const args = JSON.parse(srv.args || '[]') as string[]
-      const envVars = JSON.parse(srv.env || '{}') as Record<string, string>
-      return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          child.kill()
-          resolve({ ok: false, error: 'Timed out after 15s — process started but MCP handshake did not complete' })
-        }, 15_000)
+  server.register('mcp.oauthStart', async ({ id }: { id: string }) => {
+    const srv = mcpServerRepo.findById(id)
+    if (!srv) throw new Error(`MCP server not found: ${id}`)
+    if (srv.transport === 'stdio') throw new Error('OAuth login is only supported for HTTP/SSE MCP servers')
+    if (!srv.url) throw new Error('No URL configured')
+    const started = await mcpOAuthService.startAuthorization({
+      mcpUrl: srv.url,
+      scope: srv.oauth_scope,
+      audience: srv.oauth_audience,
+      tokenEndpointAuthMethod: srv.oauth_token_endpoint_auth_method,
+      registration: buildStoredRegistration(srv),
+    })
+    mcpServerRepo.updateOAuthRegistration(id, {
+      clientId: started.registration.clientId,
+      registrationJson: JSON.stringify(started.registration.raw ?? {
+        client_id: started.registration.clientId,
+        redirect_uris: started.registration.redirectUris,
+      }),
+      redirectMode: started.redirectMode,
+    })
+    mcpServerRepo.updateOAuthSession(id, {
+      metadataJson: JSON.stringify(started.metadata),
+      authState: 'required',
+      redirectMode: started.redirectMode,
+      lastError: null,
+    })
+    return started
+  })
 
-        const child = spawnChild(command, args, {
-          env: { ...process.env, ...envVars },
-          stdio: ['pipe', 'pipe', 'pipe'],
+  server.register('mcp.oauthPoll', async ({ id, requestId }: { id: string, requestId: string }) => {
+    const srv = mcpServerRepo.findById(id)
+    if (!srv) throw new Error(`MCP server not found: ${id}`)
+
+    const result = mcpOAuthService.pollAuthorization(requestId)
+    if (result.status === 'success' && result.tokens) {
+      if (result.registration) {
+        mcpServerRepo.updateOAuthRegistration(id, {
+          clientId: result.registration.clientId,
+          registrationJson: JSON.stringify(result.registration.raw ?? {
+            client_id: result.registration.clientId,
+            redirect_uris: result.registration.redirectUris,
+          }),
         })
-
-        let stdout = ''
-
-        child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
-
-        const initRequest = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent-test', version: '0.1.0' } } })
-        child.stdin?.write(initRequest + '\n')
-
-        child.on('error', (err) => {
-          clearTimeout(timeout)
-          resolve({ ok: false, error: `Failed to spawn: ${err.message}` })
-        })
-
-        const checkInitResponse = () => {
-          try {
-            const lines = stdout.split('\n').filter(Boolean)
-            for (const line of lines) {
-              const resp = JSON.parse(line)
-              if (resp.id === 1 && resp.result) {
-                clearTimeout(timeout)
-                child.kill()
-                return resolve({ ok: true, tools: undefined })
-              }
-              if (resp.error) {
-                clearTimeout(timeout)
-                child.kill()
-                return resolve({ ok: false, error: resp.error.message || 'MCP init rejected' })
-              }
-            }
-          } catch { /* partial data, keep waiting */ }
-        }
-
-        child.stdout?.on('data', () => checkInitResponse())
-
-        child.on('close', (code) => {
-          clearTimeout(timeout)
-          if (code !== 0 && code !== null) {
-            resolve({ ok: false, error: `Process exited with code ${code}` })
-          }
-        })
+      }
+      const updated = mcpServerRepo.updateOAuthSession(id, {
+        accessToken: result.tokens.accessToken,
+        refreshToken: result.tokens.refreshToken,
+        tokenType: result.tokens.tokenType,
+        expiresAt: result.tokens.expiresAt,
+        idToken: result.tokens.idToken,
+        metadataJson: JSON.stringify(result.metadata),
+        authState: 'connected',
+        lastError: null,
+        connectedAt: new Date().toISOString(),
       })
+      return { ...result, server: updated }
     }
 
-    const targetUrl = srv.url
-    if (!targetUrl) return { ok: false, error: 'No URL configured' }
-    const headers = JSON.parse(srv.headers || '{}') as Record<string, string>
-
-    try {
-      const resp = await fetch(targetUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/event-stream',
-          ...headers,
-        },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent-test', version: '0.1.0' } } }),
-        signal: AbortSignal.timeout(10_000),
+    if (result.status === 'error') {
+      const updated = mcpServerRepo.updateOAuthSession(id, {
+        metadataJson: JSON.stringify(result.metadata),
+        authState: 'error',
+        lastError: result.error ?? 'OAuth authorization failed',
       })
-      if (!resp.ok) return { ok: false, error: `HTTP ${resp.status} ${resp.statusText}` }
-      const body = await resp.json()
-      if (body.error) return { ok: false, error: body.error.message || 'MCP init rejected' }
-      return { ok: true }
-    } catch (err: any) {
-      return { ok: false, error: err?.message || 'Connection failed' }
+      return { ...result, server: updated }
     }
+
+    return result
+  })
+
+  server.register('mcp.oauthComplete', async ({ url }: { url: string }) => {
+    await mcpOAuthService.completeAuthorization(url)
+    return { ok: true }
+  })
+
+  server.register('mcp.oauthDisconnect', async ({ id }: { id: string }) => {
+    return mcpServerRepo.clearOAuthSession(id)
   })
 
   server.register('mcp.getBindings', async ({ stageId, phaseId }: { stageId: string, phaseId: string }) =>

@@ -21,11 +21,13 @@ import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phas
 import { ActivatedPhaseRepository } from '../db/repositories/activated-phase.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
+import type { McpServer } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { git, getHead, getMergeBase, resetHard, resetHardClean, stashIfDirty, getCurrentBranch } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
+import { McpOAuthService, resolveOAuthAccessToken } from '../mcp/oauth'
 import { collectTools } from '../tools/registry'
 import { renderWorkflowSkill } from '../workflow-skills/registry'
 
@@ -70,6 +72,7 @@ export class WorkflowEngine {
   private activeRequirementProviders = new Map<string, AgentProvider>()
   private pendingAdvance = new Map<string, string>()
   private pendingPlanMode = new Set<string>()
+  private mcpOAuthService = new McpOAuthService()
 
   /** 供 context-builder 加载根级 skill（skills/<id>/）的回调 */
   private resolveWorkflowSkill = (id: string, vars: Record<string, string>) => {
@@ -137,6 +140,56 @@ export class WorkflowEngine {
   private resolveConfigForTask(repoTaskId: string): WorkflowConfig {
     const task = this.taskRepo.findById(repoTaskId)
     return this.getWorkflowConfig(task?.workflow_id)
+  }
+
+  private parseJsonSafely<T>(value: string | null | undefined, fallback: T): T {
+    if (!value) return fallback
+    try {
+      return JSON.parse(value) as T
+    }
+    catch {
+      return fallback
+    }
+  }
+
+  private async buildMcpServerConfig(server: McpServer): Promise<McpServerConfig> {
+    const headers = this.parseJsonSafely(server.headers, {} as Record<string, string>)
+
+    if (server.transport !== 'stdio' && server.auth_type === 'oauth') {
+      const { accessToken, refreshedTokens } = await resolveOAuthAccessToken({
+        mcpUrl: server.url ?? '',
+        clientId: server.oauth_client_id,
+        accessToken: server.oauth_access_token,
+        refreshToken: server.oauth_refresh_token,
+        expiresAt: server.oauth_expires_at,
+        audience: server.oauth_audience,
+        metadata: this.parseJsonSafely(server.oauth_metadata_json, null),
+      }, input => this.mcpOAuthService.refreshToken(input))
+
+      headers.Authorization = `Bearer ${accessToken}`
+
+      if (refreshedTokens) {
+        this.mcpServerRepo.updateOAuthSession(server.id, {
+          accessToken: refreshedTokens.accessToken,
+          refreshToken: refreshedTokens.refreshToken,
+          tokenType: refreshedTokens.tokenType,
+          expiresAt: refreshedTokens.expiresAt,
+          idToken: refreshedTokens.idToken,
+          lastError: null,
+          connectedAt: server.oauth_connected_at ?? new Date().toISOString(),
+        })
+      }
+    }
+
+    return {
+      name: server.name,
+      transport: server.transport,
+      command: server.command,
+      args: this.parseJsonSafely(server.args, [] as string[]),
+      env: this.parseJsonSafely(server.env, {} as Record<string, string>),
+      url: server.url,
+      headers,
+    }
   }
 
   recoverMcpBackups(): void {
@@ -1251,15 +1304,7 @@ export class WorkflowEngine {
 
         if (servers.length > 0) {
           injectedMcpNames = servers.map(s => s.name)
-          const serverConfigs: McpServerConfig[] = servers.map(s => ({
-            name: s.name,
-            transport: s.transport,
-            command: s.command,
-            args: JSON.parse(s.args),
-            env: JSON.parse(s.env),
-            url: s.url,
-            headers: JSON.parse(s.headers),
-          }))
+          const serverConfigs: McpServerConfig[] = await Promise.all(servers.map(s => this.buildMcpServerConfig(s)))
           configWriter.write(workDir, serverConfigs)
           const mcpConfigPath = configWriter.getConfigPath(workDir)
           elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${injectedMcpNames.join(',')})`)
@@ -1810,15 +1855,7 @@ export class WorkflowEngine {
       if (mcpServers.length === 0) {
         elog(`executePhase: no MCP servers for ${stage.id}/${phase.id}`)
       } else {
-        const serverConfigs: McpServerConfig[] = mcpServers.map(s => ({
-          name: s.name,
-          transport: s.transport,
-          command: s.command,
-          args: JSON.parse(s.args),
-          env: JSON.parse(s.env),
-          url: s.url,
-          headers: JSON.parse(s.headers),
-        }))
+        const serverConfigs: McpServerConfig[] = await Promise.all(mcpServers.map(s => this.buildMcpServerConfig(s)))
         configWriter.backup(cwd)
         configWriter.write(cwd, serverConfigs)
         const mcpConfigPath = configWriter.getConfigPath(cwd)
