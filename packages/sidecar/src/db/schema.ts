@@ -113,6 +113,7 @@ export function applySchema(db: Database.Database): void {
       oauth_redirect_mode TEXT CHECK (oauth_redirect_mode IN ('deeplink', 'loopback')),
       oauth_last_error TEXT,
       oauth_connected_at TEXT,
+      is_feishu_project INTEGER NOT NULL DEFAULT 0,
       created_at  TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -359,5 +360,8 @@ export function applySchema(db: Database.Database): void {
   }
   if (!mcpCols.some(c => c.name === 'oauth_connected_at')) {
     db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_connected_at TEXT`)
+  }
+  if (!mcpCols.some(c => c.name === 'is_feishu_project')) {
+    db.exec(`ALTER TABLE mcp_servers ADD COLUMN is_feishu_project INTEGER NOT NULL DEFAULT 0`)
   }
 }

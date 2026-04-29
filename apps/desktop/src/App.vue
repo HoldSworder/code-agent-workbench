@@ -1,23 +1,34 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, onBeforeUnmount } from 'vue'
 import { useRoute } from 'vue-router'
 import { useReposStore } from './stores/repos'
+import { useLarkIdentityStore } from './stores/lark-identity'
 import { startSidecar, sidecarReady } from './composables/use-sidecar'
+import UserBadge from './components/UserBadge.vue'
 
 const route = useRoute()
 const reposStore = useReposStore()
+const larkIdentity = useLarkIdentityStore()
 
 onMounted(async () => {
   await startSidecar()
   reposStore.fetchAll()
+  larkIdentity.startAutoRefresh()
+})
+
+onBeforeUnmount(() => {
+  larkIdentity.stopAutoRefresh()
 })
 </script>
 
 <template>
   <div class="flex h-screen bg-[#f5f5f7] dark:bg-[#1a1a1e] text-gray-900 dark:text-gray-100">
     <nav class="w-52 bg-[#ebebee]/80 dark:bg-[#28282c] flex flex-col backdrop-blur-xl">
-      <div class="px-5 pt-6 pb-4">
+      <div class="px-5 pt-6 pb-3">
         <h1 class="text-base font-semibold tracking-tight text-gray-800 dark:text-gray-200">Code Agent</h1>
+      </div>
+      <div class="px-3 pb-3">
+        <UserBadge />
       </div>
       <div class="flex-1 overflow-y-auto px-2">
         <router-link
@@ -102,6 +113,14 @@ onMounted(async () => {
         >
           <div class="i-carbon-chat w-4 h-4 opacity-60" />
           咨询
+        </router-link>
+        <router-link
+          to="/review"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150 text-gray-500 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5"
+          active-class="!bg-white dark:!bg-white/10 !text-gray-900 dark:!text-white font-medium shadow-sm"
+        >
+          <div class="i-carbon-collaborate w-4 h-4 opacity-60" />
+          迭代评审
         </router-link>
         <router-link
           to="/settings"

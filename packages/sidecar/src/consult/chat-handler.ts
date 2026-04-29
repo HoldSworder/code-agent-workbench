@@ -1,6 +1,12 @@
-import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import type { ConsultConfig, ConsultSession, ConsultMessage, ConsultSessionSummary } from './types'
+import {
+  buildAgentEnv,
+  buildCliArgs,
+  CliRunner,
+  resolveBinary,
+} from '@code-agent/shared/cli'
+import { PromptBuilder } from '@code-agent/shared/util'
+import type { ConsultConfig, ConsultMessage, ConsultSession, ConsultSessionSummary } from './types'
 
 const ACTIVITY_TIMEOUT_MS = 3 * 60 * 1000
 const MAX_TIMEOUT_MS = 15 * 60 * 1000
@@ -21,7 +27,7 @@ const READONLY_GUARDRAIL = [
 
 export class ConsultChatHandler {
   private sessions = new Map<string, ConsultSession>()
-  private activeProcesses = new Map<string, ChildProcess>()
+  private activeAborts = new Map<string, AbortController>()
   private config: ConsultConfig
 
   constructor(config: ConsultConfig) {
@@ -75,12 +81,9 @@ export class ConsultChatHandler {
   }
 
   cancelSession(sessionId: string): void {
-    const proc = this.activeProcesses.get(sessionId)
-    if (proc && !proc.killed) {
-      proc.kill('SIGTERM')
-      setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL') }, 5000)
-    }
-    this.activeProcesses.delete(sessionId)
+    const ctl = this.activeAborts.get(sessionId)
+    if (ctl) ctl.abort()
+    this.activeAborts.delete(sessionId)
     const session = this.sessions.get(sessionId)
     if (session) session.abort = null
   }
@@ -91,8 +94,7 @@ export class ConsultChatHandler {
   }
 
   /**
-   * Send a message and stream the response via callback.
-   * Returns a promise that resolves when the agent finishes.
+   * 发送一条用户消息，流式回调 onChunk，promise resolve 时表示 agent 结束。
    */
   async chat(
     sessionId: string,
@@ -105,269 +107,64 @@ export class ConsultChatHandler {
     session.messages.push({ role: 'user', content: userMessage, timestamp: Date.now() })
 
     const prompt = this.buildPrompt(session)
-    const binary = this.config.binaryPath ?? this.defaultBinary()
-    const { args, stdinData } = this.buildReadonlyArgs(session.repoPath, prompt)
-    const env = this.buildCleanEnv()
-    const useStreamJson = this.config.provider !== 'codex'
-
-    return new Promise((resolve, reject) => {
-      let assistantText = ''
-      let lineBuf = ''
-      let resolved = false
-
-      const finish = (error?: string) => {
-        if (resolved) return
-        resolved = true
-        clearTimeout(maxTimer)
-        clearTimeout(activityTimer)
-        this.activeProcesses.delete(sessionId)
-        session.abort = null
-
-        if (error) {
-          reject(new Error(error))
-        } else {
-          const cleaned = assistantText.replace(/<<PHASE_COMPLETE>>|<<PENDING_INPUT>>/g, '').trim()
-          session.messages.push({ role: 'assistant', content: cleaned, timestamp: Date.now() })
-          resolve({ assistantMessage: cleaned })
-        }
-      }
-
-      const killAgent = (reason: string) => {
-        if (child && !child.killed) {
-          child.kill('SIGTERM')
-          setTimeout(() => { if (!child.killed) child.kill('SIGKILL') }, 5000)
-        }
-        finish(reason)
-      }
-
-      const maxTimer = setTimeout(() => killAgent('Agent timeout'), MAX_TIMEOUT_MS)
-      let activityTimer = setTimeout(() => killAgent('No activity timeout'), ACTIVITY_TIMEOUT_MS)
-
-      const resetActivityTimer = () => {
-        clearTimeout(activityTimer)
-        activityTimer = setTimeout(() => killAgent('No activity timeout'), ACTIVITY_TIMEOUT_MS)
-      }
-
-      const child = spawn(binary, args, {
-        cwd: session.repoPath,
-        env,
-        shell: false,
-        stdio: [stdinData != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-      })
-
-      this.activeProcesses.set(sessionId, child)
-
-      child.on('error', (err) => {
-        const code = (err as NodeJS.ErrnoException).code
-        if (code === 'ENOENT')
-          finish(`CLI "${binary}" not found. Please install it or update the path in settings.`)
-        else
-          finish(err?.message ?? 'Unknown spawn error')
-      })
-
-      if (stdinData != null && child.stdin) {
-        child.stdin.on('error', () => {})
-        const ok = child.stdin.write(stdinData)
-        if (!ok) child.stdin.once('drain', () => child.stdin?.end())
-        else child.stdin.end()
-      }
-
-      child.stdout?.on('data', (data) => {
-        const chunk = String(data)
-        resetActivityTimer()
-
-        if (useStreamJson) {
-          lineBuf += chunk
-          const lines = lineBuf.split('\n')
-          lineBuf = lines.pop()!
-
-          for (const line of lines) {
-            const normalized = normalizeLine(line)
-            if (!normalized) continue
-            const { text, isComplete } = extractStreamText(normalized)
-            if (text) {
-              if (isComplete && assistantText.endsWith(text)) continue
-              assistantText += text
-              onChunk(text)
-            }
-          }
-        } else {
-          assistantText += chunk
-          onChunk(chunk)
-        }
-      })
-
-      child.stderr?.on('data', () => {})
-
-      child.on('close', (code) => {
-        if (lineBuf.trim()) {
-          const normalized = normalizeLine(lineBuf)
-          if (normalized) {
-            const { text } = extractStreamText(normalized)
-            if (text && !assistantText.endsWith(text)) {
-              assistantText += text
-              onChunk(text)
-            }
-          }
-          lineBuf = ''
-        }
-
-        if (code !== 0 && code !== null) {
-          finish(`CLI exited with code ${code}`)
-          return
-        }
-        finish()
-      })
+    const binary = resolveBinary(this.config.provider, this.config.binaryPath)
+    const { args, stdinData, useStreamJson } = buildCliArgs({
+      backend: this.config.provider,
+      cwd: session.repoPath,
+      mode: 'readonly',
+      model: this.config.model,
+      prompt,
     })
+    const env = buildAgentEnv({
+      proxyUrl: this.config.proxyUrl,
+      sniProxyPatch: this.config.sniProxyPatch,
+    })
+
+    const ctl = new AbortController()
+    this.activeAborts.set(sessionId, ctl)
+
+    let assistantText = ''
+    const result = await CliRunner.run({
+      binary,
+      args,
+      cwd: session.repoPath,
+      stdinData,
+      env,
+      useStreamJson,
+      timeoutMs: MAX_TIMEOUT_MS,
+      activityTimeoutMs: ACTIVITY_TIMEOUT_MS,
+      signal: ctl.signal,
+      onText: (text) => {
+        assistantText += text
+        onChunk(text)
+      },
+    })
+
+    this.activeAborts.delete(sessionId)
+    session.abort = null
+
+    if (result.status !== 'success') {
+      throw new Error(result.error ?? 'Agent failed')
+    }
+
+    const cleaned = (result.output || assistantText).replace(/<<PHASE_COMPLETE>>|<<PENDING_INPUT>>/g, '').trim()
+    session.messages.push({ role: 'assistant', content: cleaned, timestamp: Date.now() })
+    return { assistantMessage: cleaned }
   }
 
   private buildPrompt(session: ConsultSession): string {
-    const parts: string[] = [READONLY_GUARDRAIL, '']
+    const builder = new PromptBuilder().text(READONLY_GUARDRAIL)
 
     if (session.messages.length > 1) {
-      parts.push('## 对话历史\n')
       const history = session.messages.slice(0, -1)
-      for (const msg of history) {
-        parts.push(`**${msg.role === 'user' ? '用户' : '助手'}**: ${msg.content}\n`)
-      }
-      parts.push('---\n')
+      const formatted = history
+        .map(m => `**${m.role === 'user' ? '用户' : '助手'}**: ${m.content}`)
+        .join('\n')
+      builder.section('对话历史', formatted).divider()
     }
 
     const lastMsg = session.messages[session.messages.length - 1]
-    parts.push(lastMsg.content)
-
-    return parts.join('\n')
+    builder.text(lastMsg.content)
+    return builder.build()
   }
-
-  /** Build CLI args with read-only flags (no --yolo/--trust/--full-auto) */
-  private buildReadonlyArgs(cwd: string, prompt: string): { args: string[], stdinData: string | null } {
-    switch (this.config.provider) {
-      case 'cursor-cli': {
-        const args = ['-p', '--output-format', 'stream-json', '--stream-partial-output', '--workspace', cwd]
-        if (this.config.model && this.config.model !== 'auto')
-          args.push('--model', this.config.model)
-        return { args, stdinData: prompt }
-      }
-      case 'claude-code': {
-        const args = ['--print', '-', '--output-format', 'stream-json', '--verbose']
-        if (this.config.model && this.config.model !== 'auto')
-          args.push('--model', this.config.model)
-        return { args, stdinData: prompt }
-      }
-      case 'codex': {
-        const args = ['exec', '-', '--approval-mode', 'suggest', '-C', cwd]
-        if (this.config.model && this.config.model !== 'auto')
-          args.push('--model', this.config.model)
-        return { args, stdinData: prompt }
-      }
-    }
-  }
-
-  private buildCleanEnv(): Record<string, string> {
-    const env: Record<string, string> = {}
-    const parentNodeOptions = process.env.NODE_OPTIONS ?? ''
-    const hasSniPatchInParent = parentNodeOptions.includes('agent-socks5-patch')
-
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v == null) continue
-      if (k === 'NODE_OPTIONS' && !hasSniPatchInParent) continue
-      if (k.startsWith('npm_')) continue
-      if (k.startsWith('ELECTRON_')) continue
-      env[k] = v
-    }
-
-    const patch = this.config.sniProxyPatch
-    if (patch) {
-      env.NODE_OPTIONS = `--require "${patch.scriptPath}"`
-      env.AGENT_SOCKS5_HOST = patch.socks5Host
-      env.AGENT_SOCKS5_PORT = String(patch.socks5Port)
-      delete env.HTTP_PROXY
-      delete env.HTTPS_PROXY
-      delete env.ALL_PROXY
-      delete env.http_proxy
-      delete env.https_proxy
-      delete env.all_proxy
-    } else if (hasSniPatchInParent) {
-      delete env.HTTP_PROXY
-      delete env.HTTPS_PROXY
-      delete env.ALL_PROXY
-      delete env.http_proxy
-      delete env.https_proxy
-      delete env.all_proxy
-    } else if (this.config.proxyUrl) {
-      env.HTTP_PROXY = this.config.proxyUrl
-      env.HTTPS_PROXY = this.config.proxyUrl
-      env.ALL_PROXY = this.config.proxyUrl
-      env.http_proxy = this.config.proxyUrl
-      env.https_proxy = this.config.proxyUrl
-      env.all_proxy = this.config.proxyUrl
-    }
-
-    return env
-  }
-
-  private defaultBinary(): string {
-    return {
-      'cursor-cli': 'agent',
-      'claude-code': 'claude',
-      'codex': 'codex',
-    }[this.config.provider]
-  }
-}
-
-// ── Stream parsing helpers (aligned with cli.provider.ts) ──
-
-function normalizeLine(raw: string): string {
-  const trimmed = raw.replace(/\r/g, '').trim()
-  if (!trimmed) return ''
-  const prefixed = trimmed.match(/^(?:stdout|stderr)\s*[:=]?\s*([\[{].*)$/i)
-  return prefixed ? prefixed[1].trim() : trimmed
-}
-
-function stripThinkTags(text: string): string {
-  return text.replace(/<\/?think(?:ing)?>/gi, '').replace(/\n{3,}/g, '\n\n')
-}
-
-function extractStreamText(line: string): { text: string, isComplete: boolean } {
-  const EMPTY = { text: '', isComplete: false }
-  try {
-    const evt = JSON.parse(line) as Record<string, any>
-
-    // cursor-cli delta: { type: 'assistant', subtype: 'delta', text: '...' }
-    if (evt.type === 'assistant' && evt.subtype === 'delta' && typeof evt.text === 'string')
-      return { text: stripThinkTags(evt.text), isComplete: false }
-
-    // claude-code text event: { type: 'text', text: '...' }
-    if (evt.type === 'text' && typeof evt.text === 'string')
-      return { text: stripThinkTags(evt.text), isComplete: false }
-
-    // claude-code stream_event: { type: 'stream_event', event: { delta: { type: 'text_delta', text } } }
-    if (evt.type === 'stream_event') {
-      const delta = evt.event?.delta
-      if (delta?.type === 'text_delta' && typeof delta.text === 'string')
-        return { text: delta.text, isComplete: false }
-    }
-
-    // content_block_delta (Anthropic API style)
-    if (evt.type === 'content_block_delta' && evt.delta?.text)
-      return { text: evt.delta.text, isComplete: false }
-
-    // Complete assistant message (final)
-    if (evt.type === 'assistant' && !evt.subtype) {
-      const blocks = evt.message?.content ?? evt.content
-      let fullText = ''
-      if (Array.isArray(blocks))
-        fullText = blocks.filter((b: any) => b.type === 'text' && typeof b.text === 'string').map((b: any) => b.text).join('')
-      else if (typeof blocks === 'string')
-        fullText = blocks
-      fullText = stripThinkTags(fullText)
-      if (fullText)
-        return { text: fullText, isComplete: true }
-    }
-
-    // result type (codex)
-    if (evt.type === 'result' && typeof evt.result === 'string')
-      return { text: stripThinkTags(evt.result), isComplete: true }
-  } catch {}
-  return EMPTY
 }

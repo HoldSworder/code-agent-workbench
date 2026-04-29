@@ -6,13 +6,19 @@ import { homedir } from 'node:os'
 import { getDb } from './db/connection'
 import { RpcServer } from './rpc/server'
 import { registerMethods } from './rpc/methods'
+import { registerReviewMethods } from './rpc/review-methods'
 import { WorkflowEngine } from './workflow/engine'
 import { Orchestrator } from './orchestrator/orchestrator'
 import { parseTeamConfig } from './orchestrator/team-parser'
 import { registerOrchestratorMethods, registerTeamConfigMethods } from './orchestrator/rpc'
-import { ExternalCliProvider } from './providers/cli.provider'
-import { ApiProvider } from './providers/api.provider'
+import { buildSniProxyPatch } from '@code-agent/shared/cli'
+import {
+  createApiProvider,
+  createCliProvider,
+  loadAgentRuntimeFromSettings,
+} from './providers/factory'
 import { SettingsRepository } from './db/repositories/settings.repo'
+import { McpServerRepository } from './db/repositories/mcp-server.repo'
 import { ConsultServer } from './consult/server'
 import type { ConsultConfig } from './consult/types'
 
@@ -134,20 +140,33 @@ function readdirSafe(dir: string): string[] {
 
 const settingsRepo = new SettingsRepository(db)
 
-const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
-
-function parseSocks5Config(proxyUrl: string): { host: string, port: number } | null {
-  try {
-    const url = new URL(proxyUrl)
-    return { host: url.hostname || '127.0.0.1', port: Number(url.port) || 7890 }
-  }
-  catch {
-    const match = proxyUrl.match(/:(\d+)\s*$/)
-    return match ? { host: '127.0.0.1', port: Number(match[1]) } : null
-  }
+// 一次性迁移：把历史 v1 通过 name='lark-project' 定位的 MCP 自动置 is_feishu_project=1。
+try {
+  const result = new McpServerRepository(db).migrateLegacyLarkProject()
+  if (result.migrated)
+    process.stderr.write(`sidecar: migrated legacy lark-project MCP -> feishu-project flag (id=${result.id})\n`)
+}
+catch (err) {
+  process.stderr.write(`sidecar: migrateLegacyLarkProject failed: ${err}\n`)
 }
 
+const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
+
 const currentCliType = () => settingsRepo.get('agent.provider') ?? 'cursor-cli'
+
+/** ApiProvider 走 fetch，需要进程级代理；CLI provider 不需要（已通过 buildAgentEnv 注入子进程）。 */
+function syncProcessProxyEnv(proxyUrl: string | undefined): void {
+  if (proxyUrl) {
+    process.env.HTTP_PROXY = proxyUrl
+    process.env.HTTPS_PROXY = proxyUrl
+    process.env.ALL_PROXY = proxyUrl
+  }
+  else {
+    delete process.env.HTTP_PROXY
+    delete process.env.HTTPS_PROXY
+    delete process.env.ALL_PROXY
+  }
+}
 
 const engine = new WorkflowEngine({
   db,
@@ -155,56 +174,28 @@ const engine = new WorkflowEngine({
   workflowYaml,
   cliType: currentCliType(),
   resolveProvider: (providerType, options) => {
-    const globalProvider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
-    const globalModel = settingsRepo.get('agent.model') ?? undefined
-    const binaryPath = settingsRepo.get('agent.binaryPath') ?? undefined
-    const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
-    const proxyUrl = proxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
-
-    const provider = options?.agentOverride ?? globalProvider
-    const model = options?.modelOverride ?? globalModel
-
-    if (proxyUrl) {
-      process.env.HTTP_PROXY = proxyUrl
-      process.env.HTTPS_PROXY = proxyUrl
-      process.env.ALL_PROXY = proxyUrl
-    }
-    else {
-      delete process.env.HTTP_PROXY
-      delete process.env.HTTPS_PROXY
-      delete process.env.ALL_PROXY
-    }
-
-    const sniProxyPatch = (() => {
-      if (!proxyUrl || !existsSync(sniPatchPath)) return undefined
-      const socks5 = parseSocks5Config(proxyUrl)
-      if (!socks5) return undefined
-      return { scriptPath: sniPatchPath, socks5Host: socks5.host, socks5Port: socks5.port }
-    })()
+    const runtime = loadAgentRuntimeFromSettings(settingsRepo)
+    runtime.sniProxyPatch = (runtime.proxyUrl && existsSync(sniPatchPath))
+      ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl: runtime.proxyUrl })
+      : undefined
+    syncProcessProxyEnv(runtime.proxyUrl)
 
     switch (providerType) {
       case 'external-cli':
-        return new ExternalCliProvider({
-          type: provider as 'cursor-cli' | 'claude-code' | 'codex',
-          model,
-          binaryPath,
+        return createCliProvider({
+          runtime,
+          agentOverride: options?.agentOverride,
+          modelOverride: options?.modelOverride,
           resumeSessionId: options?.resumeSessionId,
-          proxyUrl,
-          sniProxyPatch,
         })
       case 'codex':
-        return new ExternalCliProvider({
-          type: 'codex',
-          model,
-          proxyUrl,
-          sniProxyPatch,
+        return createCliProvider({
+          runtime,
+          agentOverride: 'codex',
+          modelOverride: options?.modelOverride,
         })
       case 'api':
-        return new ApiProvider({
-          type: 'anthropic',
-          apiKey: settingsRepo.get('agent.apiKey') ?? process.env.ANTHROPIC_API_KEY ?? '',
-          model: model ?? process.env.MODEL ?? 'claude-sonnet-4-20250514',
-        })
+        return createApiProvider({ runtime, modelOverride: options?.modelOverride })
       default:
         throw new Error(`Unknown provider: ${providerType}`)
     }
@@ -244,12 +235,9 @@ try {
 
     const orchProxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
     const orchProxyUrl = orchProxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
-    const orchSniPatch = (() => {
-      if (!orchProxyUrl || !existsSync(sniPatchPath)) return undefined
-      const socks5 = parseSocks5Config(orchProxyUrl)
-      if (!socks5) return undefined
-      return { scriptPath: sniPatchPath, socks5Host: socks5.host, socks5Port: socks5.port }
-    })()
+    const orchSniPatch = (orchProxyUrl && existsSync(sniPatchPath))
+      ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl: orchProxyUrl })
+      : undefined
 
     orchestrator = new Orchestrator({
       db,
@@ -278,12 +266,9 @@ function buildConsultConfig(): ConsultConfig {
   const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
   const proxyUrl = proxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
 
-  const sniProxyPatch = (() => {
-    if (!proxyUrl || !existsSync(sniPatchPath)) return undefined
-    const socks5 = parseSocks5Config(proxyUrl)
-    if (!socks5) return undefined
-    return { scriptPath: sniPatchPath, socks5Host: socks5.host, socks5Port: socks5.port }
-  })()
+  const sniProxyPatch = (proxyUrl && existsSync(sniPatchPath))
+    ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl })
+    : undefined
 
   return { provider, model, binaryPath, port, proxyUrl, sniProxyPatch }
 }
@@ -293,6 +278,7 @@ const consultServer = new ConsultServer({ db, config: buildConsultConfig(), stat
 
 const rpcServer = new RpcServer()
 registerMethods(rpcServer, db, engine, workflowPath, consultServer, buildConsultConfig, workflowsDir, dbPath)
+registerReviewMethods(rpcServer, db)
 
 // 配置 RPC 始终可用（即使 team.yaml 不存在也能创建）
 registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator, () => {

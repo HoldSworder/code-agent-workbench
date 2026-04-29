@@ -1,4 +1,6 @@
 import { spawn as spawnChild } from 'node:child_process'
+import { parseMcpResponseText as sharedParseMcpResponseText } from '@code-agent/shared/mcp'
+import type { JsonRpcResponse as SharedJsonRpcResponse } from '@code-agent/shared/mcp'
 import type { McpOAuthMetadataBundle, OAuthTokenSet, RefreshTokenInput } from './oauth'
 import { detectOAuthRequirement, resolveOAuthAccessToken } from './oauth'
 
@@ -65,15 +67,7 @@ export interface McpProbeResult {
   }
 }
 
-interface JsonRpcResponse {
-  jsonrpc?: string
-  id?: string | number | null
-  result?: any
-  error?: {
-    code?: number
-    message?: string
-  }
-}
+type JsonRpcResponse = SharedJsonRpcResponse
 
 const EMPTY_GROUP: McpCapabilityGroup = { count: 0, items: [] }
 const EMPTY_CAPABILITIES: McpCapabilitiesSnapshot = {
@@ -148,61 +142,8 @@ export function buildCapabilitySummary(capabilities: McpCapabilitiesSnapshot, li
   }
 }
 
-function parseSsePayloads(text: string): unknown[] {
-  const payloads: unknown[] = []
-  const dataLines: string[] = []
-
-  const flush = () => {
-    if (dataLines.length === 0) return
-    const payload = dataLines.join('\n').trim()
-    dataLines.length = 0
-    if (!payload) return
-    payloads.push(JSON.parse(payload))
-  }
-
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trimEnd()
-    if (!line) {
-      flush()
-      continue
-    }
-    if (line.startsWith('data:')) {
-      dataLines.push(line.slice(5).trimStart())
-    }
-  }
-  flush()
-  return payloads
-}
-
-export function parseMcpResponseText(text: string): JsonRpcResponse {
-  const trimmed = text.trim()
-  if (!trimmed) throw new Error('Empty MCP response body')
-
-  try {
-    return JSON.parse(trimmed) as JsonRpcResponse
-  }
-  catch {}
-
-  try {
-    const payloads = parseSsePayloads(trimmed)
-    const match = payloads.find((payload): payload is JsonRpcResponse =>
-      Boolean(payload && typeof payload === 'object' && ('result' in payload || 'error' in payload)),
-    )
-    if (match) return match
-  }
-  catch {}
-
-  for (const rawLine of trimmed.split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (!line || line.startsWith('event:') || line.startsWith(':')) continue
-    try {
-      return JSON.parse(line) as JsonRpcResponse
-    }
-    catch {}
-  }
-
-  throw new Error('Unable to parse MCP response payload')
-}
+/** Re-export shared parser for backward compatibility within the package. */
+export const parseMcpResponseText = sharedParseMcpResponseText
 
 async function readJsonRpcResponse(response: Response): Promise<JsonRpcResponse> {
   const text = await response.text()

@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type Database from 'better-sqlite3'
+import { extractClientIp, readBody, sendJson } from '@code-agent/shared/http'
 import type { ConsultChatHandler } from './chat-handler'
 import { RepoRepository } from '../db/repositories/repo.repo'
 
@@ -8,14 +9,6 @@ export interface RouteContext {
   chatHandler: ConsultChatHandler
   getLocalIp: () => string | null
   getPort: () => number
-}
-
-function extractClientIp(req: IncomingMessage): string {
-  const forwarded = req.headers['x-forwarded-for']
-  if (typeof forwarded === 'string') return forwarded.split(',')[0].trim()
-  if (Array.isArray(forwarded) && forwarded.length > 0) return forwarded[0].split(',')[0].trim()
-  const remote = req.socket.remoteAddress ?? 'unknown'
-  return remote.replace(/^::ffff:/, '')
 }
 
 type Handler = (req: IncomingMessage, res: ServerResponse, ctx: RouteContext) => void | Promise<void>
@@ -27,24 +20,15 @@ interface Route {
 }
 
 function json(res: ServerResponse, data: unknown, status = 200): void {
-  res.writeHead(status, { 'Content-Type': 'application/json' })
-  res.end(JSON.stringify(data))
+  sendJson(res, status, data)
 }
 
 function error(res: ServerResponse, message: string, status = 400): void {
-  json(res, { error: message }, status)
+  sendJson(res, status, { error: message })
 }
 
 function parseBody(req: IncomingMessage): Promise<Record<string, any>> {
-  return new Promise((resolve, reject) => {
-    let body = ''
-    req.on('data', (chunk) => { body += chunk })
-    req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}) }
-      catch { reject(new Error('Invalid JSON body')) }
-    })
-    req.on('error', reject)
-  })
+  return readBody<Record<string, any>>(req)
 }
 
 const routes: Route[] = [

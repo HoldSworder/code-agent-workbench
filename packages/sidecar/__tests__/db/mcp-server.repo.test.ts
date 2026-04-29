@@ -137,6 +137,117 @@ describe('McpServerRepository', () => {
     expect(updated.oauth_connected_at).toBe('2026-04-23T10:00:00.000Z')
   })
 
+  describe('Feishu Project MCP quick config', () => {
+    it('upsertFeishuProject inserts with fixed id and auto-flags it', () => {
+      const upserted = repo.upsertFeishuProject({
+        url: 'https://project.feishu.cn/openapi/mcp',
+        headers: { 'X-Tenant': 'wuhan' },
+      })
+      expect(upserted.id).toBe('feishu-project')
+      expect(upserted.transport).toBe('http')
+      expect(upserted.is_feishu_project).toBe(1)
+      expect(upserted.url).toBe('https://project.feishu.cn/openapi/mcp')
+      expect(JSON.parse(upserted.headers)).toEqual({ 'X-Tenant': 'wuhan' })
+
+      const flagged = repo.findFeishuProject()
+      expect(flagged?.id).toBe('feishu-project')
+    })
+
+    it('upsertFeishuProject updates existing flagged row in place (preserves id)', () => {
+      const original = repo.create({
+        name: 'lark-project',
+        transport: 'http',
+        url: 'https://old.example.com/mcp',
+      })
+      repo.setFeishuProject(original.id)
+
+      const updated = repo.upsertFeishuProject({
+        url: 'https://new.example.com/mcp',
+        headers: { Authorization: 'Bearer xyz' },
+        description: '已更新描述',
+      })
+
+      expect(updated.id).toBe(original.id)
+      expect(updated.url).toBe('https://new.example.com/mcp')
+      expect(updated.description).toBe('已更新描述')
+      expect(updated.is_feishu_project).toBe(1)
+      expect(JSON.parse(updated.headers)).toEqual({ Authorization: 'Bearer xyz' })
+
+      // 仍然只有一条标记位
+      const allFlagged = db.prepare('SELECT id FROM mcp_servers WHERE is_feishu_project = 1').all() as Array<{ id: string }>
+      expect(allFlagged).toHaveLength(1)
+      expect(allFlagged[0].id).toBe(original.id)
+    })
+
+    it('upsertFeishuProject clears stale flags on other rows when inserting', () => {
+      const orphan = repo.create({
+        name: 'orphan-http',
+        transport: 'http',
+        url: 'https://orphan.example.com/mcp',
+      })
+      // 直接绕开 setFeishuProject 制造一条"残留"标记位（模拟历史脏数据）
+      db.prepare('UPDATE mcp_servers SET is_feishu_project = 1 WHERE id = ?').run(orphan.id)
+      // 再删除其 flag 但保留它（不影响 insert path）
+      db.prepare('UPDATE mcp_servers SET is_feishu_project = 0 WHERE id = ?').run(orphan.id)
+
+      // 插入新固定 id 行；同时手动注入一条假"残留"
+      db.prepare(`
+        INSERT INTO mcp_servers (id, name, transport, url, is_feishu_project)
+        VALUES ('legacy-other', 'legacy-other', 'http', 'https://legacy.example.com/mcp', 1)
+      `).run()
+
+      const upserted = repo.upsertFeishuProject({
+        url: 'https://project.feishu.cn/openapi/mcp',
+      })
+      // 因为已有 is_feishu_project=1 行（legacy-other），upsert 走 update 分支，不会用固定 id
+      expect(upserted.id).toBe('legacy-other')
+      const flaggedRows = db.prepare('SELECT id FROM mcp_servers WHERE is_feishu_project = 1').all() as Array<{ id: string }>
+      expect(flaggedRows).toHaveLength(1)
+    })
+
+    it('deleteFeishuProject removes the flagged row and reports', () => {
+      repo.upsertFeishuProject({ url: 'https://x.com/mcp' })
+      const result = repo.deleteFeishuProject()
+      expect(result.deleted).toBe(true)
+      expect(result.id).toBe('feishu-project')
+      expect(repo.findFeishuProject()).toBeNull()
+      expect(repo.findById('feishu-project')).toBeUndefined()
+
+      const second = repo.deleteFeishuProject()
+      expect(second.deleted).toBe(false)
+      expect(second.id).toBeNull()
+    })
+
+    it('migrateLegacyLarkProject auto-flags legacy lark-project row', () => {
+      const legacy = repo.create({
+        name: 'lark-project',
+        transport: 'http',
+        url: 'https://legacy.example.com/mcp',
+      })
+      expect(legacy.is_feishu_project).toBe(0)
+
+      const result = repo.migrateLegacyLarkProject()
+      expect(result.migrated).toBe(true)
+      expect(result.id).toBe(legacy.id)
+      expect(repo.findFeishuProject()?.id).toBe(legacy.id)
+    })
+
+    it('migrateLegacyLarkProject is noop when already flagged', () => {
+      const a = repo.create({ name: 'lark-project', transport: 'http', url: 'https://a/mcp' })
+      repo.setFeishuProject(a.id)
+      const result = repo.migrateLegacyLarkProject()
+      expect(result.migrated).toBe(false)
+      expect(result.id).toBe(a.id)
+    })
+
+    it('migrateLegacyLarkProject is noop when no legacy row exists', () => {
+      repo.create({ name: 'unrelated', transport: 'http', url: 'https://unrelated/mcp' })
+      const result = repo.migrateLegacyLarkProject()
+      expect(result.migrated).toBe(false)
+      expect(result.id).toBeNull()
+    })
+  })
+
   it('clears oauth session without touching oauth registration', () => {
     const server = repo.create({
       name: 'oauth-mcp',

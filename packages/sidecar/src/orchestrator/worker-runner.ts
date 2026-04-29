@@ -1,3 +1,4 @@
+import { errorMessage } from '@code-agent/shared/util'
 import type { AgentProvider, PhaseContext, PhaseResult, RunOptions } from '../providers/types'
 import { createFeatureBranch, getCurrentBranch, git } from '../git/operations'
 import type { OrchestratorRepository } from './repository'
@@ -47,7 +48,7 @@ export async function runWorker(
     branchName = await createFeatureBranch(repoPath, slug, defaultBranch)
   }
   catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = errorMessage(err)
     repo.updateAssignmentStatus(assignment.id, 'failed', `branch creation failed: ${msg}`)
     repo.appendEvent(assignment.run_id, 'worker_failed', assignment.id, JSON.stringify({ error: msg }))
     return {
@@ -106,7 +107,7 @@ export async function runWorker(
     phaseResult = await provider.run(context, { onChunk: wrappedOnChunk })
   }
   catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = errorMessage(err)
     phaseResult = { status: 'failed', error: msg }
   }
   finally {

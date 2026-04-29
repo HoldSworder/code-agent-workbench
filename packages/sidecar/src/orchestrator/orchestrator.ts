@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3'
+import type { SniProxyPatch } from '@code-agent/shared/cli'
 import type { AgentProvider, RunOptions } from '../providers/types'
-import type { CliProviderConfig } from '../providers/cli.provider'
-import { ExternalCliProvider } from '../providers/cli.provider'
+import { createCliProvider, loadAgentRuntimeFromSettings } from '../providers/factory'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { OrchestratorRepository } from './repository'
 import { LeaderLoop } from './leader'
@@ -14,7 +14,7 @@ export interface OrchestratorOptions {
   teamYamlPath: string
   repoPath: string
   defaultBranch?: string
-  sniProxyPatch?: CliProviderConfig['sniProxyPatch']
+  sniProxyPatch?: SniProxyPatch
   onChunk?: RunOptions['onChunk']
   onEvent?: (event: string, data?: unknown) => void
 }
@@ -135,32 +135,13 @@ export class Orchestrator {
   // ── Provider factory (1A: independent from WorkflowEngine) ──
 
   private resolveProviderForRole(role: RoleConfig): AgentProvider {
-    const globalProvider = this.settings.get('agent.provider') ?? 'cursor-cli'
-    const globalModel = this.settings.get('agent.model') ?? undefined
-    const binaryPath = this.settings.get('agent.binaryPath') ?? undefined
-    const proxyEnabled = this.settings.get('proxy.enabled') === 'true'
-    const proxyUrl = proxyEnabled ? (this.settings.get('proxy.url') ?? undefined) : undefined
-
-    const provider = role.provider ?? globalProvider
-    const model = (role.model || undefined) ?? globalModel
-
-    if (proxyUrl) {
-      process.env.HTTP_PROXY = proxyUrl
-      process.env.HTTPS_PROXY = proxyUrl
-      process.env.ALL_PROXY = proxyUrl
-    }
-    else {
-      delete process.env.HTTP_PROXY
-      delete process.env.HTTPS_PROXY
-      delete process.env.ALL_PROXY
-    }
-
-    return new ExternalCliProvider({
-      type: provider as 'claude-code' | 'cursor-cli' | 'codex',
-      model,
-      binaryPath,
-      proxyUrl,
+    const runtime = loadAgentRuntimeFromSettings(this.settings, {
       sniProxyPatch: this.options.sniProxyPatch,
+    })
+    return createCliProvider({
+      runtime,
+      agentOverride: role.provider,
+      modelOverride: role.model || undefined,
     })
   }
 }

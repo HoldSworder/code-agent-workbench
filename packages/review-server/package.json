@@ -1,0 +1,29 @@
+{
+  "name": "@code-agent/review-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format esm --target node20 --no-splitting --external better-sqlite3",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "docker:build": "docker build -t code-agent-review-server:latest .",
+    "docker:run": "docker run --rm -p 4100:4100 -v $(pwd)/data:/data code-agent-review-server:latest"
+  },
+  "dependencies": {
+    "@code-agent/shared": "workspace:*",
+    "better-sqlite3": "^12.8.0",
+    "ws": "^8.18.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.0",
+    "@types/ws": "^8.5.13",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}

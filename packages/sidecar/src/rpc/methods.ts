@@ -7,6 +7,7 @@ import { MessageRepository } from '../db/repositories/message.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { spawn as spawnChild } from 'node:child_process'
+import { CliRunner, buildAgentEnv, buildSniProxyPatch, resolveBinary as resolveSharedBinary, type CliBackend } from '@code-agent/shared/cli'
 import { resolve, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -31,7 +32,7 @@ import {
 } from '../workflow-skills/registry'
 import type { WorkflowSkillMeta } from '../workflow-skills/types'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
-import type { CreateMcpServerInput, UpdateMcpServerInput } from '../db/repositories/mcp-server.repo'
+import type { CreateMcpServerInput, UpdateMcpServerInput, UpsertFeishuProjectInput } from '../db/repositories/mcp-server.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { OrchestratorRepository } from '../orchestrator/repository'
 import type { ConsultServer } from '../consult/server'
@@ -890,6 +891,34 @@ export function registerMethods(
     return { ok: true }
   })
 
+  server.register('mcp.setFeishuProject', async ({ id }: { id: string }) => {
+    return mcpServerRepo.setFeishuProject(id)
+  })
+  server.register('mcp.unsetFeishuProject', async () => {
+    mcpServerRepo.unsetFeishuProject()
+    return { ok: true }
+  })
+  server.register('mcp.getFeishuProject', async () => {
+    return mcpServerRepo.findFeishuProject()
+  })
+
+  // 快捷配置：用固定逻辑 id 落库 + 自动置 is_feishu_project 标记。
+  // 落库后立刻探测一次（与 mcp.create 行为一致），便于卡片显示连通状态。
+  server.register('mcp.upsertFeishuProject', async (params: UpsertFeishuProjectInput) => {
+    const upserted = mcpServerRepo.upsertFeishuProject(params)
+    try {
+      const { updated } = await probeAndPersistMcpServer(upserted.id)
+      return updated
+    }
+    catch {
+      return upserted
+    }
+  })
+
+  server.register('mcp.deleteFeishuProject', async () => {
+    return mcpServerRepo.deleteFeishuProject()
+  })
+
   // ── Settings ──
   server.register('settings.get', async ({ key }) => {
     return { value: settingsRepo.get(key) }
@@ -906,83 +935,13 @@ export function registerMethods(
   const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
 
   function buildModelListEnv(): Record<string, string> {
-    const env: Record<string, string> = {}
-    const parentNodeOptions = process.env.NODE_OPTIONS ?? ''
-    const hasSniPatchInParent = parentNodeOptions.includes('agent-socks5-patch')
-
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v == null) continue
-      if (k === 'NODE_OPTIONS' && !hasSniPatchInParent) continue
-      if (k.startsWith('npm_')) continue
-      if (k.startsWith('ELECTRON_')) continue
-      env[k] = v
-    }
-    env.NO_COLOR = '1'
-    env.TERM = 'dumb'
-
-    if (hasSniPatchInParent) {
-      delete env.HTTP_PROXY
-      delete env.HTTPS_PROXY
-      delete env.ALL_PROXY
-      delete env.http_proxy
-      delete env.https_proxy
-      delete env.all_proxy
-      return env
-    }
-
     const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
     const proxyUrl = proxyEnabled ? settingsRepo.get('proxy.url') : null
-    if (!proxyUrl) return env
-
-    if (existsSync(sniPatchPath)) {
-      let socks5Host = '127.0.0.1'
-      let socks5Port = '7890'
-      try {
-        const url = new URL(proxyUrl)
-        socks5Host = url.hostname || '127.0.0.1'
-        socks5Port = url.port || '7890'
-      }
-      catch {
-        const match = proxyUrl.match(/:(\d+)\s*$/)
-        if (match) socks5Port = match[1]
-      }
-      env.NODE_OPTIONS = `--require "${sniPatchPath}"`
-      env.AGENT_SOCKS5_HOST = socks5Host
-      env.AGENT_SOCKS5_PORT = socks5Port
-      delete env.HTTP_PROXY
-      delete env.HTTPS_PROXY
-      delete env.ALL_PROXY
-      delete env.http_proxy
-      delete env.https_proxy
-      delete env.all_proxy
-    }
-    else {
-      env.HTTP_PROXY = proxyUrl
-      env.HTTPS_PROXY = proxyUrl
-      env.ALL_PROXY = proxyUrl
-      env.http_proxy = proxyUrl
-      env.https_proxy = proxyUrl
-      env.all_proxy = proxyUrl
-    }
-
-    return env
-  }
-
-  function spawnListModels(binary: string, args: string[]): Promise<string> {
-    return new Promise((res, reject) => {
-      let stdout = ''
-      const child = spawnChild(binary, args, {
-        env: buildModelListEnv(),
-        stdio: ['ignore', 'pipe', 'pipe'],
-        shell: false,
-      })
-      const timer = setTimeout(() => {
-        child.kill('SIGTERM')
-        reject(new Error('timeout'))
-      }, 30_000)
-      child.stdout?.on('data', (d) => { stdout += String(d) })
-      child.on('error', (err) => { clearTimeout(timer); reject(err) })
-      child.on('close', () => { clearTimeout(timer); res(stdout) })
+    const useSniPatch = !!proxyUrl && existsSync(sniPatchPath)
+    return buildAgentEnv({
+      proxyUrl: useSniPatch ? null : proxyUrl,
+      sniProxyPatch: useSniPatch ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl: proxyUrl! }) : null,
+      extraEnv: { NO_COLOR: '1', TERM: 'dumb' },
     })
   }
 
@@ -998,20 +957,12 @@ export function registerMethods(
       .filter(m => m.id && m.id !== 'Available models')
   }
 
-  const defaultBinaries: Record<string, string> = {
-    'cursor-cli': 'agent',
-    'claude-code': 'claude',
-    'codex': 'codex',
-  }
-
   function resolveBinary(provider: string): string | null {
-    const fallback = defaultBinaries[provider]
-    if (!fallback) return null
+    const KNOWN: CliBackend[] = ['cursor-cli', 'claude-code', 'codex']
+    if (!KNOWN.includes(provider as CliBackend)) return null
     const globalProvider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
-    if (provider === globalProvider) {
-      return settingsRepo.get('agent.binaryPath') || fallback
-    }
-    return fallback
+    const override = provider === globalProvider ? settingsRepo.get('agent.binaryPath') : null
+    return resolveSharedBinary(provider as CliBackend, override)
   }
 
   function fetchCodexModels(binary: string): Promise<{ id: string, label: string }[]> {
@@ -1076,8 +1027,17 @@ export function registerMethods(
         const models = await fetchCodexModels(binary)
         return { models }
       }
-      const stdout = await spawnListModels(binary, ['--list-models'])
-      const models = parseModelList(stdout)
+      const result = await CliRunner.run({
+        binary,
+        args: ['--list-models'],
+        cwd: process.cwd(),
+        env: buildModelListEnv(),
+        useStreamJson: false,
+        timeoutMs: 30_000,
+        activityTimeoutMs: 30_000,
+      })
+      if (result.status !== 'success') return { models: [] }
+      const models = parseModelList(result.output)
       return { models }
     }
     catch {

@@ -1,4 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk'
+import type Anthropic from '@anthropic-ai/sdk'
+import { errorMessage } from '@code-agent/shared/util'
+import { callAnthropic, createLlmClient } from '@code-agent/shared/llm'
 import type { AgentProvider, PhaseContext, PhaseResult } from './types'
 import { buildSignalPrompt } from './signal-prompt'
 
@@ -15,10 +17,7 @@ export class ApiProvider implements AgentProvider {
   private cancelled = false
 
   constructor(config: ApiProviderConfig) {
-    this.client = new Anthropic({
-      apiKey: config.apiKey,
-      baseURL: config.baseUrl,
-    })
+    this.client = createLlmClient({ apiKey: config.apiKey, baseUrl: config.baseUrl })
     this._model = config.model
   }
 
@@ -32,31 +31,24 @@ export class ApiProvider implements AgentProvider {
     const userMessage = context.userMessage ?? '请开始执行此阶段的任务。'
 
     try {
-      const response = await this.client.messages.create({
+      const { text, usage } = await callAnthropic({
+        client: this.client,
         model: this._model,
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMessage }],
+        systemPrompt,
+        userPrompt: userMessage,
       })
 
       if (this.cancelled)
         return { status: 'cancelled' }
 
-      const text = response.content
-        .filter((block): block is Anthropic.TextBlock => block.type === 'text')
-        .map(block => block.text)
-        .join('\n')
-
       return {
         status: 'success',
         output: text,
-        tokenUsage:
-          response.usage.input_tokens + response.usage.output_tokens,
+        tokenUsage: usage.totalTokens,
       }
     }
     catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err)
-      return { status: 'failed', error: message }
+      return { status: 'failed', error: errorMessage(err) }
     }
   }
 

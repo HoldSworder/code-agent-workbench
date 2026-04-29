@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-shell'
 import { rpc } from '../composables/use-sidecar'
+import { FEISHU_PROJECT_MCP_ID } from '../composables/feishu-project-mcp'
 
 type McpTransport = 'stdio' | 'http' | 'sse'
 type McpLastTestStatus = 'success' | 'error' | null
@@ -93,6 +94,7 @@ interface RawMcpServer {
   oauth_redirect_mode?: McpOAuthRedirectMode
   oauth_last_error?: string | null
   oauth_connected_at?: string | null
+  is_feishu_project?: number
   created_at: string
   updated_at: string
 }
@@ -123,6 +125,7 @@ interface McpServer extends Omit<RawMcpServer, 'last_test_status' | 'last_test_e
   oauth_connected_at: string | null
   oauthMetadata: McpOAuthMetadata | null
   oauthRegistration: McpOAuthRegistration | null
+  is_feishu_project: number
 }
 
 interface McpTestResult {
@@ -199,6 +202,98 @@ const oauthErrors = ref(new Map<string, string>())
 const showJsonImport = ref(false)
 const jsonInput = ref('')
 const jsonError = ref('')
+
+// ── 飞书项目 MCP 快捷配置 ──
+const feishuProjectServer = computed<McpServer | null>(() => {
+  return servers.value.find(s => s.is_feishu_project === 1) ?? null
+})
+
+const feishuQuick = ref({
+  url: '',
+  headers: '',
+  description: '',
+})
+const feishuSaving = ref(false)
+const feishuTesting = ref(false)
+const feishuTestResult = ref<McpTestResult | null>(null)
+const feishuFormError = ref('')
+
+function syncFeishuQuickFromServer() {
+  const srv = feishuProjectServer.value
+  if (!srv) {
+    feishuQuick.value = { url: '', headers: '', description: '' }
+    return
+  }
+  feishuQuick.value = {
+    url: srv.url ?? '',
+    headers: srv.headers && srv.headers !== '{}' ? srv.headers : '',
+    description: srv.description ?? '',
+  }
+}
+
+async function saveFeishuProjectMcp() {
+  feishuFormError.value = ''
+  if (!feishuQuick.value.url.trim()) {
+    feishuFormError.value = '请填写飞书项目 MCP 的 URL'
+    return
+  }
+  let headersObj: Record<string, string> = {}
+  if (feishuQuick.value.headers.trim()) {
+    try {
+      headersObj = JSON.parse(feishuQuick.value.headers)
+    } catch {
+      feishuFormError.value = 'Headers 必须是合法 JSON 对象'
+      return
+    }
+  }
+
+  feishuSaving.value = true
+  try {
+    await rpc('mcp.upsertFeishuProject', {
+      url: feishuQuick.value.url.trim(),
+      headers: headersObj,
+      description: feishuQuick.value.description,
+    })
+    await loadData()
+    feishuTestResult.value = null
+  } catch (err) {
+    feishuFormError.value = (err as Error)?.message || '保存失败'
+  } finally {
+    feishuSaving.value = false
+  }
+}
+
+async function clearFeishuProjectMcp() {
+  if (!feishuProjectServer.value) return
+  if (!confirm('确认清除飞书项目 MCP 配置？\n该操作会从数据库删除这条 MCP，评审中心与分支回填都将不可用，直到重新填写。')) return
+  feishuSaving.value = true
+  try {
+    await rpc('mcp.deleteFeishuProject', {})
+    feishuTestResult.value = null
+    feishuFormError.value = ''
+    await loadData()
+  } catch (err) {
+    feishuFormError.value = (err as Error)?.message || '清除失败'
+  } finally {
+    feishuSaving.value = false
+  }
+}
+
+async function testFeishuProjectMcp() {
+  const srv = feishuProjectServer.value
+  if (!srv) return
+  feishuTesting.value = true
+  feishuTestResult.value = null
+  try {
+    const result = await rpc<McpTestResult>('mcp.test', { id: srv.id })
+    feishuTestResult.value = result
+    await loadData()
+  } catch (err) {
+    feishuTestResult.value = { ok: false, error: (err as Error)?.message || '测试失败' }
+  } finally {
+    feishuTesting.value = false
+  }
+}
 
 function parseJsonSafely<T>(value: string | null | undefined, fallback: T): T {
   if (!value) return fallback
@@ -293,6 +388,7 @@ function normalizeServer(raw: RawMcpServer): McpServer {
     capabilitySummary,
     oauthMetadata,
     oauthRegistration,
+    is_feishu_project: raw.is_feishu_project ?? 0,
   }
 }
 
@@ -578,7 +674,10 @@ async function loadData() {
   }
 }
 
-onMounted(loadData)
+onMounted(async () => {
+  await loadData()
+  syncFeishuQuickFromServer()
+})
 
 function openCreate() {
   editingServer.value = null
@@ -668,6 +767,24 @@ async function toggleServer(id: string) {
     console.error('Failed to toggle MCP server:', err)
   }
 }
+
+async function toggleFeishuProject(server: McpServer) {
+  try {
+    if (server.is_feishu_project) {
+      await rpc('mcp.unsetFeishuProject', {})
+    } else {
+      if (server.transport !== 'http') {
+        alert('仅 transport=http 的 MCP 可标记为飞书项目 MCP')
+        return
+      }
+      await rpc('mcp.setFeishuProject', { id: server.id })
+    }
+    await loadData()
+  } catch (err) {
+    console.error('Failed to set feishu project mcp:', err)
+    alert(`设置失败: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
 </script>
 
 <template>
@@ -701,6 +818,135 @@ async function toggleServer(id: string) {
         <div class="i-carbon-information w-3.5 h-3.5 mt-0.5 text-amber-500 shrink-0" />
         <div class="text-[11.5px] text-amber-700 dark:text-amber-400/90 leading-relaxed">
           <span class="font-medium">按需加载模式</span> — 此处注册的 MCP Server 不会全局常驻运行。它们仅在工作流阶段中被绑定时才会按需启动，任务结束后自动释放，避免不必要的资源占用。
+        </div>
+      </div>
+    </div>
+
+    <!-- 飞书项目 MCP 快捷配置卡片 -->
+    <div class="mb-5 rounded-xl bg-white dark:bg-[#28282c] shadow-sm shadow-black/[0.04] dark:shadow-none border border-amber-200/60 dark:border-amber-500/15 overflow-hidden">
+      <div class="px-4 py-3 bg-amber-50/60 dark:bg-amber-500/5 border-b border-amber-200/60 dark:border-amber-500/10 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="i-carbon-star-filled w-3.5 h-3.5 text-amber-500" />
+          <span class="text-[13px] font-semibold text-gray-800 dark:text-gray-100">飞书项目 MCP</span>
+          <span class="text-[10px] px-1.5 py-0.5 rounded font-medium bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
+            id={{ FEISHU_PROJECT_MCP_ID }}
+          </span>
+        </div>
+        <div class="flex items-center gap-1.5 text-[11px]">
+          <template v-if="feishuProjectServer">
+            <span
+              class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium"
+              :class="feishuProjectServer.last_test_status === 'success'
+                ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400'
+                : feishuProjectServer.last_test_status === 'error'
+                  ? 'bg-red-50 text-red-500 dark:bg-red-500/10 dark:text-red-400'
+                  : 'bg-gray-100 text-gray-500 dark:bg-white/5 dark:text-gray-400'"
+            >
+              <div
+                class="w-1.5 h-1.5 rounded-full"
+                :class="feishuProjectServer.last_test_status === 'success'
+                  ? 'bg-emerald-500'
+                  : feishuProjectServer.last_test_status === 'error'
+                    ? 'bg-red-500'
+                    : 'bg-gray-400'"
+              />
+              {{
+                feishuProjectServer.last_test_status === 'success'
+                  ? '已连通'
+                  : feishuProjectServer.last_test_status === 'error'
+                    ? '探测失败'
+                    : '尚未探测'
+              }}
+            </span>
+            <span v-if="!feishuProjectServer.enabled" class="text-rose-500">已禁用</span>
+          </template>
+          <span v-else class="text-gray-400">未配置</span>
+        </div>
+      </div>
+
+      <div class="px-4 py-4 space-y-3">
+        <p class="text-[11.5px] text-gray-500 dark:text-gray-400 leading-relaxed">
+          快捷入口固定逻辑 id 为 <code class="px-1 bg-gray-100 dark:bg-white/10 rounded font-mono">feishu-project</code>，保存即自动标记为「全局飞书项目 MCP」，被评审中心、故事点评估、分支回填统一引用。无需在下方列表里手动设标。
+        </p>
+
+        <div>
+          <label class="text-[12px] font-medium text-gray-500 mb-1 block">URL（streamable HTTP 端点）<span class="text-rose-500 ml-0.5">*</span></label>
+          <input
+            v-model="feishuQuick.url"
+            class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] font-mono border border-gray-200 dark:border-white/10 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
+            placeholder="https://project.feishu.cn/openapi/mcp"
+            spellcheck="false"
+          >
+        </div>
+
+        <div>
+          <label class="text-[12px] font-medium text-gray-500 mb-1 block">Headers (JSON object，可选)</label>
+          <input
+            v-model="feishuQuick.headers"
+            class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] font-mono border border-gray-200 dark:border-white/10 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
+            placeholder='{"Authorization": "Bearer ..."}'
+            spellcheck="false"
+          >
+        </div>
+
+        <div>
+          <label class="text-[12px] font-medium text-gray-500 mb-1 block">备注（可选）</label>
+          <input
+            v-model="feishuQuick.description"
+            class="w-full px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/5 text-[13px] border border-gray-200 dark:border-white/10 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-colors"
+            placeholder="例如 武汉电销空间"
+          >
+        </div>
+
+        <p v-if="feishuFormError" class="text-[11.5px] text-rose-500 leading-relaxed break-all">
+          {{ feishuFormError }}
+        </p>
+
+        <div v-if="feishuTestResult" class="text-[11.5px]">
+          <span v-if="feishuTestResult.ok" class="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+            <div class="i-carbon-checkmark-filled w-3 h-3" />
+            连通正常
+          </span>
+          <span v-else class="inline-flex items-center gap-1 text-rose-500 break-all">
+            <div class="i-carbon-close-filled w-3 h-3" />
+            {{ feishuTestResult.error || '连接失败' }}
+          </span>
+        </div>
+
+        <div class="flex items-center justify-between pt-1 gap-2 flex-wrap">
+          <p class="text-[11px] text-gray-400">
+            如需更细粒度的 OAuth / 探测能力详情，可在下方列表点击该 MCP 的「展开明细」。
+          </p>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="feishuProjectServer"
+              class="inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-gray-500 bg-gray-100 hover:bg-gray-200 dark:bg-white/5 dark:hover:bg-white/10 transition-colors disabled:opacity-50"
+              :disabled="feishuTesting || feishuSaving"
+              @click="testFeishuProjectMcp"
+            >
+              <div v-if="feishuTesting" class="w-3 h-3 border-2 border-gray-300 border-t-emerald-500 rounded-full animate-spin" />
+              <div v-else class="i-carbon-connection-signal w-3 h-3" />
+              {{ feishuTesting ? '测试中…' : '测试连通' }}
+            </button>
+            <button
+              v-if="feishuProjectServer"
+              class="inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-rose-500 bg-rose-50 hover:bg-rose-100 dark:bg-rose-500/10 dark:hover:bg-rose-500/15 transition-colors disabled:opacity-50"
+              :disabled="feishuSaving || feishuTesting"
+              @click="clearFeishuProjectMcp"
+            >
+              <div class="i-carbon-trash-can w-3 h-3" />
+              清除
+            </button>
+            <button
+              class="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium bg-indigo-500 text-white hover:bg-indigo-600 transition-colors shadow-sm shadow-indigo-500/20 disabled:opacity-50"
+              :disabled="!feishuQuick.url || feishuSaving"
+              @click="saveFeishuProjectMcp"
+            >
+              <div v-if="feishuSaving" class="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+              <div v-else class="i-carbon-save w-3 h-3" />
+              {{ feishuSaving ? '保存中…' : feishuProjectServer ? '保存修改' : '保存并标记' }}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -740,6 +986,14 @@ async function toggleServer(id: string) {
               <span class="text-[13px] font-medium text-gray-800 dark:text-gray-100 truncate">{{ server.name }}</span>
               <span class="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0" :class="transportColor[server.transport]">
                 {{ transportLabel[server.transport] }}
+              </span>
+              <span
+                v-if="server.is_feishu_project"
+                class="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300 inline-flex items-center gap-1"
+                title="该 MCP 已被标记为全局飞书项目 MCP，评审中心将通过它拉取迭代需求并回写故事点"
+              >
+                <div class="i-carbon-star-filled w-3 h-3" />
+                飞书项目 MCP
               </span>
             </div>
             <p v-if="server.description" class="text-[11px] text-gray-400 mt-0.5 truncate">{{ server.description }}</p>
@@ -841,6 +1095,29 @@ async function toggleServer(id: string) {
             >
               {{ oauthErrors.get(server.id) }}
             </p>
+
+            <div
+              v-if="server.transport === 'http' && !server.is_feishu_project"
+              class="mt-2 flex flex-wrap items-center gap-2"
+            >
+              <button
+                class="inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-medium transition-colors text-gray-500 bg-gray-100 hover:bg-gray-200 dark:bg-white/5 dark:hover:bg-white/10"
+                title="设为全局飞书项目 MCP（评审中心使用）"
+                @click="toggleFeishuProject(server)"
+              >
+                <div class="i-carbon-star w-3 h-3" />
+                设为飞书项目 MCP
+              </button>
+              <span class="text-[10px] text-gray-400 leading-relaxed">
+                推荐使用页面顶部「飞书项目 MCP」快捷卡片配置
+              </span>
+            </div>
+            <div
+              v-else-if="server.is_feishu_project"
+              class="mt-2 text-[10px] text-amber-600 dark:text-amber-300/80 leading-relaxed"
+            >
+              该 MCP 由顶部「飞书项目 MCP」快捷卡片管理，请在上方编辑/清除。
+            </div>
 
             <!-- Test result -->
             <Transition
@@ -1054,6 +1331,7 @@ async function toggleServer(id: string) {
               <div class="i-carbon-edit w-3.5 h-3.5" />
             </button>
             <button
+              v-if="!server.is_feishu_project"
               class="w-7 h-7 rounded-md flex items-center justify-center text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors"
               @click="deleteServer(server.id)"
             >

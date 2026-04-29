@@ -1,5 +1,18 @@
 import type Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
+import {
+  FEISHU_PROJECT_MCP_ID,
+  FEISHU_PROJECT_MCP_DEFAULT_NAME,
+  FEISHU_PROJECT_MCP_LEGACY_NAME,
+} from '../../review/feishu-mcp-id'
+
+export interface UpsertFeishuProjectInput {
+  url: string
+  headers?: Record<string, string>
+  name?: string
+  description?: string
+  enabled?: boolean
+}
 
 export interface McpServer {
   id: string
@@ -33,6 +46,7 @@ export interface McpServer {
   oauth_redirect_mode: 'deeplink' | 'loopback' | null
   oauth_last_error: string | null
   oauth_connected_at: string | null
+  is_feishu_project: number
   created_at: string
   updated_at: string
 }
@@ -317,5 +331,120 @@ export class McpServerRepository {
 
   delete(id: string): void {
     this.db.prepare('DELETE FROM mcp_servers WHERE id = ?').run(id)
+  }
+
+  /**
+   * 把指定 MCP 标记为"全局飞书项目 MCP"。事务保证全局唯一。
+   */
+  setFeishuProject(id: string): McpServer {
+    const target = this.findById(id)
+    if (!target) throw new Error(`MCP server not found: ${id}`)
+    if (target.transport !== 'http') throw new Error('仅 transport=http 的 MCP 可标记为飞书项目 MCP')
+
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE mcp_servers SET is_feishu_project = 0, updated_at = datetime('now') WHERE is_feishu_project = 1").run()
+      this.db.prepare("UPDATE mcp_servers SET is_feishu_project = 1, updated_at = datetime('now') WHERE id = ?").run(id)
+    })()
+
+    return this.findById(id)!
+  }
+
+  /**
+   * 取消"全局飞书项目 MCP"标记（任意时刻最多 1 条，因此不需要参数）。
+   */
+  unsetFeishuProject(): void {
+    this.db.prepare("UPDATE mcp_servers SET is_feishu_project = 0, updated_at = datetime('now') WHERE is_feishu_project = 1").run()
+  }
+
+  findFeishuProject(): McpServer | null {
+    const row = this.db.prepare('SELECT * FROM mcp_servers WHERE is_feishu_project = 1 LIMIT 1').get() as McpServer | undefined
+    return row ?? null
+  }
+
+  /**
+   * 飞书项目 MCP 快捷配置：
+   * - 已存在 is_feishu_project=1 记录 → 在该行上更新 url/headers/enabled/(name/description 可选)
+   * - 不存在 → 以固定 id `FEISHU_PROJECT_MCP_ID` 插入新行（transport=http, is_feishu_project=1）
+   * 全程在事务内执行；返回最新行。
+   */
+  upsertFeishuProject(input: UpsertFeishuProjectInput): McpServer {
+    if (!input.url || typeof input.url !== 'string')
+      throw new Error('飞书项目 MCP 必须提供 URL')
+
+    const headersJson = JSON.stringify(input.headers ?? {})
+    const enabledNum = input.enabled === false ? 0 : 1
+
+    const tx = this.db.transaction(() => {
+      const existing = this.findFeishuProject()
+      if (existing) {
+        const fields: string[] = ['url = ?', 'headers = ?', 'enabled = ?', 'transport = ?']
+        const values: unknown[] = [input.url, headersJson, enabledNum, 'http']
+        if (input.name !== undefined) { fields.push('name = ?'); values.push(input.name) }
+        if (input.description !== undefined) { fields.push('description = ?'); values.push(input.description) }
+        fields.push("updated_at = datetime('now')")
+        values.push(existing.id)
+        this.db.prepare(`UPDATE mcp_servers SET ${fields.join(', ')} WHERE id = ?`).run(...values)
+        return existing.id
+      }
+
+      // 不存在标记位记录：尝试用固定 id 插入；若 id 已被占用（极少见），回退 randomUUID
+      const collision = this.findById(FEISHU_PROJECT_MCP_ID)
+      const insertId = collision ? randomUUID() : FEISHU_PROJECT_MCP_ID
+
+      this.db.prepare(`
+        INSERT INTO mcp_servers (
+          id, name, description, transport, command, args, env, url, headers, enabled, is_feishu_project
+        )
+        VALUES (?, ?, ?, 'http', NULL, '[]', '{}', ?, ?, ?, 1)
+      `).run(
+        insertId,
+        input.name ?? FEISHU_PROJECT_MCP_DEFAULT_NAME,
+        input.description ?? '',
+        input.url,
+        headersJson,
+        enabledNum,
+      )
+      // 保证全局唯一标记（顺手清掉其他可能残留的标记位）
+      this.db.prepare(
+        "UPDATE mcp_servers SET is_feishu_project = 0, updated_at = datetime('now') WHERE is_feishu_project = 1 AND id != ?",
+      ).run(insertId)
+      return insertId
+    })
+
+    const id = tx()
+    return this.findById(id)!
+  }
+
+  /**
+   * 删除飞书项目 MCP（快捷卡片"清除"）：
+   * 优先按 is_feishu_project=1 找；找不到再按固定 id 找；都没有则 noop。
+   */
+  deleteFeishuProject(): { deleted: boolean, id: string | null } {
+    const target = this.findFeishuProject() ?? this.findById(FEISHU_PROJECT_MCP_ID) ?? null
+    if (!target) return { deleted: false, id: null }
+    this.db.prepare('DELETE FROM mcp_servers WHERE id = ?').run(target.id)
+    return { deleted: true, id: target.id }
+  }
+
+  /**
+   * 一次性迁移：兼容历史 v1 通过 `findByName('lark-project')` 定位的实现。
+   * - 若已有任意 is_feishu_project=1 记录 → noop
+   * - 否则若存在 name='lark-project' 且 transport='http' 的记录 → 给它置 is_feishu_project=1
+   * - 否则 → noop（保持"未配置"，由用户在快捷卡片里填）
+   */
+  migrateLegacyLarkProject(): { migrated: boolean, id: string | null } {
+    const flagged = this.findFeishuProject()
+    if (flagged) return { migrated: false, id: flagged.id }
+
+    const legacy = this.db.prepare(
+      'SELECT * FROM mcp_servers WHERE name = ? AND transport = ? LIMIT 1',
+    ).get(FEISHU_PROJECT_MCP_LEGACY_NAME, 'http') as McpServer | undefined
+
+    if (!legacy) return { migrated: false, id: null }
+
+    this.db.prepare(
+      "UPDATE mcp_servers SET is_feishu_project = 1, updated_at = datetime('now') WHERE id = ?",
+    ).run(legacy.id)
+    return { migrated: true, id: legacy.id }
   }
 }

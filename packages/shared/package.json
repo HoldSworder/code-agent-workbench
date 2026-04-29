@@ -1,0 +1,41 @@
+{
+  "name": "@code-agent/shared",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./util": "./src/util/index.ts",
+    "./http": "./src/http/index.ts",
+    "./db": "./src/db/index.ts",
+    "./cli": "./src/cli/index.ts",
+    "./llm": "./src/llm/index.ts",
+    "./lark": "./src/lark/index.ts",
+    "./mcp": "./src/mcp/index.ts"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/util/index.ts src/http/index.ts src/db/index.ts src/cli/index.ts src/llm/index.ts src/lark/index.ts src/mcp/index.ts --format esm --target node20 --no-splitting --dts --external better-sqlite3",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
+    "better-sqlite3": "^12.8.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "better-sqlite3": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.0",
+    "better-sqlite3": "^12.8.0",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}

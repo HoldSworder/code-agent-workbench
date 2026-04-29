@@ -476,6 +476,93 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       } as T
+    case 'review.checkLarkIdentity':
+      return {
+        installed: true,
+        loggedIn: true,
+        identity: {
+          userId: 'ou_mock_user_id',
+          userName: '开发模拟用户',
+          tokenStatus: 'valid',
+          expiresAt: null,
+          appId: 'cli_mock',
+        },
+        error: null,
+      } as T
+    case 'review.checkFeishuProjectMcp':
+      return {
+        configured: false,
+        healthy: false,
+        mcpId: null,
+        mcpName: null,
+        toolCount: null,
+        lastError: '浏览器 mock：尚未在 MCP 页面标记任何 MCP 为飞书项目 MCP',
+      } as T
+    case 'review.serverHealth':
+      return { healthy: false, error: '浏览器 mock：未启动评审中心服务' } as T
+    case 'mcp.setFeishuProject':
+    case 'mcp.unsetFeishuProject':
+    case 'mcp.getFeishuProject':
+      return { ok: true } as T
+    case 'mcp.upsertFeishuProject':
+      return {
+        id: 'feishu-project',
+        name: '飞书项目 MCP',
+        description: '',
+        transport: 'http',
+        command: null,
+        args: '[]',
+        env: '{}',
+        url: (params as any)?.url ?? 'https://project.feishu.cn/openapi/mcp',
+        headers: JSON.stringify((params as any)?.headers ?? {}),
+        enabled: 1,
+        is_feishu_project: 1,
+        last_test_status: null,
+        last_test_error: null,
+        last_tested_at: null,
+        capabilities_json: null,
+        capabilities_summary: null,
+        auth_type: null,
+        oauth_client_id: null,
+        oauth_scope: null,
+        oauth_audience: null,
+        oauth_token_endpoint_auth_method: null,
+        oauth_access_token: null,
+        oauth_refresh_token: null,
+        oauth_token_type: null,
+        oauth_expires_at: null,
+        oauth_id_token: null,
+        oauth_metadata_json: null,
+        oauth_registration_json: null,
+        oauth_auth_state: null,
+        oauth_redirect_mode: null,
+        oauth_last_error: null,
+        oauth_connected_at: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      } as T
+    case 'mcp.deleteFeishuProject':
+      return { deleted: true, id: 'feishu-project' } as T
+    case 'review.feishuDocCreate':
+      return { token: 'mock_token', url: 'https://feishu.cn/docx/mock_token' } as T
+    case 'review.feishuDocFetch':
+      return { content: '' } as T
+    case 'review.feishuDocOverwrite':
+    case 'review.feishuDocAppend':
+      return { ok: true } as T
+    case 'review.generateDevSpec':
+      return { content: '# 开发 Spec（mock）\n\n（浏览器 mock 模式）', upserted: null } as T
+    case 'review.evaluateStoryPoints':
+      return {
+        results: [
+          { role: 'frontend', points: 0, rationale: 'mock' },
+          { role: 'backend', points: 0, rationale: 'mock' },
+          { role: 'qa', points: 0, rationale: 'mock' },
+        ],
+        warnings: ['浏览器 mock 模式不会真实写入飞书或评审中心'],
+      } as T
+    case 'review.feishuProjectMcpCall':
+      return { result: null } as T
     default:
       console.warn(`Sidecar mock: unhandled RPC ${method}`)
       return undefined as T

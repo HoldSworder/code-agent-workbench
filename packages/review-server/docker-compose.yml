@@ -1,0 +1,13 @@
+services:
+  review-server:
+    build: .
+    image: code-agent-review-server:latest
+    container_name: code-agent-review-server
+    restart: unless-stopped
+    ports:
+      - "4100:4100"
+    volumes:
+      - ./data:/data
+    environment:
+      REVIEW_SERVER_PORT: "4100"
+      REVIEW_DB_PATH: "/data/review-server.db"

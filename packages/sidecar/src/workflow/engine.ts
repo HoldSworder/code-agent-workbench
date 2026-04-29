@@ -8,6 +8,7 @@ function elog(msg: string) {
   try { appendFileSync(LOG_FILE, `${new Date().toISOString()} [engine] ${msg}\n`) } catch {}
 }
 import type Database from 'better-sqlite3'
+import { errorMessage } from '@code-agent/shared/util'
 import type { AgentProvider, PhaseResult } from '../providers/types'
 import { buildPromptFromContext } from '../providers/cli.provider'
 import { parseWorkflow, findPhaseById, findPhaseInStages, flattenPhases, getLastMandatoryPhaseId } from './parser'
@@ -717,7 +718,7 @@ export class WorkflowEngine {
       }
     }
     catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err)
+      const errMsg = errorMessage(err)
       commitInfo = `，但自动提交失败：${errMsg}。请注意工作区仍有未提交的变更`
       elog(`suspendTask: git commit failed: ${err}`)
     }
@@ -1403,7 +1404,7 @@ export class WorkflowEngine {
     }
     catch (err: unknown) {
       this.activeRequirementProviders.delete(requirementId)
-      const errMsg = err instanceof Error ? err.message : String(err)
+      const errMsg = errorMessage(err)
       this.reqRepo.updateFetchError(requirementId, errMsg)
       this.reqRepo.updateStatus(requirementId, 'fetch_failed')
       elog(`startRequirementFetch: crashed for ${requirementId}: ${errMsg}`)
@@ -1910,7 +1911,7 @@ export class WorkflowEngine {
       this.activeProviders.delete(repoTaskId)
       this.liveOutputs.delete(repoTaskId)
       this.liveActivityLogs.delete(repoTaskId)
-      const errMsg = err instanceof Error ? err.message : String(err)
+      const errMsg = errorMessage(err)
 
       if (agentRunId)
         this.runRepo.finish(agentRunId, 'failed', undefined, errMsg)
@@ -1984,7 +1985,7 @@ export class WorkflowEngine {
     if (phase.id === 'create-branch') {
       this.syncBranchNameFromWorktree(repoTaskId)
       this.syncBranchToFeishuProject(repoTaskId).catch(err => {
-        elog(`syncBranchToFeishuProject failed: ${err instanceof Error ? err.message : String(err)}`)
+        elog(`syncBranchToFeishuProject failed: ${errorMessage(err)}`)
       })
     }
 
@@ -2171,13 +2172,13 @@ export class WorkflowEngine {
       this.taskRepo.updateChangeInfo(repoTaskId, actual, changeId, openspecPath)
     }
     catch (err) {
-      elog(`syncBranchName failed: ${err instanceof Error ? err.message : String(err)}`)
+      elog(`syncBranchName failed: ${errorMessage(err)}`)
     }
   }
 
   /**
    * create-branch 完成后，将分支名写入飞书项目工作项的"前端关联代码库"字段。
-   * 仅在需求关联了飞书项目链接且系统中配置了 lark-project MCP 时执行。
+   * 仅在需求关联了飞书项目链接且系统中已配置飞书项目 MCP（is_feishu_project=1）时执行。
    */
   private async syncBranchToFeishuProject(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
@@ -2194,9 +2195,9 @@ export class WorkflowEngine {
     const [, projectKey, workItemType, workItemId] = feishuMatch
     const branchName = task.branch_name
 
-    const mcpServer = this.mcpServerRepo.findByName('lark-project')
+    const mcpServer = this.mcpServerRepo.findFeishuProject()
     if (!mcpServer || !mcpServer.enabled || !mcpServer.url) {
-      elog(`syncBranchToFeishuProject: lark-project MCP not configured or disabled`)
+      elog('syncBranchToFeishuProject: 飞书项目 MCP 未配置或被禁用，请在 MCP 页快捷卡片中填写 URL')
       return
     }
 
@@ -2280,7 +2281,7 @@ export class WorkflowEngine {
       elog(`syncBranchToFeishuProject: updated work item ${workItemId} with repo=${matchedOptionId} branch=${branchName}`)
     }
     catch (err) {
-      elog(`syncBranchToFeishuProject: ${err instanceof Error ? err.message : String(err)}`)
+      elog(`syncBranchToFeishuProject: ${errorMessage(err)}`)
     }
   }
 

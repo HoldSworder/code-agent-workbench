@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { errorMessage } from '@code-agent/shared/util'
 import type { AgentProvider, PhaseContext, RunOptions } from '../providers/types'
 import type { OrchestratorRepository, RequirementForLeader } from './repository'
 import type { TeamConfig, LeaderDecision, RoleConfig } from './types'
@@ -139,7 +140,7 @@ export class LeaderLoop {
     repo.appendEvent(run.id, 'leader_started', null, JSON.stringify({ requirement: req.id }))
 
     this.executeLeader(req, run, leaderCwd).catch((err) => {
-      const errMsg = err instanceof Error ? err.message : String(err)
+      const errMsg = errorMessage(err)
       this.deps.onEvent?.('leader_execution_error', { error: errMsg, runId: run.id })
       try {
         repo.updateRunStatus(run.id, 'failed')
@@ -165,7 +166,7 @@ export class LeaderLoop {
           this.scheduleNext(hasMore ? 0 : this.deps.teamConfig.polling.interval_seconds * 1000)
       }
       catch (err) {
-        this.deps.onEvent?.('poll_error', { error: err instanceof Error ? err.message : String(err) })
+        this.deps.onEvent?.('poll_error', { error: errorMessage(err) })
         if (this.running && !signal.aborted)
           this.scheduleNext(this.deps.teamConfig.polling.interval_seconds * 1000)
       }
@@ -287,7 +288,7 @@ export class LeaderLoop {
     catch (err) {
       this.currentProvider = null
       providerFailed = true
-      providerError = err instanceof Error ? err.message : String(err)
+      providerError = errorMessage(err)
       repo.appendEvent(run.id, 'leader_agent_error', null, JSON.stringify({ error: providerError }))
       rawOutput = ''
     }

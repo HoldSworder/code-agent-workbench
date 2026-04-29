@@ -18,6 +18,7 @@ const router = createRouter({
     { path: '/mcp', component: () => import('./views/McpView.vue') },
     { path: '/orchestrator', component: () => import('./views/orchestrator/OrchestratorView.vue') },
     { path: '/consult', component: () => import('./views/ConsultView.vue') },
+    { path: '/review', component: () => import('./views/ReviewView.vue') },
     { path: '/settings', component: () => import('./views/Settings.vue') },
   ],
 })
