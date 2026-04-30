@@ -7,7 +7,7 @@
 
 ```
 桌面端 A (Tauri)                                ┌────────────────────────────┐
-  ├─ ReviewView.vue                            │   review-server (Docker)   │
+  ├─ ReviewListView/Bridge/SessionDetail       │   review-server (Docker)   │
   ├─ Sidecar (Node)                            │  ┌─────────────────────┐   │
   │   ├─ lark-cli auth/docs                    │  │  HTTP /api/*         │   │
   │   ├─ feishu-project MCP（HTTP streamable） │  │  WS /ws              │   │

@@ -10,6 +10,9 @@ export type { BuildCliArgsOptions, BuildCliArgsResult, CliMode } from './args'
 export { CliRunner } from './runner'
 export type { CliRunOptions, CliRunResult, CliRunStatus } from './runner'
 
+export { runCliSingleShot } from './single-shot'
+export type { RunCliSingleShotOptions, RunCliSingleShotResult } from './single-shot'
+
 export {
   normalizeLine,
   stripThinkTags,

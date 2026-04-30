@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import type { AgentRuntimeSettings } from '../providers/factory'
 import { llmCall } from './llm'
 
 export type Role = 'frontend' | 'backend' | 'qa'
@@ -12,11 +13,14 @@ export interface RoleResult {
 
 export interface EvaluateInput {
   requirementTitle: string
+  /** 仅前端 design.md 的 markdown 正文。 */
   specMarkdown: string
   /** 评估规则文件路径；不传则读取 workflows/shared/story-point-rules.md */
   rulesFilePath?: string
-  /** 上下文 cwd（默认 process.cwd()） */
+  /** 规则文件解析与 CLI 子进程 cwd（默认 process.cwd()）。 */
   cwd?: string
+  /** LLM runtime（CLI provider 或 custom-api），来自设置。 */
+  runtime: AgentRuntimeSettings
 }
 
 const ROLE_LABELS: Record<Role, string> = { frontend: '前端', backend: '后端', qa: '测试' }
@@ -56,7 +60,13 @@ export async function evaluateStoryPoints(input: EvaluateInput): Promise<RoleRes
     `# Dev-Spec\n\n${input.specMarkdown}`,
   ].join('\n\n---\n\n')
 
-  const raw = await llmCall({ systemPrompt: SYSTEM_PROMPT, userPrompt, maxTokens: 1200 })
+  const raw = await llmCall({
+    systemPrompt: SYSTEM_PROMPT,
+    userPrompt,
+    maxTokens: 1200,
+    runtime: input.runtime,
+    cwd: input.cwd,
+  })
   const parsed = safeParseJson(raw)
   if (!parsed || !Array.isArray(parsed.results)) {
     throw new Error(`AI 返回内容无法解析为评估结果: ${raw.slice(0, 200)}`)

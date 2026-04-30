@@ -4,6 +4,20 @@ export interface CallerIdentity {
   role?: string
 }
 
+/**
+ * HTTP 头部值必须是 ByteString（≤0xFF），中文姓名等非 ASCII 字符直接放进去会被
+ * `fetch`/undici 抛出 `Cannot convert argument to a ByteString`。统一对身份头做
+ * `encodeURIComponent`，配合 review-server 端 `readCallerIdentity` 的 try-decode，
+ * 既支持中文名又向后兼容旧的纯 ASCII 客户端。
+ *
+ * 已经是 ASCII 安全的字符串走 encodeURIComponent 几乎是恒等变换（仅极少数特殊字符
+ * 会被转义），不会破坏现有 open_id / role 字符串。
+ */
+export function encodeHeaderValue(value: string): string {
+  if (/^[\x20-\x7E]*$/.test(value)) return value
+  return encodeURIComponent(value)
+}
+
 export interface UpsertSpecInput {
   baseVersion?: number
   content: string
@@ -37,9 +51,9 @@ export class ReviewServerClient {
 
   private buildHeaders(identity: CallerIdentity): Record<string, string> {
     const h: Record<string, string> = { 'Content-Type': 'application/json' }
-    h['X-Lark-User-Id'] = identity.userId
-    h['X-Lark-User-Name'] = identity.userName
-    if (identity.role) h['X-Lark-Role'] = identity.role
+    h['X-Lark-User-Id'] = encodeHeaderValue(identity.userId)
+    h['X-Lark-User-Name'] = encodeHeaderValue(identity.userName)
+    if (identity.role) h['X-Lark-Role'] = encodeHeaderValue(identity.role)
     return h
   }
 

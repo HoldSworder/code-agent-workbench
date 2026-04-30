@@ -1,0 +1,106 @@
+---
+description: "@code-agent/shared 公共能力强制使用规范（CLI / LLM / lark-cli / MCP / Node HTTP / SQLite / 错误与 JSON / Prompt）"
+alwaysApply: true
+---
+
+# `@code-agent/shared` 公共能力规范
+
+本工作区的子进程编排、外部 SDK 调用、子系统集成已统一抽到 `packages/shared/`。
+**新增功能或修改既有逻辑时，凡涉及下述场景必须使用 / 维护这些公共组件，不允许新写一份本地实现。**
+
+## 强制使用清单（按场景定位入口）
+
+| 场景 | 必须使用 | 禁止 |
+|---|---|---|
+| spawn agent CLI（cursor-cli / claude-code / codex） | `@code-agent/shared/cli` 的 `CliRunner.run` + `buildCliArgs` + `buildAgentEnv` + `resolveBinary` | 直接 `child_process.spawn` 拼参数、自写 stream 解析 |
+| 解析 agent CLI stdout（think 标签 / activity / sessionId / token） | `stream-parse.ts` 导出的 `extractStreamText` / `extractActivityEntry` / `extractSessionId` / `extractTokenUsage` / `parseJsonOutput` | 在调用点重写正则、JSON 拆包逻辑 |
+| Anthropic SDK 客户端 / 单轮调用 | `@code-agent/shared/llm` 的 `createLlmClient` + `callAnthropic` | 直接 `new Anthropic()`、自己处理 `content[].text` 与 `usage` |
+| 调 `lark-cli` 子进程 | `@code-agent/shared/lark` 的 `runLarkCli` / `runLarkCliJson` / `isLarkCliInstalled` | 直接 `execFile('lark-cli', ...)`、自己解析 JSON 输出 |
+| 飞书云文档（Docx / Wiki）增删查改 | `@code-agent/shared/lark` 的 `createDoc` / `fetchDoc` / `overwriteDoc` / `appendDoc` / `fetchLarkDocContent` / `parseLarkDocUrl` | 在 sidecar 内重写文档操作逻辑 |
+| 检查 lark-cli 登录状态 | `getLarkAuthStatus` | 自己跑 `auth status` 解析 |
+| MCP HTTP 客户端（initialize / tools/call / notifications） | `@code-agent/shared/mcp` 的 `McpHttpSession` + `parseMcpResponseText` | 自写 fetch 序列、自己处理 SSE 包 |
+| Node 内置 HTTP 服务的请求/响应工具 | `@code-agent/shared/http` 的 `readBody` / `sendJson` / `sendError` / `parseRequest` / `applyCors` / `extractClientIp` | 重新写 chunk 拼接、JSON 解析、CORS 头 |
+| SQLite 连接 + pragma + schema apply | `@code-agent/shared/db` 的 `createSqliteConnection` | 直接 `new Database(...)` 后零散写 pragma |
+| 错误归一化为字符串 | `@code-agent/shared/util` 的 `errorMessage(err)` | `err instanceof Error ? err.message : String(err)` 这种重复内联 |
+| 容错 JSON 解析（含 markdown ```json 围栏） | `tryParseJson` / `tryParseJsonLoose` / `stripJsonFences` | 自己 try-catch JSON.parse |
+| 构造结构化 LLM prompt | `PromptBuilder` | 用模板字符串拼凑 system / user 段 |
+
+## sidecar 专属强约束
+
+1. **AgentProvider 实例化**：必须通过 `packages/sidecar/src/providers/factory.ts`
+   的 `loadAgentRuntimeFromSettings` + `createCliProvider` / `createApiProvider`，
+   不允许在新代码里直接 `new ExternalCliProvider(...)` 或 `new ApiProvider(...)`。
+   `WorkflowEngine.resolveProvider` 与 `Orchestrator.resolveProviderForRole` 是已有的两个统一入口。
+
+2. **代理副作用**：CLI provider 的代理通过 `buildAgentEnv` 注入子进程，
+   **不要在新增路径上重复写 `process.env.HTTP_PROXY = ...`**；
+   仅 ApiProvider（走 fetch）路径下需要由 `sidecar/src/index.ts` 的 `syncProcessProxyEnv` 统一同步，
+   其它地方不要写。
+
+3. **review-server HTTP 透传**：sidecar 调 review-server 必须通过
+   `packages/sidecar/src/review/client.ts` 的 `ReviewServerClient`，
+   新增的 endpoint 走「`ReviewServerClient` 加方法 → `rpc/review-methods.ts` 注册 RPC」两步，
+   不允许在 RPC handler 里直接 fetch。
+
+## 桌面端（apps/desktop）强约束
+
+- **不允许从桌面端直接 `fetch(reviewServerBaseUrl + ...)`**。
+  所有 review-server 交互必须通过 `rpc('review.xxx', { baseUrl, ... })` 走 sidecar。
+  现有入口：`review.listSessions` / `review.createSession` / `review.serverHealth` 等。
+- 如缺需要的 RPC，按上面 sidecar 第 3 条流程补，再在桌面端调用。
+
+## 修改公共组件的流程（红线）
+
+改 `packages/shared/` 下的导出 API 时必须：
+
+1. **先 grep 全部调用方**（典型路径：`packages/sidecar/src`、`packages/review-server/src`、`apps/desktop/src`），
+   评估破坏面；调用方多处时，**API 变更必须同步改全部 caller**，禁止留半套实现。
+2. **跑测试三连**：
+   - `pnpm --filter @code-agent/shared test`
+   - `pnpm --filter @code-agent/sidecar exec tsc --noEmit`
+   - `pnpm --filter @code-agent/desktop exec vue-tsc --noEmit`
+   sidecar 现有 14 个 baseline 失败用例与本规范无关，但**不允许在你的改动后新增失败**。
+   **额外的 build 烟测（不能跳）**：tsc/vitest 天然支持 `.ts`，无法暴露打包链问题；
+   `@code-agent/shared` 的 `package.json#exports` 指向 `.ts` 源文件，靠
+   `packages/sidecar/tsup.config.ts` 与 `packages/review-server/tsup.config.ts` 的
+   `noExternal: ['@code-agent/shared']` 把 shared 内联到 dist。改完务必：
+   - `pnpm --filter @code-agent/sidecar build && grep -c '@code-agent/shared' packages/sidecar/dist/index.js` 必须为 0
+   - `pnpm --filter @code-agent/review-server build && grep -c '@code-agent/shared' packages/review-server/dist/index.js` 必须为 0
+   - 启动 `node packages/sidecar/dist/index.js --project-root "$(pwd)"`，stderr 在 ~1 秒内出现 `sidecar: ready`
+   否则 desktop 端会卡在「正在启动服务…」（sidecar 子进程因 `ERR_UNKNOWN_FILE_EXTENSION` 静默崩溃）。
+3. **新增导出**必须同时：
+   - 在对应 `src/<module>/index.ts` 显式导出（保持类型 + 值分组）
+   - 在 `packages/shared/__tests__/<module>/` 添加单元测试
+   - 在 `packages/shared/package.json` 的 `exports` 字段里已声明 subpath（`./util` `./http` `./db` `./cli` `./llm` `./lark` `./mcp`）→ 不要新建 subpath 入口（如确需新建，必须同步更新 `package.json#scripts.build` 的 entry 列表）
+
+## 反例 / 触发提醒
+
+写出下列任一模式时立即停下，改用公共能力：
+
+- `child_process.spawn('cursor-agent', ...)` / `spawn('codex', ...)` / `spawn('lark-cli', ...)`
+- `new Anthropic({ apiKey, baseURL })`
+- `req.on('data', ...)` / `req.on('end', ...)` 自己拼 body
+- `res.writeHead(200, ...)` 后手写 JSON.stringify
+- `new Database(path)` 后再 `db.pragma('journal_mode=WAL')`
+- `fetch(reviewServerBaseUrl + '/api/...')`（在 `apps/` 下）
+- 自写正则提取 `<think>` 标签或 `session_id` 字段
+
+## 索引：包结构速查
+
+```
+packages/shared/src/
+  util/   errorMessage / tryParseJson / tryParseJsonLoose / stripJsonFences / PromptBuilder
+  http/   readBody / sendJson / sendError / parseRequest / applyCors / extractClientIp
+  db/     createSqliteConnection
+  cli/    CliRunner / buildCliArgs / buildAgentEnv / buildSniProxyPatch / resolveBinary
+          + stream-parse: extractStreamText / extractActivityEntry / extractSessionId
+                          / extractTokenUsage / parseStreamResult / parseJsonOutput
+                          / normalizeLine / stripThinkTags
+  llm/    createLlmClient / callAnthropic
+  lark/   parseLarkDocUrl / runLarkCli / runLarkCliJson / isLarkCliInstalled
+          / createDoc / fetchDoc / overwriteDoc / appendDoc / fetchLarkDocContent
+          / getLarkAuthStatus
+  mcp/    McpHttpSession / parseMcpResponseText
+```
+
+不确定该用哪个时，先 `Grep` 一下 `packages/shared/src` 看是否已有同义实现，再决定是新增还是复用。

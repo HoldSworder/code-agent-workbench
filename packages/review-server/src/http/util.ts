@@ -34,6 +34,20 @@ export interface CallerIdentity {
   role: string
 }
 
+/**
+ * HTTP 头按规范是 ByteString，中文姓名等非 ASCII 字符必须由客户端先做
+ * `encodeURIComponent`。这里 try-decode：解码成功则用解码值，解码失败（旧客户端
+ * 或非 URL 编码内容）则保留原值，保证向后兼容。
+ */
+function decodeHeaderValue(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  }
+  catch {
+    return value
+  }
+}
+
 export function readCallerIdentity(req: IncomingMessage): CallerIdentity | null {
   const userId = req.headers['x-lark-user-id']
   const userName = req.headers['x-lark-user-name']
@@ -41,8 +55,8 @@ export function readCallerIdentity(req: IncomingMessage): CallerIdentity | null 
   if (typeof userId !== 'string' || !userId) return null
   if (typeof userName !== 'string' || !userName) return null
   return {
-    userId,
-    userName,
-    role: typeof role === 'string' ? role : 'host',
+    userId: decodeHeaderValue(userId),
+    userName: decodeHeaderValue(userName),
+    role: typeof role === 'string' && role ? decodeHeaderValue(role) : 'host',
   }
 }

@@ -550,8 +550,21 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'review.feishuDocOverwrite':
     case 'review.feishuDocAppend':
       return { ok: true } as T
-    case 'review.generateDevSpec':
-      return { content: '# 开发 Spec（mock）\n\n（浏览器 mock 模式）', upserted: null } as T
+    case 'review.generateFrontendDesign':
+      return { content: '# 前端开发设计（mock）\n\n（浏览器 mock 模式）', upserted: null } as T
+    case 'review.fetchRequirementDoc':
+      return {
+        workItemUrl: '',
+        workItemId: 'mock',
+        projectKey: 'mock',
+        workItemType: 'story',
+        title: 'Mock 需求',
+        sourceType: 'title_only',
+        sourceFieldLabel: null,
+        docUrl: null,
+        content: '',
+        warnings: ['浏览器 mock 模式不会调用飞书项目 MCP'],
+      } as T
     case 'review.evaluateStoryPoints':
       return {
         results: [
