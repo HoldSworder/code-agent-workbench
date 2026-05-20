@@ -196,8 +196,9 @@ interface AgentProvider {
 
 - **团队定义**：`team.yaml` 声明角色、Provider、Prompt 模板
 - **任务分配**：Leader 输出 `<decision>` JSON，包含 `split` / `single_worker` / `blocked` 三种决策
-- **隔离执行**：每个 Worker 在独立 git worktree 中工作，互不干扰
-- **事件追踪**：所有编排事件（dispatched / assigned / completed / failed）写入 `orchestrator_events` 表
+- **隔离执行**：每个 Worker 在独立 git worktree 中工作（`<repo>/.worktrees/orchestrator-<assignment-id>/`），主仓库目录永不切分支；并发 worker 互不干扰
+- **扇入合并**：Worker 成功后通过 `git merge --no-ff` 把分支合入 RepoTask 的 main worktree；merge commit 记入 `assignment_commits` 表，支持 worker 级回滚（reset + cherry-pick 算法）
+- **事件追踪**：所有编排事件（dispatched / assigned / completed / failed / merge_conflict / heartbeat）写入 `orchestrator_events` 表
 
 ### 数据持久化
 

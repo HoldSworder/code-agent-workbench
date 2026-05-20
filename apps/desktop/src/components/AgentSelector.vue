@@ -25,15 +25,21 @@ const modelDropdownOpen = ref(false)
 const modelSearchQuery = ref('')
 const modelDropdownRef = ref<HTMLElement>()
 
-const cliProviders = [
-  { value: 'claude-code', label: 'Claude Code' },
+interface ProviderOption {
+  value: string
+  label: string
+  disabled?: boolean
+}
+
+const cliProviders: ProviderOption[] = [
   { value: 'cursor-cli', label: 'Cursor CLI' },
-  { value: 'codex', label: 'Codex' },
+  { value: 'claude-code', label: 'Claude Code', disabled: true },
+  { value: 'codex', label: 'Codex', disabled: true },
 ]
 
-const allProviders = computed(() =>
+const allProviders = computed<ProviderOption[]>(() =>
   props.showApiOption
-    ? [...cliProviders, { value: 'custom-api', label: 'Custom API' }]
+    ? [...cliProviders, { value: 'custom-api', label: 'Custom API', disabled: true }]
     : cliProviders,
 )
 
@@ -116,14 +122,18 @@ function switchToCustomInput() {
           v-for="p in allProviders"
           :key="p.value"
           type="button"
+          :disabled="p.disabled"
+          :title="p.disabled ? '暂未支持，敬请期待' : ''"
           class="flex items-center gap-2 text-left transition-all duration-150 rounded-lg border"
           :class="[
             provider === p.value
               ? 'border-indigo-500/40 bg-indigo-50/50 dark:bg-indigo-500/[0.06] ring-1 ring-indigo-500/20'
-              : 'border-gray-200 dark:border-white/[0.06] hover:border-gray-300 dark:hover:border-white/10 hover:bg-gray-50 dark:hover:bg-white/[0.02]',
+              : p.disabled
+                ? 'border-gray-200 dark:border-white/[0.06] opacity-50 cursor-not-allowed'
+                : 'border-gray-200 dark:border-white/[0.06] hover:border-gray-300 dark:hover:border-white/10 hover:bg-gray-50 dark:hover:bg-white/[0.02]',
             compact ? 'px-2.5 py-1.5' : 'px-3.5 py-3',
           ]"
-          @click="emit('update:provider', p.value)"
+          @click="!p.disabled && emit('update:provider', p.value)"
         >
           <div
             class="rounded-full border-2 transition-colors shrink-0"

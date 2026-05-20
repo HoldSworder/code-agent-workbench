@@ -129,19 +129,47 @@ Agent 之间不共享上下文。每个阶段启动全新的 Agent 进程，所�
 └── e2e-report.md      # E2E 报告（e2e 阶段产出）
 ```
 
+### 任务生命周期（worktree 创建 → 等待合并 → 清理）
+
+| 阶段 | 触发 | DB 状态 | 副作用 |
+|---|---|---|---|
+| 创建 | `task.create` RPC | `lifecycle_status='active'` | 用配置的 LLM provider 把需求标题翻译成 kebab-case 英文 slug → `git worktree add -b feature/<slug> .worktrees/<slug>` → 写入 DB → best-effort 飞书项目同步 |
+| 开发 | workflow phases 执行 | 同上 | Agent cwd 指向 worktree，正常推进各 phase |
+| 等待合并 | `archive-deploy` phase 完成 | `lifecycle_status='pending_merge'` | 已推送 origin + 创建 MR，但本地 worktree 与分支**保留**，方便处理 review 反馈 |
+| 清理 | 用户在 Dashboard 点「已合并，清理 worktree」 | `lifecycle_status='archived'` | 调 `task.cleanupAfterMerge`，校验本地 feature 分支已合入 default branch → `git worktree remove --force` → `git branch -d feature/<slug>` |
+
+slug 不满意时可调 `task.renameBranch` RPC（内部 `git branch -m feature/<new>`），不再需要单独的 `create-branch` workflow phase。
+
 ### 多任务隔离
 
-同一仓库下的多个 RepoTask 通过 **git worktree** 隔离：
+同一仓库下的多个 RepoTask 通过 **git worktree** 真实隔离（task.create 时调用 `git worktree add` 创建独立工作目录与分支）：
 
 ```
-{repo}/
-├── .worktrees/
-│   ├── {change-id-1}/    # Task 1 的工作目录
-│   └── {change-id-2}/    # Task 2 的工作目录（互不干扰）
-└── ... (主仓库)
+{repo}/                                # 主仓库始终停在 default branch，不参与任务工作
+├── .worktrees/                        # 由 .git/info/exclude 隐藏，不污染用户 .gitignore
+│   ├── {change-id-1}/                 # RepoTask 1 的 main worktree（branch = feature/{change-id-1}）
+│   ├── {change-id-2}/                 # RepoTask 2 的 main worktree（互不干扰）
+│   ├── orchestrator-{assignment-A}/   # Leader 拆分出的 worker A
+│   └── orchestrator-{assignment-B}/   # Leader 拆分出的 worker B
+└── ...
 ```
 
-Agent 的 `cwd` 指向对应 worktree 目录，多任务可并行执行。
+- Agent 的 `cwd` 指向对应 worktree 目录，多任务可并行执行
+- 每个 worker 完成后通过 `git merge --no-ff` 把自己的分支合回 RepoTask 的 main worktree，merge commit SHA 写入 `assignment_commits` 表
+- 任务最终交付的就是 main worktree 的分支 `feature/{change-id}`
+
+### 回滚机制（两层）
+
+| 层级 | 入口 RPC | 操作 |
+|---|---|---|
+| Phase | `workflow.rollback` / `workflow.rollbackPaused` / `workflow.rollbackToStage` | main worktree `git reset --hard <phase_sha>`，连带清理目标 phase 之后所有 worker worktree 与 `assignment_commits` 行 |
+| Worker | `workflow.rollbackAssignment` | main worktree reset 到该 worker 合并前 SHA，再 cherry-pick 之后其它 worker 的 merge commits；冲突时自动恢复，并提示改用 phase 级回滚 |
+
+`phase_commits` 始终是「线性历史上的一个点」，cherry-pick 重建后会更新 worker merge SHA，保持这个不变量。
+
+### 孤儿 worktree 清理
+
+`task.cleanupOrphanWorktrees` RPC 扫描所有仓库的 `.worktrees/`，把不在数据库中的目录强制 `git worktree remove --force`。
 
 ## 开发环境搭建
 
@@ -273,7 +301,9 @@ code-agent/                    # pnpm workspace root
 | `requirement.list` | — | 列出所有需求 |
 | `requirement.create` | `{ title, description, source, source_url? }` | 创建需求 |
 | `requirement.get` | `{ id }` | 获取需求详情 |
-| `task.create` | `{ requirementId, repoId }` | 创建任务（含 worktree） |
+| `task.create` | `{ requirementId, repoId }` | 创建任务：LLM 翻译标题为英文 slug，git worktree add 创建独立分支与目录 |
+| `task.renameBranch` | `{ taskId, newSlug }` | 重命名 feature 分支（用户对 LLM 生成的 slug 不满意时） |
+| `task.cleanupAfterMerge` | `{ taskId, force? }` | MR 合并后清理：移除 worktree + 删除本地 feature 分支 |
 | `task.listByRepo` | `{ repoId }` | 按仓库列出任务 |
 | `task.listByRequirement` | `{ requirementId }` | 按需求列出任务 |
 | `task.get` | `{ id }` | 获取任务详情 |

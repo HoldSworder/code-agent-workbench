@@ -28,6 +28,8 @@ export interface Assignment {
   acceptance_criteria: string | null
   worktree_path: string | null
   branch_name: string | null
+  main_worktree_path: string | null
+  repo_task_id: string | null
   status: string
   agent_provider: string | null
   agent_model: string | null
@@ -170,6 +172,45 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     }
   }
 
+  async function retryMergeAssignment(assignmentId: string) {
+    const result = await rpc('orchestrator.retryMergeAssignment', { assignmentId }) as { success: boolean, error?: string }
+    if (!result?.success && result?.error) {
+      // eslint-disable-next-line no-alert
+      alert(`合并仍冲突：${result.error}\n请到 worker worktree 解决后再次重试，或选择放弃。`)
+    }
+    if (selectedRun.value)
+      await fetchRunDetail(selectedRun.value.id)
+  }
+
+  async function dropAssignment(assignmentId: string) {
+    await rpc('orchestrator.dropAssignment', { assignmentId })
+    if (selectedRun.value)
+      await fetchRunDetail(selectedRun.value.id)
+  }
+
+  /**
+   * Worker-level rollback. Caller should locate the owning RepoTask first;
+   * for now we let sidecar look it up via assignment_commits.repo_task_id.
+   */
+  async function rollbackAssignment(assignmentId: string) {
+    // The sidecar method requires repoTaskId; we look it up from the
+    // assignment's run, then dispatch. If no repo task is wired (legacy run),
+    // the request is a no-op.
+    const a = selectedRunAssignments.value.find(x => x.id === assignmentId)
+    if (!a) return
+    // Best-effort: ask sidecar to look up by assignment_id directly.
+    const result = await rpc('workflow.rollbackAssignment', {
+      repoTaskId: (a as any).repo_task_id ?? '',
+      assignmentId,
+    }) as { ok: boolean, error?: string }
+    if (!result?.ok && result?.error) {
+      // eslint-disable-next-line no-alert
+      alert(`回滚失败：${result.error}\n建议改用阶段级回滚。`)
+    }
+    if (selectedRun.value)
+      await fetchRunDetail(selectedRun.value.id)
+  }
+
   const agentOutputs = ref<Map<string, { content: string, totalLength: number }>>(new Map())
 
   async function fetchAgentOutput(runId: string, assignmentId?: string) {
@@ -269,6 +310,9 @@ export const useOrchestratorStore = defineStore('orchestrator', () => {
     rejectRun,
     retryRun,
     retryAssignment,
+    rollbackAssignment,
+    retryMergeAssignment,
+    dropAssignment,
     agentOutputs,
     fetchAgentOutput,
     getAgentOutput,

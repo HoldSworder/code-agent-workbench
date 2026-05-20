@@ -15,7 +15,11 @@ import { existsSync, writeFileSync, readFileSync } from 'node:fs'
 import { stringify as yamlStringify } from 'yaml'
 import type { WorkflowEngine } from '../workflow/engine'
 import { parseWorkflow } from '../workflow/parser'
-import { getChangedFiles, getFileDiff, getMergeBase } from '../git/operations'
+import { getChangedFiles, getFileDiff, getMergeBase, git, createWorktree, removeWorktree, listWorktrees, ensureLocalExclude, detectDefaultBranch, renameCurrentBranch, isBranchMergedInto, deleteBranch } from '../git/operations'
+import { llmCall } from '../review/llm'
+import { BRANCH_SLUG_SYSTEM_PROMPT, normalizeSlug } from '@code-agent/shared/llm'
+import { loadAgentRuntimeFromSettings } from '../providers/factory'
+import { errorMessage } from '@code-agent/shared/util'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 import { readTranscript, listSessionsForRepo } from '../transcript/reader'
 import { scanAllSkills, readSkillContent, enableSkill, disableSkill, ENV_LABELS } from '../skill/scanner'
@@ -32,7 +36,7 @@ import {
 } from '../workflow-skills/registry'
 import type { WorkflowSkillMeta } from '../workflow-skills/types'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
-import type { CreateMcpServerInput, UpdateMcpServerInput, UpsertFeishuProjectInput } from '../db/repositories/mcp-server.repo'
+import type { CreateMcpServerInput, UpdateMcpServerInput } from '../db/repositories/mcp-server.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { OrchestratorRepository } from '../orchestrator/repository'
 import type { ConsultServer } from '../consult/server'
@@ -46,26 +50,28 @@ const __dirname = dirname(__filename)
 const projectRoot = resolve(__dirname, '../../..')
 
 /**
- * 生成初始 changeId（占位符）。
- * 实际语义化英文分支名由 create-branch workflow phase 的 agent 决定，
- * engine 会在该 phase 完成后通过 syncBranchNameFromWorktree 回写。
+ * 通过用户已配置的 LLM runtime（CLI provider 或 custom-api）将中文需求标题
+ * 翻译/规范化为 kebab-case 英文 slug。
+ *
+ * 失败语义：所有异常向上抛，由 task.create 决定回滚还是兜底。
  */
-function changeIdFromRequirement(title: string, description?: string): string {
-  const text = (title || description || '').trim()
-  const slug = text
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-
-  const suffix = Date.now().toString(36).slice(-4)
-
-  if (!slug)
-    return `change-${suffix}`
-
-  const truncated = slug.slice(0, 40).replace(/-$/, '')
-  return `${truncated}-${suffix}`
+async function generateChangeIdViaLlm(
+  title: string,
+  description: string | undefined,
+  runtime: ReturnType<typeof loadAgentRuntimeFromSettings>,
+  cwd: string,
+): Promise<string> {
+  const userPrompt = description?.trim()
+    ? `Title: ${title}\nDescription: ${description}`
+    : title
+  const text = await llmCall({
+    systemPrompt: BRANCH_SLUG_SYSTEM_PROMPT,
+    userPrompt,
+    maxTokens: 64,
+    runtime,
+    cwd,
+  })
+  return normalizeSlug(text)
 }
 
 export function registerMethods(
@@ -257,6 +263,10 @@ export function registerMethods(
     const tasks = taskRepo.findByRequirementId(id)
     for (const task of tasks) {
       await engine.cancelCurrentAgent(task.id).catch(() => {})
+      const repo = repoRepo.findById(task.repo_id)
+      if (repo && task.worktree_path && task.worktree_path !== repo.local_path) {
+        await removeWorktree(repo.local_path, task.worktree_path).catch(() => {})
+      }
     }
     taskRepo.deleteByRequirementId(id)
     orchestratorRepo.deleteByRequirementId(id)
@@ -321,21 +331,147 @@ export function registerMethods(
       if (!repo)
         throw new Error(`Repo not found: ${params.repoId}`)
 
-      const changeId = changeIdFromRequirement(requirement.title, requirement.description)
+      // Detect canonical default branch (handles master / main / custom) and
+      // write back to repos table if it differs from what the user registered.
+      let detectedBranch = repo.default_branch
+      try {
+        detectedBranch = await detectDefaultBranch(repo.local_path)
+        if (detectedBranch !== repo.default_branch)
+          repoRepo.update(repo.id, { default_branch: detectedBranch })
+      }
+      catch { /* keep DB value */ }
+
+      // Resolve baseSha: prefer remote default branch, fall back to local.
+      let baseSha: string | null = null
+      try { baseSha = await git(repo.local_path, ['rev-parse', `origin/${detectedBranch}`]) }
+      catch {
+        try { baseSha = await git(repo.local_path, ['rev-parse', detectedBranch]) }
+        catch { baseSha = null }
+      }
+      if (!baseSha)
+        throw new Error(`Cannot resolve base sha for ${detectedBranch} in ${repo.local_path}`)
+
+      // Generate semantic English slug via configured LLM runtime.
+      // 失败直接抛错——所有工作流都依赖 LLM，用户已配置 provider 不应失败；
+      // 若运行时确实不可用，前端会展示错误并允许重试。
+      const runtime = loadAgentRuntimeFromSettings(settingsRepo)
+      const slug = await generateChangeIdViaLlm(
+        requirement.title,
+        requirement.description,
+        runtime,
+        repo.local_path,
+      )
+      const changeId = slug
       const branchName = `feature/${changeId}`
       const openspecPath = `openspec/changes/${changeId}`
 
-      return taskRepo.create({
+      const worktreePath = join(repo.local_path, '.worktrees', changeId)
+      // Hide internal worktree directory from main repo's git status.
+      await ensureLocalExclude(repo.local_path, '.worktrees/')
+
+      try {
+        await createWorktree(repo.local_path, worktreePath, branchName, baseSha)
+      }
+      catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        throw new Error(`Failed to create worktree at ${worktreePath}: ${msg}`)
+      }
+
+      const task = taskRepo.create({
         requirement_id: requirement.id,
         repo_id: repo.id,
         branch_name: branchName,
         change_id: changeId,
         openspec_path: openspecPath,
-        worktree_path: repo.local_path,
+        worktree_path: worktreePath,
+        base_sha: baseSha,
         workflow_id: params.workflowId,
       })
+      // Seed phase_commits INITIAL_PHASE_ID so downstream rollback chain has an
+      // anchor without depending on getMergeBase against remote.
+      try { commitRepo.save(task.id, INITIAL_PHASE_ID, baseSha) } catch {}
+
+      // Best-effort 飞书项目同步：失败仅 elog，不阻塞任务创建。
+      engine.syncBranchToFeishuProject(task.id).catch(() => {})
+
+      return task
     },
   )
+
+  // Rename the feature branch of an existing task. Used when user is not
+  // satisfied with the auto-generated slug, or to recover from invalid name.
+  server.register(
+    'task.renameBranch',
+    async ({ taskId, newSlug }: { taskId: string, newSlug: string }) => {
+      const task = taskRepo.findById(taskId)
+      if (!task) throw new Error(`Task not found: ${taskId}`)
+      const normalized = normalizeSlug(newSlug)
+      const newBranch = `feature/${normalized}`
+      if (newBranch === task.branch_name) return { task, changed: false }
+      await renameCurrentBranch(task.worktree_path, newBranch)
+      const newOpenspecPath = `openspec/changes/${normalized}`
+      taskRepo.updateChangeInfo(taskId, newBranch, normalized, newOpenspecPath)
+      const updated = taskRepo.findById(taskId)
+      return { task: updated, changed: true }
+    },
+  )
+
+  // 任务完成 MR 合并后清理 worktree + 本地分支。
+  // 校验链：分支已合入 default branch → removeWorktree → branch -D（已合则用 -d）。
+  server.register(
+    'task.cleanupAfterMerge',
+    async ({ taskId, force }: { taskId: string, force?: boolean }) => {
+      const task = taskRepo.findById(taskId)
+      if (!task) throw new Error(`Task not found: ${taskId}`)
+      const repo = repoRepo.findById(task.repo_id)
+      if (!repo) throw new Error(`Repo not found: ${task.repo_id}`)
+
+      const targetBranch = repo.default_branch
+      const merged = await isBranchMergedInto(repo.local_path, task.branch_name, targetBranch)
+      if (!merged && !force) {
+        throw new Error(
+          `分支 ${task.branch_name} 尚未合入 ${targetBranch}（远端 origin/${targetBranch} 也未包含）。`
+          + ` 请等待 MR 合并后重试，或传 force=true 强制清理。`,
+        )
+      }
+
+      await removeWorktree(repo.local_path, task.worktree_path).catch(err => {
+        process.stderr.write(`[sidecar] task.cleanupAfterMerge: removeWorktree failed: ${errorMessage(err)}\n`)
+      })
+      try {
+        await deleteBranch(repo.local_path, task.branch_name, !merged)
+      }
+      catch (err) {
+        process.stderr.write(`[sidecar] task.cleanupAfterMerge: deleteBranch failed: ${errorMessage(err)}\n`)
+      }
+
+      taskRepo.markArchived(taskId)
+      return { ok: true, merged }
+    },
+  )
+
+  // Orphan worktree cleanup: drop directories under <repo>/.worktrees/ that
+  // no longer correspond to any active RepoTask in DB.
+  server.register('task.cleanupOrphanWorktrees', async () => {
+    const repos = repoRepo.findAll()
+    const removed: Array<{ repo: string, path: string }> = []
+    for (const repo of repos) {
+      let entries: Awaited<ReturnType<typeof listWorktrees>> = []
+      try { entries = await listWorktrees(repo.local_path) }
+      catch { continue }
+      const liveTasks = new Set(
+        taskRepo.findByRepoId(repo.id).map(t => t.worktree_path),
+      )
+      for (const e of entries) {
+        if (e.path === repo.local_path) continue
+        if (!e.path.includes(`${repo.local_path}/.worktrees/`)) continue
+        if (liveTasks.has(e.path)) continue
+        await removeWorktree(repo.local_path, e.path).catch(() => {})
+        removed.push({ repo: repo.id, path: e.path })
+      }
+    }
+    return { removed }
+  })
 
   server.register('task.getLiveOutput', async ({ repoTaskId }) => {
     return {
@@ -509,6 +645,22 @@ export function registerMethods(
       process.stderr.write(`[workflow] rollbackPaused to ${targetStageId}/${targetPhaseId} failed for ${repoTaskId}: ${err}\n`)
     })
     return { ok: true }
+  })
+  server.register('workflow.rollbackAssignment', async ({ repoTaskId, assignmentId }) => {
+    try {
+      await engine.rollbackAssignment(repoTaskId, assignmentId)
+      return { ok: true }
+    }
+    catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(`[workflow] rollbackAssignment ${assignmentId} failed for ${repoTaskId}: ${msg}\n`)
+      return { ok: false, error: msg }
+    }
+  })
+  server.register('task.listAssignmentCommits', async ({ repoTaskId }) => {
+    const { AssignmentCommitRepository } = await import('../db/repositories/assignment-commit.repo')
+    const repoX = new AssignmentCommitRepository(db)
+    return repoX.findByTask(repoTaskId)
   })
   server.register('workflow.rollbackToMessage', async ({ repoTaskId, messageId }) => {
     engine.rollbackToMessage(repoTaskId, messageId).catch((err) => {
@@ -889,34 +1041,6 @@ export function registerMethods(
   server.register('mcp.setBindings', async ({ stageId, phaseId, mcpServerIds }: { stageId: string, phaseId: string, mcpServerIds: string[] }) => {
     mcpBindingRepo.setBindings(stageId, phaseId, mcpServerIds)
     return { ok: true }
-  })
-
-  server.register('mcp.setFeishuProject', async ({ id }: { id: string }) => {
-    return mcpServerRepo.setFeishuProject(id)
-  })
-  server.register('mcp.unsetFeishuProject', async () => {
-    mcpServerRepo.unsetFeishuProject()
-    return { ok: true }
-  })
-  server.register('mcp.getFeishuProject', async () => {
-    return mcpServerRepo.findFeishuProject()
-  })
-
-  // 快捷配置：用固定逻辑 id 落库 + 自动置 is_feishu_project 标记。
-  // 落库后立刻探测一次（与 mcp.create 行为一致），便于卡片显示连通状态。
-  server.register('mcp.upsertFeishuProject', async (params: UpsertFeishuProjectInput) => {
-    const upserted = mcpServerRepo.upsertFeishuProject(params)
-    try {
-      const { updated } = await probeAndPersistMcpServer(upserted.id)
-      return updated
-    }
-    catch {
-      return upserted
-    }
-  })
-
-  server.register('mcp.deleteFeishuProject', async () => {
-    return mcpServerRepo.deleteFeishuProject()
   })
 
   // ── Settings ──

@@ -157,7 +157,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         },
         state_inference: {
           rules: [
-            { condition: 'no_change_dir', stage: 'planning', phase: 'create-branch', description: '无变更目录 → 先创建 feature 分支' },
+            { condition: 'no_change_dir', stage: 'planning', phase: 'spec-create', description: '无变更目录 → 直接进入 Spec 落盘（worktree 由 sidecar 在 task.create 时创建）' },
             { condition: 'has_proposal_and_specs_no_tasks', stage: 'planning', phase: 'task-breakdown', description: '有 proposal + specs 但无 tasks → 任务拆分' },
             { condition: 'tasks_has_unchecked', stage: 'development', phase: 'tdd-dev', description: 'tasks.md 有未勾选项 → 代码开发' },
             { condition: 'e2e_report_pass', stage: 'release', phase: 'archive-deploy', description: 'e2e-report 通过 → 可归档发布' },
@@ -171,7 +171,6 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         ],
         stages: [
           { id: 'planning', name: '任务规划', gate: 'has_tasks', phases: [
-            { id: 'create-branch', name: '创建分支', provider: 'external-cli', skill: 'skills/frontend/create-branch.md', requires_confirm: false, entry_gate: 'working_tree_clean' },
             { id: 'spec-create', name: 'Spec 落盘', provider: 'external-cli', skill: 'skills/frontend/spec-create.md', requires_confirm: true, invoke_commands: ['openspec new change "{{change_id}}"'], guardrails: ['no_openspec_write_before_confirm'], confirm_files: ['{{openspec_path}}/proposal.md', '{{openspec_path}}/specs/*/spec.md'] },
             { id: 'task-breakdown', name: '任务拆分', provider: 'external-cli', skill: 'skills/frontend/task-breakdown.md', requires_confirm: true, invoke_commands: ['openspec instructions tasks --change "{{change_id}}"'] },
             { id: 'task-validate', name: '任务验证', provider: 'external-cli', skill: 'skills/frontend/task-validate.md', requires_confirm: false, invoke_commands: ['openspec validate "{{change_id}}"'] },
@@ -489,60 +488,18 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         },
         error: null,
       } as T
-    case 'review.checkFeishuProjectMcp':
+    case 'feishuProject.checkAuth':
       return {
-        configured: false,
-        healthy: false,
-        mcpId: null,
-        mcpName: null,
-        toolCount: null,
-        lastError: '浏览器 mock：尚未在 MCP 页面标记任何 MCP 为飞书项目 MCP',
+        installed: false,
+        authenticated: false,
+        host: null,
+        expiresInMinutes: null,
+        error: '浏览器 mock：未检测到 meegle CLI',
       } as T
+    case 'feishuProject.listViewItems':
+      return { items: [], pageNum: 1, hasMore: false, total: 0, rawSnippet: null } as T
     case 'review.serverHealth':
       return { healthy: false, error: '浏览器 mock：未启动评审中心服务' } as T
-    case 'mcp.setFeishuProject':
-    case 'mcp.unsetFeishuProject':
-    case 'mcp.getFeishuProject':
-      return { ok: true } as T
-    case 'mcp.upsertFeishuProject':
-      return {
-        id: 'feishu-project',
-        name: '飞书项目 MCP',
-        description: '',
-        transport: 'http',
-        command: null,
-        args: '[]',
-        env: '{}',
-        url: (params as any)?.url ?? 'https://project.feishu.cn/openapi/mcp',
-        headers: JSON.stringify((params as any)?.headers ?? {}),
-        enabled: 1,
-        is_feishu_project: 1,
-        last_test_status: null,
-        last_test_error: null,
-        last_tested_at: null,
-        capabilities_json: null,
-        capabilities_summary: null,
-        auth_type: null,
-        oauth_client_id: null,
-        oauth_scope: null,
-        oauth_audience: null,
-        oauth_token_endpoint_auth_method: null,
-        oauth_access_token: null,
-        oauth_refresh_token: null,
-        oauth_token_type: null,
-        oauth_expires_at: null,
-        oauth_id_token: null,
-        oauth_metadata_json: null,
-        oauth_registration_json: null,
-        oauth_auth_state: null,
-        oauth_redirect_mode: null,
-        oauth_last_error: null,
-        oauth_connected_at: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      } as T
-    case 'mcp.deleteFeishuProject':
-      return { deleted: true, id: 'feishu-project' } as T
     case 'review.feishuDocCreate':
       return { token: 'mock_token', url: 'https://feishu.cn/docx/mock_token' } as T
     case 'review.feishuDocFetch':
@@ -563,7 +520,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         sourceFieldLabel: null,
         docUrl: null,
         content: '',
-        warnings: ['浏览器 mock 模式不会调用飞书项目 MCP'],
+        warnings: ['浏览器 mock 模式不会调用 meegle CLI'],
       } as T
     case 'review.evaluateStoryPoints':
       return {
@@ -574,8 +531,6 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         ],
         warnings: ['浏览器 mock 模式不会真实写入飞书或评审中心'],
       } as T
-    case 'review.feishuProjectMcpCall':
-      return { result: null } as T
     default:
       console.warn(`Sidecar mock: unhandled RPC ${method}`)
       return undefined as T

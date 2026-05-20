@@ -13,6 +13,12 @@ export interface Requirement {
   fetch_prompt: string | null
   fetch_cli_type: string | null
   fetch_model: string | null
+  /**
+   * 飞书项目「描述/需求文档/SPEC文档」三件套的原始值（JSON 字符串）。
+   * 形如 `{ "description": "...", "requirementDocUrl": "https://...", "specDocUrl": "https://..." }`。
+   * source=feishu 才会被填充；其它来源永远为 null。
+   */
+  feishu_fields_json: string | null
   status: string
   mode: string
   created_at: string
@@ -60,13 +66,20 @@ export class RequirementRepository {
       .all() as Requirement[]
   }
 
-  update(id: string, data: { title?: string, description?: string, doc_url?: string | null, mode?: string }): void {
+  update(id: string, data: {
+    title?: string
+    description?: string
+    doc_url?: string | null
+    mode?: string
+    feishu_fields_json?: string | null
+  }): void {
     const sets: string[] = []
     const values: (string | null)[] = []
     if (data.title !== undefined) { sets.push('title = ?'); values.push(data.title) }
     if (data.description !== undefined) { sets.push('description = ?'); values.push(data.description) }
     if (data.doc_url !== undefined) { sets.push('doc_url = ?'); values.push(data.doc_url) }
     if (data.mode !== undefined) { sets.push('mode = ?'); values.push(data.mode) }
+    if (data.feishu_fields_json !== undefined) { sets.push('feishu_fields_json = ?'); values.push(data.feishu_fields_json) }
     if (sets.length === 0) return
     values.push(id)
     this.db.prepare(`UPDATE requirements SET ${sets.join(', ')} WHERE id = ?`).run(...values)

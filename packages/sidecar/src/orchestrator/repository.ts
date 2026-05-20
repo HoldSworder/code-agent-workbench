@@ -23,6 +23,9 @@ export interface RequirementForLeader {
 export class OrchestratorRepository {
   constructor(private db: Database.Database) {}
 
+  /** Exposed for cross-repo composition (e.g. AssignmentCommitRepository). */
+  get rawDb(): Database.Database { return this.db }
+
   // ── Runs ──
 
   createRun(input: CreateRunInput): OrchestratorRun {
@@ -166,6 +169,18 @@ export class OrchestratorRepository {
     this.db
       .prepare('UPDATE assignments SET worktree_path = ?, branch_name = ? WHERE id = ?')
       .run(worktreePath, branchName, id)
+  }
+
+  setAssignmentMainWorktree(id: string, mainWorktreePath: string): void {
+    this.db
+      .prepare('UPDATE assignments SET main_worktree_path = ? WHERE id = ?')
+      .run(mainWorktreePath, id)
+  }
+
+  setAssignmentRepoTask(id: string, repoTaskId: string): void {
+    this.db
+      .prepare('UPDATE assignments SET repo_task_id = ? WHERE id = ?')
+      .run(repoTaskId, id)
   }
 
   // ── Events ──

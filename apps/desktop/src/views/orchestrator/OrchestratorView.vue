@@ -33,6 +33,22 @@ async function handleRetry(assignmentId: string) {
   await store.retryAssignment(assignmentId)
 }
 
+async function handleRollbackAssignment(assignmentId: string) {
+  if (!confirm('回滚此 worker：将主分支重置到该 worker 合并前的状态，并 cherry-pick 之后其它 worker 的合并。若发生冲突会自动恢复。是否继续？'))
+    return
+  await store.rollbackAssignment(assignmentId)
+}
+
+async function handleRetryMerge(assignmentId: string) {
+  await store.retryMergeAssignment(assignmentId)
+}
+
+async function handleDropAssignment(assignmentId: string) {
+  if (!confirm('放弃此 worker：会清理其 worktree 与已合入的产物（如有），且不可恢复。是否继续？'))
+    return
+  await store.dropAssignment(assignmentId)
+}
+
 async function handleRetryRun(runId: string) {
   const result = await store.retryRun(runId)
   if (result?.newRunId) {
@@ -120,6 +136,9 @@ onUnmounted(() => {
               @reject="handleReject"
               @retry="handleRetry"
               @retry-run="handleRetryRun"
+              @rollback-assignment="handleRollbackAssignment"
+              @retry-merge="handleRetryMerge"
+              @drop-assignment="handleDropAssignment"
             />
           </div>
 

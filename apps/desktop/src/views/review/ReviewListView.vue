@@ -26,9 +26,8 @@ const viewItems = ref<ViewWorkItem[]>([])
 const viewLoading = ref(false)
 const viewError = ref<string | null>(null)
 const viewPageNum = ref(1)
-const viewPageSize = 50
 const viewHasMore = ref(false)
-const viewDebug = ref<{ toolName?: string, availableTools?: string[], rawSnippet?: string | null } | null>(null)
+const viewDebug = ref<{ toolName?: string, rawSnippet?: string | null } | null>(null)
 
 const selectedRepoIds = ref<string[]>(loadSelectedRepoIds())
 
@@ -108,15 +107,14 @@ async function fetchViewItems(reset = true): Promise<void> {
     const res = await rpc<{
       items: ViewWorkItem[]
       pageNum: number
-      pageSize: number
-      toolName?: string
-      debug?: { availableTools?: string[], rawSnippet?: string | null }
-    }>('review.listViewWorkItems', {
+      hasMore: boolean
+      total: number | null
+      rawSnippet: string | null
+    }>('feishuProject.listViewItems', {
       projectKey: viewProjectKey.value,
       workItemType: normalizedType,
       viewId: viewId.value,
       pageNum: viewPageNum.value,
-      pageSize: viewPageSize,
     })
     if (!res) {
       viewError.value = 'Sidecar 未连接（res=undefined）。如果当前是浏览器开发模式，请改用 tauri dev 启动。'
@@ -124,12 +122,11 @@ async function fetchViewItems(reset = true): Promise<void> {
     }
     const items = Array.isArray(res.items) ? res.items : []
     viewItems.value = reset ? items : viewItems.value.concat(items)
-    viewHasMore.value = items.length >= viewPageSize
-    if (items.length === 0 && (res.toolName || res.debug)) {
+    viewHasMore.value = !!res.hasMore
+    if (items.length === 0 && res.rawSnippet) {
       viewDebug.value = {
-        toolName: res.toolName,
-        availableTools: res.debug?.availableTools,
-        rawSnippet: res.debug?.rawSnippet ?? null,
+        toolName: 'meegle view get',
+        rawSnippet: res.rawSnippet,
       }
     }
   }
@@ -274,8 +271,8 @@ onMounted(async () => {
 
           <div v-if="viewError" class="text-[12px] text-rose-600 whitespace-pre-wrap">
             {{ viewError }}
-            <span v-if="/未配置.*MCP|feishu-project|未启用/i.test(viewError)">
-              · <router-link to="/mcp" class="text-indigo-500 hover:underline">前往 MCP 配置</router-link>
+            <span v-if="/meegle|未登录|未安装/i.test(viewError)">
+              · 请在终端执行 <code class="px-1 bg-gray-100 dark:bg-white/10 rounded">meegle auth login --host project.feishu.cn</code>
             </span>
           </div>
 
@@ -306,19 +303,16 @@ onMounted(async () => {
             class="mt-1 text-[11px] text-gray-500 border border-amber-200 dark:border-amber-700/40 rounded-md p-2 bg-amber-50/40 dark:bg-amber-900/10"
           >
             <summary class="cursor-pointer text-amber-700 dark:text-amber-300">
-              MCP 调用成功但解析不出条目（点击查看诊断信息）
+              meegle CLI 调用成功但解析不出条目（点击查看诊断信息）
             </summary>
             <div class="mt-2 space-y-1">
-              <div>实际调用工具：<code>{{ viewDebug.toolName ?? '(unknown)' }}</code></div>
-              <div v-if="viewDebug.availableTools?.length">
-                可用工具：<code class="break-all">{{ viewDebug.availableTools.join(', ') }}</code>
-              </div>
+              <div>实际调用：<code>{{ viewDebug.toolName ?? 'meegle view get' }}</code></div>
               <div v-if="viewDebug.rawSnippet">
                 原始响应（前 800 字符）：
                 <pre class="mt-1 p-2 rounded bg-white/60 dark:bg-black/30 whitespace-pre-wrap break-all font-mono text-[11px]">{{ viewDebug.rawSnippet }}</pre>
               </div>
               <div v-else class="text-rose-500">
-                工具返回的 content 为空或无 text。请确认 view_id 是否正确，或在飞书项目内打开该视图能看到工作项。
+                meegle 返回为空。请确认 view_id 是否正确，或在飞书项目内打开该视图能看到工作项。
               </div>
             </div>
           </details>

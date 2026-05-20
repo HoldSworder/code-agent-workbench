@@ -22,10 +22,11 @@ import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phas
 import { ActivatedPhaseRepository } from '../db/repositories/activated-phase.repo'
 import { McpBindingRepository } from '../db/repositories/mcp-binding.repo'
 import { McpServerRepository } from '../db/repositories/mcp-server.repo'
+import { AssignmentCommitRepository } from '../db/repositories/assignment-commit.repo'
 import type { McpServer } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { git, getHead, getMergeBase, resetHard, resetHardClean, stashIfDirty, getCurrentBranch } from '../git/operations'
+import { git, getHead, getMergeBase, resetHard, resetHardClean, stashIfDirty, getCurrentBranch, removeWorktree, createWorktree, cherryPick } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
 import { McpOAuthService, resolveOAuthAccessToken } from '../mcp/oauth'
@@ -65,12 +66,12 @@ export class WorkflowEngine {
   private cliType: string
   private mcpServerRepo: McpServerRepository
   private activatedPhaseRepo: ActivatedPhaseRepository
+  private assignmentCommitRepo: AssignmentCommitRepository
   private dbPath: string
   private activeProviders = new Map<string, AgentProvider>()
   private liveOutputs = new Map<string, string>()
   private liveActivityLogs = new Map<string, string>()
   private requirementLiveOutputs = new Map<string, string>()
-  private activeRequirementProviders = new Map<string, AgentProvider>()
   private pendingAdvance = new Map<string, string>()
   private pendingPlanMode = new Set<string>()
   private mcpOAuthService = new McpOAuthService()
@@ -104,6 +105,7 @@ export class WorkflowEngine {
     this.repoRepo = new RepoRepository(this.db)
     this.settingsRepo = new SettingsRepository(this.db)
     this.activatedPhaseRepo = new ActivatedPhaseRepository(this.db)
+    this.assignmentCommitRepo = new AssignmentCommitRepository(this.db)
   }
 
   addWorkflow(id: string, yamlContent: string): void {
@@ -663,6 +665,10 @@ export class WorkflowEngine {
     if (phase.is_terminal) {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
       this.taskRepo.markWorkflowCompleted(repoTaskId)
+      if (phase.id === 'archive-deploy') {
+        try { this.taskRepo.markPendingMerge(repoTaskId) }
+        catch (err) { elog(`markPendingMerge failed: ${errorMessage(err)}`) }
+      }
       return
     }
 
@@ -1112,6 +1118,7 @@ export class WorkflowEngine {
     this.msgRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.runRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
     this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
+    await this.cleanupAssignmentsForPhases(repoTaskId, phasesToClear)
 
     if (options?.pauseAfterRollback) {
       this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'waiting_input')
@@ -1165,6 +1172,7 @@ export class WorkflowEngine {
         this.msgRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
         this.runRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
         this.commitRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+        await this.cleanupAssignmentsForPhases(repoTaskId, laterPhases)
       }
     }
 
@@ -1208,6 +1216,7 @@ export class WorkflowEngine {
       this.msgRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
       this.runRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
       this.commitRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
+      await this.cleanupAssignmentsForPhases(repoTaskId, laterPhases)
     }
 
     const { stage, phase } = found
@@ -1272,138 +1281,69 @@ export class WorkflowEngine {
     return req?.fetch_output ?? ''
   }
 
-  async startRequirementFetch(requirementId: string, mcpServerIds?: string[]): Promise<void> {
+  /**
+   * 拉取飞书需求详情。
+   *
+   * 当前实现：sidecar 直接调 `meegle workitem get` + 飞书云文档抓取，按
+   * SPEC文档 → 需求文档 → 描述 优先级写库，**不再** spawn agent CLI、不再注入 MCP。
+   * `mcpServerIds` 入参保留是为了向后兼容现有 RPC 调用，新链路里被忽略。
+   */
+  async startRequirementFetch(requirementId: string, _mcpServerIds?: string[]): Promise<void> {
     const requirement = this.reqRepo.findById(requirementId)
     if (!requirement)
       throw new Error(`Requirement not found: ${requirementId}`)
     if (requirement.source !== 'feishu' || !requirement.source_url)
       throw new Error(`Requirement ${requirementId} is not a feishu requirement or has no source_url`)
 
-    const reqPhases = this.config.requirement_phases ?? []
-    const phase = reqPhases.find(p => p.id === 'feishu-requirement')
-    if (!phase)
-      throw new Error('feishu-requirement phase not found in workflow config')
-
-    // status 已由 RPC 层同步设置为 fetching，此处确保 liveOutput 初始化
     this.requirementLiveOutputs.set(requirementId, '')
-
-    const baseDir = join(homedir(), '.code-agent', 'requirement-fetch')
-    const workDir = join(baseDir, requirementId)
-    try { mkdirSync(workDir, { recursive: true }) } catch {}
-
-    const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
-    const effectiveCliType = phaseAgentCfg.agent ?? this.cliType
-    const configWriter = getConfigWriter(effectiveCliType)
+    this.reqRepo.updateFetchMeta(requirementId, {
+      prompt: null,
+      cliType: 'meegle',
+      model: null,
+    })
 
     try {
-      let injectedMcpNames: string[] = []
+      const { resolveRequirementDoc } = await import('../review/feishu-requirement')
+      const source = await resolveRequirementDoc({ workItemUrl: requirement.source_url })
 
-      if (mcpServerIds?.length) {
-        const servers = mcpServerIds
-          .map(id => this.mcpServerRepo.findById(id))
-          .filter((s): s is NonNullable<typeof s> => !!s)
-
-        if (servers.length > 0) {
-          injectedMcpNames = servers.map(s => s.name)
-          const serverConfigs: McpServerConfig[] = await Promise.all(servers.map(s => this.buildMcpServerConfig(s)))
-          configWriter.write(workDir, serverConfigs)
-          const mcpConfigPath = configWriter.getConfigPath(workDir)
-          elog(`startRequirementFetch: injected ${servers.length} MCP server(s) for requirement ${requirementId} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${injectedMcpNames.join(',')})`)
-        }
-      }
-
-      if (injectedMcpNames.length === 0) {
-        this.reqRepo.updateFetchError(requirementId, '未配置飞书项目 MCP Server。请在「MCP 管理」中添加飞书项目 MCP，然后重新获取。')
-        this.reqRepo.updateStatus(requirementId, 'fetch_failed')
-        this.requirementLiveOutputs.delete(requirementId)
-        elog(`startRequirementFetch: aborted for ${requirementId} — no MCP servers available`)
-        return
-      }
-
-      const reqInfo = {
-        title: requirement.title,
-        description: requirement.description,
-        sourceUrl: requirement.source_url ?? undefined,
-        docUrl: requirement.doc_url ?? undefined,
-      }
-
-      const context = buildPhaseContext(
-        phase,
-        '_requirements',
-        '需求收集',
-        workDir,
+      // 拉取摘要：只放元信息和三件套链接，不再重复 SPEC/需求文档抓回来的 markdown 正文
+      // （正文已通过 description 列展示在专门区域）。这样这一区只是「meegle 拉到了什么」的小票。
+      const f = source.feishuFields
+      const summary = [
+        `工作项 ID：${source.workItemId}`,
+        `工作项类型：${source.workItemType}`,
+        `空间：${source.projectKey}`,
+        `LLM 取值来源：${source.sourceFieldLabel ?? '(未命中，使用标题)'} (sourceType=${source.sourceType})`,
         '',
-        '',
-        '',
-        {
-          resolveSkillContent: this.resolveSkillContent,
-          externalRules: this.config.external_rules,
-          resolveRuleContent: this.resolveSkillContent,
-          resolveWorkflowSkill: this.resolveWorkflowSkill,
-        },
-        undefined,
-        undefined,
-        false,
-        reqInfo,
-        undefined,
-        injectedMcpNames,
-      )
-      const provider = this.resolveProvider(phase.provider ?? 'external-cli', {
-        agentOverride: phaseAgentCfg.agent,
-        modelOverride: phaseAgentCfg.model,
-      })
-      this.activeRequirementProviders.set(requirementId, provider)
+        '— 飞书项目字段 —',
+        f.description ? `描述：${f.description.split('\n')[0].slice(0, 80)}${f.description.length > 80 ? '…' : ''}` : '描述：(空)',
+        f.requirementDocUrl ? `需求文档：${f.requirementDocUrl}` : '需求文档：(空)',
+        f.specDocUrl ? `需求SPEC文档：${f.specDocUrl}` : '需求SPEC文档：(空)',
+        source.warnings.length > 0 ? '\n— Warnings —\n' + source.warnings.map(w => `- ${w}`).join('\n') : null,
+      ].filter(Boolean).join('\n')
 
-      const promptText = buildPromptFromContext(context, effectiveCliType !== 'codex')
-      this.reqRepo.updateFetchMeta(requirementId, {
-        prompt: promptText,
-        cliType: effectiveCliType,
-        model: provider.model ?? null,
-      })
+      this.reqRepo.updateFetchOutput(requirementId, summary)
+      this.requirementLiveOutputs.set(requirementId, summary)
 
-      const result = await provider.run(context, {
-        onChunk: (chunk) => {
-          const current = this.requirementLiveOutputs.get(requirementId) ?? ''
-          this.requirementLiveOutputs.set(requirementId, current + chunk)
-        },
-      })
-
-      this.activeRequirementProviders.delete(requirementId)
-
-      const fullOutput = this.requirementLiveOutputs.get(requirementId) ?? result.output ?? ''
-      this.reqRepo.updateFetchOutput(requirementId, fullOutput || null)
-
-      if (result.status === 'failed' || result.status === 'cancelled') {
-        this.reqRepo.updateFetchError(requirementId, result.error ?? `Agent ${result.status}`)
-        this.reqRepo.updateStatus(requirementId, 'fetch_failed')
-        elog(`startRequirementFetch: failed for ${requirementId}: ${result.error}`)
-        return
+      const updateData: { title?: string, description?: string, doc_url?: string | null, feishu_fields_json?: string | null } = {}
+      // 只要 meegle 真实拿到了标题（非 fallback "工作项 N"），就以飞书侧为准覆盖。
+      if (source.title && !source.title.startsWith('工作项 ')) updateData.title = source.title
+      if (source.content) updateData.description = source.content
+      if (source.docUrl) updateData.doc_url = source.docUrl
+      if (f.description != null || f.requirementDocUrl != null || f.specDocUrl != null) {
+        updateData.feishu_fields_json = JSON.stringify(f)
       }
-
-      elog(`startRequirementFetch: fullOutput length=${fullOutput.length}, hasJSON=${fullOutput.includes('REQUIREMENT_DATA_JSON')}, hasYAML=${fullOutput.includes('REQUIREMENT_DATA')}`)
-      if (fullOutput) {
-        const parsed = this.parseRequirementDataBlock(fullOutput)
-        elog(`startRequirementFetch: parsed=${JSON.stringify(parsed)}`)
-        if (parsed) {
-          const updateData: { title?: string, description?: string, doc_url?: string | null } = {}
-          if (parsed.title) updateData.title = parsed.title
-          if (parsed.description) updateData.description = parsed.description
-          if (parsed.doc_url) updateData.doc_url = parsed.doc_url
-          elog(`startRequirementFetch: updateData=${JSON.stringify(updateData)}`)
-          if (Object.keys(updateData).length > 0) {
-            this.reqRepo.update(requirementId, updateData)
-            elog(`startRequirementFetch: updated requirement ${requirementId} with ${JSON.stringify(Object.keys(updateData))}`)
-          }
-        }
+      if (Object.keys(updateData).length > 0) {
+        this.reqRepo.update(requirementId, updateData)
+        elog(`startRequirementFetch: updated requirement ${requirementId} with ${JSON.stringify(Object.keys(updateData))}`)
       }
 
       const finalReq = this.reqRepo.findById(requirementId)
       const targetStatus = finalReq?.mode === 'orchestrator' ? 'pending' : 'draft'
       this.reqRepo.updateStatus(requirementId, targetStatus)
-      elog(`startRequirementFetch: completed for ${requirementId}, status → ${targetStatus}`)
+      elog(`startRequirementFetch: completed for ${requirementId} via meegle, sourceType=${source.sourceType}, status → ${targetStatus}`)
     }
     catch (err: unknown) {
-      this.activeRequirementProviders.delete(requirementId)
       const errMsg = errorMessage(err)
       this.reqRepo.updateFetchError(requirementId, errMsg)
       this.reqRepo.updateStatus(requirementId, 'fetch_failed')
@@ -1415,11 +1355,7 @@ export class WorkflowEngine {
   }
 
   async cancelRequirementFetch(requirementId: string): Promise<void> {
-    const provider = this.activeRequirementProviders.get(requirementId)
-    if (provider) {
-      await provider.cancel()
-      this.activeRequirementProviders.delete(requirementId)
-    }
+    // meegle 调用是同步短任务，没有可取消的子进程；只把 fetching 状态翻成 fetch_failed。
     this.requirementLiveOutputs.delete(requirementId)
     const req = this.reqRepo.findById(requirementId)
     if (req && req.status === 'fetching') {
@@ -1982,13 +1918,6 @@ export class WorkflowEngine {
     }
     catch { /* non-git worktree */ }
 
-    if (phase.id === 'create-branch') {
-      this.syncBranchNameFromWorktree(repoTaskId)
-      this.syncBranchToFeishuProject(repoTaskId).catch(err => {
-        elog(`syncBranchToFeishuProject failed: ${errorMessage(err)}`)
-      })
-    }
-
     if (phase.completion_check) {
       const task = this.taskRepo.findById(repoTaskId)
       if (task) {
@@ -2040,6 +1969,10 @@ export class WorkflowEngine {
     if (phase.is_terminal) {
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
       this.taskRepo.markWorkflowCompleted(repoTaskId)
+      if (phase.id === 'archive-deploy') {
+        try { this.taskRepo.markPendingMerge(repoTaskId) }
+        catch (err) { elog(`markPendingMerge failed: ${errorMessage(err)}`) }
+      }
       return
     }
 
@@ -2147,40 +2080,12 @@ export class WorkflowEngine {
   }
 
   /**
-   * create-branch 阶段完成后，从 worktree 检测实际分支名并回写 task。
-   * 这允许 agent 根据需求标题自行翻译生成语义化英文分支名。
+   * 将分支名写入飞书项目工作项的"前端关联代码库"字段。
+   * 仅在需求关联了飞书项目链接时执行；meegle 未登录或字段缺失时静默跳过（仅 elog）。
+   *
+   * 由 task.create RPC 在 worktree 创建完成后直接调用（best-effort，不阻塞任务创建）。
    */
-  private syncBranchNameFromWorktree(repoTaskId: string): void {
-    const task = this.taskRepo.findById(repoTaskId)
-    if (!task) return
-
-    try {
-      const actual = execSync('git branch --show-current', {
-        cwd: task.worktree_path,
-        encoding: 'utf-8',
-        timeout: 5_000,
-      }).trim()
-
-      if (!actual || actual === task.branch_name) return
-
-      const changeId = actual.startsWith('feature/')
-        ? actual.slice('feature/'.length)
-        : actual
-      const openspecPath = `openspec/changes/${changeId}`
-
-      elog(`syncBranchName: ${task.branch_name} → ${actual} (changeId=${changeId})`)
-      this.taskRepo.updateChangeInfo(repoTaskId, actual, changeId, openspecPath)
-    }
-    catch (err) {
-      elog(`syncBranchName failed: ${errorMessage(err)}`)
-    }
-  }
-
-  /**
-   * create-branch 完成后，将分支名写入飞书项目工作项的"前端关联代码库"字段。
-   * 仅在需求关联了飞书项目链接且系统中已配置飞书项目 MCP（is_feishu_project=1）时执行。
-   */
-  private async syncBranchToFeishuProject(repoTaskId: string): Promise<void> {
+  async syncBranchToFeishuProject(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
     if (!task) return
 
@@ -2194,60 +2099,32 @@ export class WorkflowEngine {
 
     const [, projectKey, workItemType, workItemId] = feishuMatch
     const branchName = task.branch_name
-
-    const mcpServer = this.mcpServerRepo.findFeishuProject()
-    if (!mcpServer || !mcpServer.enabled || !mcpServer.url) {
-      elog('syncBranchToFeishuProject: 飞书项目 MCP 未配置或被禁用，请在 MCP 页快捷卡片中填写 URL')
-      return
-    }
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/event-stream',
-      ...JSON.parse(mcpServer.headers || '{}'),
-    }
-
     const repo = this.repoRepo.findById(task.repo_id)
     const repoName = repo?.name ?? ''
 
     elog(`syncBranchToFeishuProject: projectKey=${projectKey} workItemType=${workItemType} workItemId=${workItemId} branch=${branchName} repo=${repoName}`)
 
     try {
-      const sessionId = await this.mcpInitialize(mcpServer.url, headers)
-      if (!sessionId) {
-        elog('syncBranchToFeishuProject: MCP initialize failed - no session ID')
-        return
-      }
-      const sessionHeaders = { ...headers, 'Mcp-Session-Id': sessionId }
+      const { listMetaFields, updateWorkItem } = await import('@code-agent/shared/meegle')
 
-      const fieldConfig = await this.mcpToolCall(mcpServer.url, sessionHeaders, 'lark-project-list_workitem_field_config', {
-        project_key: projectKey,
-        work_item_type: workItemType,
-        field_query: '前端关联代码库',
-        page_num: 1,
+      const list = await listMetaFields({
+        projectKey,
+        workItemType,
+        fieldQuery: '前端关联代码库',
+        maxPages: 2,
       })
 
-      const configData = this.extractMcpText(fieldConfig)
-      if (!configData) {
-        elog('syncBranchToFeishuProject: failed to get field config')
-        return
-      }
-
-      const parsed = JSON.parse(configData)
-      const compoundField = (parsed.list ?? []).find(
+      const compoundField = list.find(
         (f: any) => f.field_name === '前端关联代码库' && f.field_type === 'compound_field',
-      )
+      ) as any
       if (!compoundField) {
         elog('syncBranchToFeishuProject: 前端关联代码库 compound_field not found')
         return
       }
 
-      const repoSubField = (compoundField.compound_field_info ?? []).find(
-        (f: any) => f.field_name === '代码仓库',
-      )
-      const branchSubField = (compoundField.compound_field_info ?? []).find(
-        (f: any) => f.field_name === '分支',
-      )
+      const subInfos: any[] = compoundField.compound_field_info ?? []
+      const repoSubField = subInfos.find(f => f.field_name === '代码仓库')
+      const branchSubField = subInfos.find(f => f.field_name === '分支')
       if (!repoSubField || !branchSubField) {
         elog('syncBranchToFeishuProject: sub-fields not found')
         return
@@ -2267,14 +2144,15 @@ export class WorkflowEngine {
         return
       }
 
+      // 飞书 compound_field 的 field_value 期望是「JSON 字符串」格式的二维数组（每行一组子字段）。
       const fieldValue = JSON.stringify([[
         { field_key: repoSubField.field_key, field_value: matchedOptionId },
         { field_key: branchSubField.field_key, field_value: branchName },
       ]])
 
-      await this.mcpToolCall(mcpServer.url, sessionHeaders, 'lark-project-update_field', {
-        work_item_id: workItemId,
-        project_key: projectKey,
+      await updateWorkItem({
+        projectKey,
+        workItemId,
         fields: [{ field_key: compoundField.field_key, field_value: fieldValue }],
       })
 
@@ -2285,52 +2163,97 @@ export class WorkflowEngine {
     }
   }
 
-  private async mcpInitialize(url: string, headers: Record<string, string>): Promise<string | null> {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'code-agent', version: '0.1.0' } },
-      }),
-      signal: AbortSignal.timeout(10_000),
-    })
-    if (!resp.ok) return null
-    const sessionId = resp.headers.get('mcp-session-id')
-    return sessionId ?? null
+  /**
+   * For each assignment whose merge fell within `phaseIds`, drop its
+   * worktree on disk (best-effort) and remove its assignment_commits row.
+   * Called by rollback paths to keep the worker layer in sync with the
+   * main worktree's reset.
+   */
+  private async cleanupAssignmentsForPhases(
+    repoTaskId: string,
+    phaseIds: string[],
+  ): Promise<void> {
+    if (phaseIds.length === 0) return
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return
+    const repo = this.repoRepo.findById(task.repo_id)
+    if (!repo) return
+    const stale = this.assignmentCommitRepo.findByTaskAndPhases(repoTaskId, phaseIds)
+    for (const ac of stale) {
+      const path = join(repo.local_path, '.worktrees', `orchestrator-${ac.assignment_id}`)
+      await removeWorktree(repo.local_path, path).catch(() => {})
+    }
+    this.assignmentCommitRepo.deleteByTaskAndPhases(repoTaskId, phaseIds)
   }
 
-  private async mcpToolCall(url: string, headers: Record<string, string>, toolName: string, args: Record<string, unknown>): Promise<unknown> {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        jsonrpc: '2.0', id: Date.now(), method: 'tools/call',
-        params: { name: toolName, arguments: args },
-      }),
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (!resp.ok) throw new Error(`MCP HTTP ${resp.status}`)
-    const text = await resp.text()
-    for (const line of text.split('\n')) {
-      if (line.startsWith('data: ')) {
-        return JSON.parse(line.slice(6))
-      }
-    }
-    return JSON.parse(text)
-  }
+  /**
+   * Worker-level rollback: redo a single assignment while preserving the
+   * other workers' merges as cherry-picks on top of the pre-merge state.
+   *
+   * On any cherry-pick conflict, restores the main worktree HEAD to its
+   * pre-operation value and throws. Caller should surface and recommend a
+   * phase-level rollback in that case.
+   */
+  async rollbackAssignment(repoTaskId: string, assignmentId: string): Promise<void> {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
+    const repo = this.repoRepo.findById(task.repo_id)
+    if (!repo) throw new Error(`Repo not found for task: ${repoTaskId}`)
 
-  private extractMcpText(response: unknown): string | null {
-    const r = response as any
-    const contents = r?.result?.content
-    if (!Array.isArray(contents)) return null
-    if (r?.result?.isError) return null
-    for (const c of contents) {
-      if (c.type === 'text' && c.text && !c.text.startsWith('log_id:') && !c.text.startsWith('logid:')) {
-        return c.text
+    const target = this.assignmentCommitRepo.findById(assignmentId)
+    if (!target || target.repo_task_id !== repoTaskId)
+      throw new Error(`assignment_commit not found for assignment: ${assignmentId}`)
+
+    const all = this.assignmentCommitRepo.findByTask(repoTaskId)
+    const idxTarget = all.findIndex(a => a.assignment_id === assignmentId)
+    const after = all.slice(idxTarget + 1)
+
+    const mainWt = task.worktree_path
+    const preHead = await getHead(mainWt)
+
+    try {
+      await stashIfDirty(mainWt, `auto-stash before rollback assignment ${assignmentId}`)
+      await resetHard(mainWt, target.base_sha)
+      for (const ac of after) {
+        const newSha = await cherryPick(mainWt, ac.merge_sha, 1)
+        this.assignmentCommitRepo.upsert({
+          assignment_id: ac.assignment_id,
+          repo_task_id: ac.repo_task_id,
+          phase_id: ac.phase_id,
+          branch_name: ac.branch_name,
+          worker_head_sha: ac.worker_head_sha,
+          merge_sha: newSha,
+          base_sha: ac.base_sha,
+        })
       }
     }
-    return null
+    catch (err) {
+      try { await resetHard(mainWt, preHead) } catch {}
+      throw err
+    }
+
+    // Rebuild the worker worktree at its previous starting point so the
+    // assignment can be re-run.
+    const workerPath = join(repo.local_path, '.worktrees', `orchestrator-${assignmentId}`)
+    await removeWorktree(repo.local_path, workerPath).catch(() => {})
+    try {
+      await createWorktree(repo.local_path, workerPath, target.branch_name, target.worker_head_sha)
+    }
+    catch { /* worktree may be recreated later by worker-runner if missing */ }
+
+    // Drop the target assignment_commits row; orchestrator should retry the
+    // assignment and re-record on success.
+    this.assignmentCommitRepo.deleteById(assignmentId)
+
+    // Invalidate phase_commits for any phase at-or-after this assignment's
+    // recorded phase so phase-level rollback semantics stay consistent
+    // ("phase complete = snapshot SHA"). Caller may rerun the phase.
+    const wf = this.resolveConfigForTask(repoTaskId)
+    const found = findPhaseById(wf.stages, target.phase_id)
+    if (found) {
+      const phasesToInvalidate = this.collectPhaseIdsAfter(found.stageIdx, found.phaseIdx, wf)
+      this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToInvalidate)
+    }
   }
 
   private collectPhaseIdsAfter(stageIdx: number, phaseIdx: number, wf: WorkflowConfig): string[] {

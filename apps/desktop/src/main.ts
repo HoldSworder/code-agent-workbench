@@ -9,6 +9,8 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', component: () => import('./views/Dashboard.vue') },
+    { path: '/cursor-cli', component: () => import('./views/CursorCliView.vue') },
+    { path: '/feishu-project', component: () => import('./views/FeishuProjectView.vue') },
     { path: '/repo/:id', component: () => import('./views/RepoView.vue') },
     { path: '/repo/:repoId/task/:taskId', component: () => import('./views/TaskDetail.vue') },
     { path: '/workflow', component: () => import('./views/WorkflowEditor.vue') },

@@ -55,7 +55,8 @@ Repo 1:N → RepoTask ← N:1 Requirement
 | current_phase | string | 当前阶段 ID（引用 workflow.yaml） |
 | phase_status | enum | running / waiting_confirm / waiting_event / completed / failed |
 | openspec_path | string | openspec 变更目录相对路径 |
-| worktree_path | string | git worktree 工作目录绝对路径 |
+| worktree_path | string | git worktree 工作目录绝对路径（`<repo>/.worktrees/<change-id>/`） |
+| base_sha | string \| null | task.create 时锁定的基线 SHA |
 | created_at | datetime | 创建时间 |
 | updated_at | datetime | 最后更新时间 |
 

@@ -14,6 +14,9 @@ const emit = defineEmits<{
   reject: [runId: string, feedback: string]
   retry: [assignmentId: string]
   retryRun: [runId: string]
+  rollbackAssignment: [assignmentId: string]
+  retryMerge: [assignmentId: string]
+  dropAssignment: [assignmentId: string]
 }>()
 
 const showRejectDialog = ref(false)
@@ -42,6 +45,7 @@ const assignmentStatusBadge: Record<string, { label: string, class: string, icon
   completed: { label: '已完成', class: 'text-emerald-500', icon: 'i-carbon-checkmark' },
   failed: { label: '失败', class: 'text-red-500', icon: 'i-carbon-error' },
   cancelled: { label: '已取消', class: 'text-gray-400', icon: 'i-carbon-close' },
+  merge_conflict: { label: '合并冲突', class: 'text-amber-500', icon: 'i-carbon-warning-alt' },
 }
 
 const leaderDecision = computed(() => {
@@ -195,6 +199,30 @@ function handleReject(feedback: string) {
               >
                 重试
               </button>
+              <button
+                v-if="a.status === 'completed'"
+                class="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/20 transition-colors"
+                title="回滚此 worker 的合并，保留其它 worker 产物"
+                @click="emit('rollbackAssignment', a.id)"
+              >
+                回滚
+              </button>
+              <template v-if="a.status === 'merge_conflict'">
+                <button
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 hover:bg-amber-100 dark:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/20 transition-colors"
+                  title="在 worker worktree 解决冲突并 commit 后，点击重试合并到主分支"
+                  @click="emit('retryMerge', a.id)"
+                >
+                  重试合并
+                </button>
+                <button
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-red-50 text-red-600 hover:bg-red-100 dark:bg-red-500/10 dark:text-red-400 dark:hover:bg-red-500/20 transition-colors"
+                  title="放弃此 worker，清理其 worktree（不可恢复）"
+                  @click="emit('dropAssignment', a.id)"
+                >
+                  放弃
+                </button>
+              </template>
             </div>
           </div>
 
@@ -209,6 +237,13 @@ function handleReject(feedback: string) {
               </span>
               <span v-if="a.branch_name" class="font-mono">
                 {{ a.branch_name }}
+              </span>
+              <span
+                v-if="a.worktree_path"
+                class="font-mono text-gray-400 truncate max-w-[200px]"
+                :title="a.worktree_path"
+              >
+                {{ a.worktree_path.split('/').slice(-2).join('/') }}
               </span>
             </div>
             <button
@@ -225,9 +260,26 @@ function handleReject(feedback: string) {
 
           <div
             v-if="a.error_message"
-            class="mt-2 p-2 rounded bg-red-50 dark:bg-red-500/5 text-[11px] text-red-600 dark:text-red-400 font-mono break-all"
+            class="mt-2 p-2 rounded text-[11px] font-mono break-all"
+            :class="a.status === 'merge_conflict'
+              ? 'bg-amber-50 dark:bg-amber-500/5 text-amber-700 dark:text-amber-300'
+              : 'bg-red-50 dark:bg-red-500/5 text-red-600 dark:text-red-400'"
           >
             {{ a.error_message }}
+          </div>
+
+          <div
+            v-if="a.status === 'merge_conflict' && a.worktree_path"
+            class="mt-2 p-2 rounded bg-amber-50/50 dark:bg-amber-500/5 text-[11px] text-amber-700 dark:text-amber-300 space-y-1"
+          >
+            <div class="font-semibold">合并冲突恢复</div>
+            <div>
+              在以下目录解决冲突并 <code class="px-1 rounded bg-white/40 dark:bg-black/20">git commit</code> 后，点击"重试合并"：
+            </div>
+            <div class="font-mono text-[10px] break-all">{{ a.worktree_path }}</div>
+            <div v-if="a.main_worktree_path" class="text-gray-500 dark:text-gray-400">
+              合并目标：<span class="font-mono">{{ a.main_worktree_path }}</span>
+            </div>
           </div>
 
           <!-- Worker agent output -->

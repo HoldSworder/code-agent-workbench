@@ -86,6 +86,36 @@ export async function resetHardClean(cwd: string, commitSha: string): Promise<vo
   await git(cwd, ['clean', '-fd'])
 }
 
+/**
+ * Detect the canonical default branch of a repository, trying in order:
+ *   1. `git symbolic-ref refs/remotes/origin/HEAD` (set by `clone` / `remote set-head`)
+ *   2. `git rev-parse --verify origin/master`
+ *   3. `git rev-parse --verify origin/main`
+ *   4. current local branch via `git rev-parse --abbrev-ref HEAD`
+ * Throws when none of the above succeed.
+ */
+export async function detectDefaultBranch(repoPath: string): Promise<string> {
+  try {
+    const ref = await git(repoPath, ['symbolic-ref', 'refs/remotes/origin/HEAD'])
+    const m = ref.match(/^refs\/remotes\/origin\/(.+)$/)
+    if (m && m[1]) return m[1]
+  }
+  catch {}
+  for (const cand of ['master', 'main']) {
+    try {
+      await git(repoPath, ['rev-parse', '--verify', `origin/${cand}`])
+      return cand
+    }
+    catch {}
+  }
+  try {
+    const local = await git(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    if (local && local !== 'HEAD') return local
+  }
+  catch {}
+  throw new Error(`Cannot detect default branch in ${repoPath}`)
+}
+
 export async function getMergeBase(cwd: string): Promise<string | null> {
   try {
     return await git(cwd, ['merge-base', 'HEAD', 'origin/main'])
@@ -94,6 +124,198 @@ export async function getMergeBase(cwd: string): Promise<string | null> {
     try { return await git(cwd, ['merge-base', 'HEAD', 'origin/master']) }
     catch { return null }
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Worktree operations
+// ─────────────────────────────────────────────────────────────
+
+export interface WorktreeEntry {
+  path: string
+  branch: string | null
+  head: string
+}
+
+/**
+ * Create a new git worktree at `worktreePath`, checking out `branchName`
+ * created from `baseSha`. If the branch already exists, it will be reused
+ * (without -b). Throws if `worktreePath` already exists.
+ */
+export async function createWorktree(
+  repoPath: string,
+  worktreePath: string,
+  branchName: string,
+  baseSha: string,
+): Promise<void> {
+  const branches = await git(repoPath, ['branch', '--list', branchName]).catch(() => '')
+  if (branches.trim()) {
+    await git(repoPath, ['worktree', 'add', worktreePath, branchName])
+  }
+  else {
+    await git(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, baseSha])
+  }
+}
+
+/**
+ * Rename the branch currently checked out at `worktreePath` to `newName`.
+ *
+ * 内部使用 `git branch -m <newName>`（隐式作用于 HEAD），与
+ * `worker-runner` / archive-deploy 等使用同一 worktree 的代码安全共存。
+ */
+export async function renameCurrentBranch(
+  worktreePath: string,
+  newName: string,
+): Promise<void> {
+  await git(worktreePath, ['branch', '-m', newName])
+}
+
+/**
+ * 校验某分支是否已合入 `targetBranch`。
+ * 实现：`git -C <repo> branch --merged <targetBranch>` 输出列表中包含该分支即视为已合并。
+ * 同时容忍 `origin/<targetBranch>` 已合并、本地 target 落后的场景。
+ */
+export async function isBranchMergedInto(
+  repoPath: string,
+  branchName: string,
+  targetBranch: string,
+): Promise<boolean> {
+  const candidates = [targetBranch, `origin/${targetBranch}`]
+  for (const ref of candidates) {
+    let out = ''
+    try { out = await git(repoPath, ['branch', '--list', '--merged', ref, branchName]) }
+    catch { continue }
+    if (out.trim()) return true
+  }
+  return false
+}
+
+/**
+ * Delete a local branch. `force=true` maps to `-D` for unmerged branches; otherwise `-d`.
+ */
+export async function deleteBranch(
+  repoPath: string,
+  branchName: string,
+  force = false,
+): Promise<void> {
+  await git(repoPath, ['branch', force ? '-D' : '-d', branchName])
+}
+
+/**
+ * Remove a git worktree. By default uses --force to drop dirty trees.
+ * Safe to call when the path no longer exists; emits no error in that case.
+ */
+export async function removeWorktree(
+  repoPath: string,
+  worktreePath: string,
+  force = true,
+): Promise<void> {
+  const args = ['worktree', 'remove']
+  if (force) args.push('--force')
+  args.push(worktreePath)
+  try {
+    await git(repoPath, args)
+  }
+  catch {
+    // Best-effort prune to clean stale metadata even when path is gone.
+    try { await git(repoPath, ['worktree', 'prune']) } catch {}
+  }
+}
+
+/**
+ * List all git worktrees registered for `repoPath` (porcelain v2 parse).
+ */
+export async function listWorktrees(repoPath: string): Promise<WorktreeEntry[]> {
+  const out = await git(repoPath, ['worktree', 'list', '--porcelain']).catch(() => '')
+  if (!out) return []
+  const entries: WorktreeEntry[] = []
+  let cur: Partial<WorktreeEntry> = {}
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      if (cur.path) entries.push({ path: cur.path, branch: cur.branch ?? null, head: cur.head ?? '' })
+      cur = { path: line.slice('worktree '.length).trim() }
+    }
+    else if (line.startsWith('HEAD ')) {
+      cur.head = line.slice(5).trim()
+    }
+    else if (line.startsWith('branch ')) {
+      // refs/heads/<name>
+      cur.branch = line.slice('branch '.length).trim().replace(/^refs\/heads\//, '')
+    }
+    else if (line === 'detached') {
+      cur.branch = null
+    }
+  }
+  if (cur.path) entries.push({ path: cur.path, branch: cur.branch ?? null, head: cur.head ?? '' })
+  return entries
+}
+
+/**
+ * Merge `sourceBranch` into the current branch of `worktreePath` with a
+ * non-fast-forward merge commit. Returns the resulting merge commit SHA.
+ *
+ * On conflict, aborts the merge and throws an Error with message including
+ * "merge conflict" so callers can route to a recovery path.
+ */
+export async function mergeNoFf(
+  worktreePath: string,
+  sourceBranch: string,
+  message: string,
+): Promise<string> {
+  try {
+    await git(worktreePath, ['merge', '--no-ff', '--no-edit', '-m', message, sourceBranch])
+  }
+  catch (err) {
+    try { await git(worktreePath, ['merge', '--abort']) } catch {}
+    const e = err instanceof Error ? err.message : String(err)
+    throw new Error(`merge conflict while merging ${sourceBranch}: ${e}`)
+  }
+  return git(worktreePath, ['rev-parse', 'HEAD'])
+}
+
+/**
+ * Cherry-pick `commitSha` onto the current branch of `worktreePath`. For
+ * merge commits, uses `-m 1` (mainline parent). Returns the new commit SHA.
+ *
+ * Aborts and throws on conflict.
+ */
+export async function cherryPick(
+  worktreePath: string,
+  commitSha: string,
+  mainlineParent = 1,
+): Promise<string> {
+  try {
+    await git(worktreePath, ['cherry-pick', '-m', String(mainlineParent), commitSha])
+  }
+  catch (err) {
+    try { await git(worktreePath, ['cherry-pick', '--abort']) } catch {}
+    const e = err instanceof Error ? err.message : String(err)
+    throw new Error(`cherry-pick conflict on ${commitSha}: ${e}`)
+  }
+  return git(worktreePath, ['rev-parse', 'HEAD'])
+}
+
+/**
+ * Append a pattern to `.git/info/exclude` (per-repo, not committed) if not
+ * already present. Used to hide `.worktrees/` from `git status` in the main
+ * repo without touching user's `.gitignore`.
+ */
+export async function ensureLocalExclude(repoPath: string, pattern: string): Promise<void> {
+  const { readFileSync, writeFileSync, mkdirSync, existsSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  try {
+    const gitDir = (await git(repoPath, ['rev-parse', '--git-common-dir'])).trim()
+    const absGitDir = gitDir.startsWith('/') ? gitDir : join(repoPath, gitDir)
+    const infoDir = join(absGitDir, 'info')
+    if (!existsSync(infoDir)) mkdirSync(infoDir, { recursive: true })
+    const excludePath = join(infoDir, 'exclude')
+    const current = existsSync(excludePath) ? readFileSync(excludePath, 'utf8') : ''
+    const lines = current.split('\n').map(l => l.trim())
+    if (!lines.includes(pattern)) {
+      const next = (current.endsWith('\n') || current === '' ? current : `${current}\n`) + `${pattern}\n`
+      writeFileSync(excludePath, next, 'utf8')
+    }
+  }
+  catch { /* best effort */ }
 }
 
 export interface ChangedFile {

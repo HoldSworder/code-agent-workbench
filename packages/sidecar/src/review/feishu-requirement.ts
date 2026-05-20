@@ -1,6 +1,5 @@
 import { fetchLarkDocContent, parseLarkDocUrl } from '@code-agent/shared/lark'
-import type { FeishuProjectMcpClient } from './feishu-project-mcp'
-import { parseMcpJson } from './mcp-text'
+import { getWorkItem } from '@code-agent/shared/meegle'
 
 /**
  * 解析后的需求来源描述，供 design-generator 拼 userPrompt 使用。
@@ -12,6 +11,20 @@ import { parseMcpJson } from './mcp-text'
  * - `title_only`：以上三者均未命中，仅用工作项标题作 fallback。
  */
 export type RequirementSourceType = 'spec_doc' | 'requirement_doc' | 'description' | 'title_only'
+
+/**
+ * 飞书项目工作项里供前端卡片直接展示的「描述/需求文档/SPEC文档」三件套。
+ * 与 `RequirementSource.sourceType / content` 解耦：这三个字段是「原始值」展示用，
+ * 而 `content` 是按优先级解析后给 LLM 用的纯文本。
+ */
+export interface FeishuRequirementFields {
+  /** 「描述」字段原值；通常是富文本 markdown。 */
+  description: string | null
+  /** 「需求文档」字段原值（飞书云文档 URL，少数情况是 inline markdown）。 */
+  requirementDocUrl: string | null
+  /** 「需求SPEC文档」字段原值（飞书云文档 URL，少数情况是 inline markdown）。 */
+  specDocUrl: string | null
+}
 
 export interface RequirementSource {
   workItemUrl: string
@@ -26,16 +39,19 @@ export interface RequirementSource {
   docUrl: string | null
   /** 真正供 LLM 使用的纯文本内容；spec_doc/requirement_doc 是抓取的 markdown，description 是字段原值。 */
   content: string
+  /** 飞书工作项里「描述/需求文档/SPEC文档」三个原始字段值（供 UI 卡片展示，不参与 LLM）。 */
+  feishuFields: FeishuRequirementFields
   /** 拉取过程中遇到的非致命错误（例如 lark-cli 拉文档失败，但仍可降级用描述）。 */
   warnings: string[]
 }
 
 interface ResolveRequirementOptions {
-  feishuMcp: FeishuProjectMcpClient
   /** 形如 `https://project.feishu.cn/{projectKey}/{type}/detail/{id}` 的工作项 URL。 */
   workItemUrl: string
   /** 注入用于测试；默认走 `@code-agent/shared/lark` 的 fetchLarkDocContent。 */
   fetchDocContent?: (url: string) => Promise<{ content: string, error?: string }>
+  /** 注入用于测试；默认走 `@code-agent/shared/meegle` 的 getWorkItem。 */
+  fetchWorkItem?: (args: { projectKey: string, workItemId: string }) => Promise<unknown>
 }
 
 interface ParsedFeishuUrl {
@@ -76,19 +92,22 @@ interface FieldEntry {
 }
 
 /**
- * 飞书项目 MCP `get_workitem_brief` 不同部署返回结构差异较大；本函数把所有可能的字段容器
- * 拉平成 `{ label, rawValue }[]`，避免上层 if-else 分支膨胀。
+ * 把飞书项目工作项里的字段容器拉平成 `{ label, rawValue }[]`，避免上层 if-else 分支膨胀。
  *
- * 覆盖的容器：
- * - `work_item_attribute` / `work_item_attributes` / `extra_attributes`：飞书项目空间标准形态（首选）；
- * - `fields` / `field_value_pairs` / `custom_fields` / `field_keys`：旧版/通用形态。
+ * 覆盖的形态（按优先级）：
+ * - **meegle CLI 当前形态**（首选）：
+ *   - `work_item_fields: [{ key, name, value }, ...]` — 业务字段数组
+ *   - `work_item_attribute: { work_item_name, work_item_id, work_item_status, ... }` — 元属性对象，**不**作为业务字段拉入
+ * - 历史 MCP 形态（保留兼容）：
+ *   - `work_item_attribute` / `work_item_attributes` / `extra_attributes` 是数组，元素含 `field_alias` / `field_value`
+ *   - `fields` / `field_value_pairs` / `custom_fields` / `field_keys` 数组
  *
- * 顶层 `work_item_current_node` 等元字段不会被当作业务字段，避免污染匹配 / warnings 噪音。
+ * 顶层 `work_item_current_node` / `pagination` 等元字段不会被当作业务字段。
  */
 function flattenFields(workItem: Record<string, unknown>): FieldEntry[] {
   const out: FieldEntry[] = []
-  const CONTAINER_KEYS = [
-    'work_item_attribute',
+  const ARRAY_CONTAINER_KEYS = [
+    'work_item_fields', // ← meegle 实际产出
     'work_item_attributes',
     'extra_attributes',
     'fields',
@@ -97,18 +116,31 @@ function flattenFields(workItem: Record<string, unknown>): FieldEntry[] {
     'field_keys',
   ] as const
   const SKIP_TOP_LEVEL = new Set<string>([
-    ...CONTAINER_KEYS,
+    ...ARRAY_CONTAINER_KEYS,
+    'work_item_attribute',
     'work_item_current_node',
     'current_node',
     'workflow_infos',
     'sub_tasks',
     'related_work_items',
+    'pagination',
   ])
 
-  for (const key of CONTAINER_KEYS) {
+  for (const key of ARRAY_CONTAINER_KEYS) {
     const container = workItem[key]
     if (!Array.isArray(container)) continue
     for (const raw of container) {
+      if (!raw || typeof raw !== 'object') continue
+      const f = raw as Record<string, unknown>
+      const labelRaw = (f.field_alias ?? f.field_name ?? f.name ?? f.label ?? f.key ?? f.field_key ?? '') as unknown
+      const label = typeof labelRaw === 'string' ? labelRaw : String(labelRaw ?? '')
+      const valueRaw = f.field_value ?? f.value ?? f.text ?? f
+      out.push({ label, rawValue: valueRaw })
+    }
+  }
+  // 历史 MCP 兼容：`work_item_attribute` 数组形态（meegle 下它是对象，会被下面的 isArray 检查跳过）。
+  if (Array.isArray(workItem.work_item_attribute)) {
+    for (const raw of workItem.work_item_attribute) {
       if (!raw || typeof raw !== 'object') continue
       const f = raw as Record<string, unknown>
       const labelRaw = (f.field_alias ?? f.field_name ?? f.name ?? f.label ?? f.field_key ?? '') as unknown
@@ -158,11 +190,51 @@ function stringifyValue(v: unknown): string {
 }
 
 function pickTitle(workItem: Record<string, unknown>): string {
-  for (const k of ['name', 'title']) {
+  // meegle 实际形态：title 在 `work_item_attribute.work_item_name` 上。
+  const attr = workItem.work_item_attribute
+  if (attr && typeof attr === 'object' && !Array.isArray(attr)) {
+    const a = attr as Record<string, unknown>
+    for (const k of ['work_item_name', 'name', 'title']) {
+      const v = a[k]
+      if (typeof v === 'string' && v.trim()) return v.trim()
+    }
+  }
+  // 兼容历史 MCP 顶层挂 name/title 的形态。
+  for (const k of ['name', 'title', 'work_item_name']) {
     const v = workItem[k]
     if (typeof v === 'string' && v.trim()) return v.trim()
   }
   return ''
+}
+
+/**
+ * 从拉平后的字段表里挑出「描述/需求文档/SPEC文档」三件套，供前端卡片展示。
+ * 与 FIELD_RULES 共享关键字判定，但走「最先命中」策略：每类只取一个。
+ */
+function pickFeishuFields(fields: FieldEntry[]): FeishuRequirementFields {
+  const out: FeishuRequirementFields = {
+    description: null,
+    requirementDocUrl: null,
+    specDocUrl: null,
+  }
+  for (const { label, rawValue } of fields) {
+    const norm = normalizeLabel(label)
+    const value = stringifyValue(rawValue)
+    if (!value) continue
+    if (out.specDocUrl == null && FIELD_RULES[0].keywords.some(k => norm.includes(k))) {
+      out.specDocUrl = value
+      continue
+    }
+    if (out.requirementDocUrl == null && FIELD_RULES[1].keywords.some(k => norm.includes(k))) {
+      out.requirementDocUrl = value
+      continue
+    }
+    if (out.description == null && FIELD_RULES[2].keywords.some(k => norm.includes(k))) {
+      out.description = value
+      continue
+    }
+  }
+  return out
 }
 
 /**
@@ -179,28 +251,32 @@ export async function resolveRequirementDoc(opts: ResolveRequirementOptions): Pr
   if (!parsed) throw new Error(`无法解析飞书项目工作项 URL: ${opts.workItemUrl}`)
 
   const fetchContent = opts.fetchDocContent ?? (async (url: string) => fetchLarkDocContent(url))
+  const fetchWorkItem = opts.fetchWorkItem ?? (async ({ projectKey, workItemId }) => getWorkItem({ projectKey, workItemId }))
 
-  const briefResult = await opts.feishuMcp.callTool('get_workitem_brief', {
-    project_key: parsed.projectKey,
-    work_item_id: parsed.workItemId,
-    work_item_type_key: parsed.workItemType,
-    // 显式传 _all 拿全字段；不同部署对该参数容忍度不同，失败时 catch 后退到无 fields。
-    fields: ['_all'],
-  }).catch(async () => opts.feishuMcp.callTool('get_workitem_brief', {
-    project_key: parsed.projectKey,
-    work_item_id: parsed.workItemId,
-    work_item_type_key: parsed.workItemType,
-  }))
+  // 显式传 _all 拿全字段；不同部署对该参数容忍度不同，失败时 catch 后退到默认字段集。
+  const briefResult = await fetchWorkItem({
+    projectKey: parsed.projectKey,
+    workItemId: parsed.workItemId,
+  })
 
-  const json = parseMcpJson<unknown>(briefResult)
-  const root = (json && typeof json === 'object') ? json as Record<string, unknown> : {}
+  const root = (briefResult && typeof briefResult === 'object') ? briefResult as Record<string, unknown> : {}
   const dataNode = (root.data && typeof root.data === 'object') ? root.data as Record<string, unknown> : root
   const workItem = (Array.isArray((dataNode as { items?: unknown[] }).items) && ((dataNode as { items: unknown[] }).items[0] as Record<string, unknown>))
     || dataNode
 
   const title = pickTitle(workItem) || `工作项 ${parsed.workItemId}`
   const fields = flattenFields(workItem)
+  const feishuFields = pickFeishuFields(fields)
   const warnings: string[] = []
+
+  const baseResult = {
+    workItemUrl: opts.workItemUrl,
+    workItemId: parsed.workItemId,
+    projectKey: parsed.projectKey,
+    workItemType: parsed.workItemType,
+    title,
+    feishuFields,
+  }
 
   for (const rule of FIELD_RULES) {
     for (const { label, rawValue } of fields) {
@@ -212,11 +288,7 @@ export async function resolveRequirementDoc(opts: ResolveRequirementOptions): Pr
       // 描述字段直接当 markdown 透传，不尝试解析 URL。
       if (rule.type === 'description') {
         return {
-          workItemUrl: opts.workItemUrl,
-          workItemId: parsed.workItemId,
-          projectKey: parsed.projectKey,
-          workItemType: parsed.workItemType,
-          title,
+          ...baseResult,
           sourceType: 'description',
           sourceFieldLabel: label || null,
           docUrl: null,
@@ -230,11 +302,7 @@ export async function resolveRequirementDoc(opts: ResolveRequirementOptions): Pr
         const docResult = await fetchContent(valueStr)
         if (docResult.content) {
           return {
-            workItemUrl: opts.workItemUrl,
-            workItemId: parsed.workItemId,
-            projectKey: parsed.projectKey,
-            workItemType: parsed.workItemType,
-            title,
+            ...baseResult,
             sourceType: rule.type,
             sourceFieldLabel: label || null,
             docUrl: valueStr,
@@ -248,11 +316,7 @@ export async function resolveRequirementDoc(opts: ResolveRequirementOptions): Pr
 
       // 字段值不是 URL 但有内容（如直接贴的 markdown），直接用作 content。
       return {
-        workItemUrl: opts.workItemUrl,
-        workItemId: parsed.workItemId,
-        projectKey: parsed.projectKey,
-        workItemType: parsed.workItemType,
-        title,
+        ...baseResult,
         sourceType: rule.type,
         sourceFieldLabel: label || null,
         docUrl: null,
@@ -279,11 +343,7 @@ export async function resolveRequirementDoc(opts: ResolveRequirementOptions): Pr
   }
 
   return {
-    workItemUrl: opts.workItemUrl,
-    workItemId: parsed.workItemId,
-    projectKey: parsed.projectKey,
-    workItemType: parsed.workItemType,
-    title,
+    ...baseResult,
     sourceType: 'title_only',
     sourceFieldLabel: null,
     docUrl: null,

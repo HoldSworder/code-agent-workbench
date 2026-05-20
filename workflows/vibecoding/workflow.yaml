@@ -44,8 +44,8 @@ state_inference:
   rules:
     - condition: working_tree_clean
       stage: development
-      phase: create-branch
-      description: 工作区干净 → 创建 feature 分支
+      phase: dev
+      description: 工作区干净 → 直接进入开发（worktree + 分支由 sidecar 在 task.create 时创建）
 
     - condition: has_committed_changes
       stage: development
@@ -63,13 +63,10 @@ stages:
   # ──────────────────────────────────────────────
   - id: development
     name: 代码开发
+    # NOTE: feature 分支与 worktree 由 sidecar 在 task.create RPC 时直接创建
+    # （git worktree add -b feature/<slug>），slug 由配置的 LLM provider 翻译生成。
+    # 如需重命名分支可调 task.renameBranch RPC，不再走 workflow phase。
     phases:
-      - id: create-branch
-        name: 创建分支
-        provider: external-cli
-        skill: skills/create-branch.md
-        entry_gate: working_tree_clean
-
       - id: dev
         name: 开发
         provider: external-cli

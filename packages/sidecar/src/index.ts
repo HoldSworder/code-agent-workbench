@@ -7,6 +7,8 @@ import { getDb } from './db/connection'
 import { RpcServer } from './rpc/server'
 import { registerMethods } from './rpc/methods'
 import { registerReviewMethods } from './rpc/review-methods'
+import { registerFeishuProjectMethods } from './rpc/feishu-project-methods'
+import { listSessionsForRepo } from './transcript/reader'
 import { WorkflowEngine } from './workflow/engine'
 import { Orchestrator } from './orchestrator/orchestrator'
 import { parseTeamConfig } from './orchestrator/team-parser'
@@ -18,7 +20,6 @@ import {
   loadAgentRuntimeFromSettings,
 } from './providers/factory'
 import { SettingsRepository } from './db/repositories/settings.repo'
-import { McpServerRepository } from './db/repositories/mcp-server.repo'
 import { ConsultServer } from './consult/server'
 import type { ConsultConfig } from './consult/types'
 
@@ -139,16 +140,6 @@ function readdirSafe(dir: string): string[] {
 }
 
 const settingsRepo = new SettingsRepository(db)
-
-// 一次性迁移：把历史 v1 通过 name='lark-project' 定位的 MCP 自动置 is_feishu_project=1。
-try {
-  const result = new McpServerRepository(db).migrateLegacyLarkProject()
-  if (result.migrated)
-    process.stderr.write(`sidecar: migrated legacy lark-project MCP -> feishu-project flag (id=${result.id})\n`)
-}
-catch (err) {
-  process.stderr.write(`sidecar: migrateLegacyLarkProject failed: ${err}\n`)
-}
 
 const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
 
@@ -279,6 +270,7 @@ const consultServer = new ConsultServer({ db, config: buildConsultConfig(), stat
 const rpcServer = new RpcServer()
 registerMethods(rpcServer, db, engine, workflowPath, consultServer, buildConsultConfig, workflowsDir, dbPath)
 registerReviewMethods(rpcServer, db)
+registerFeishuProjectMethods(rpcServer)
 
 // 配置 RPC 始终可用（即使 team.yaml 不存在也能创建）
 registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator, () => {
@@ -288,6 +280,21 @@ registerTeamConfigMethods(rpcServer, teamYamlPath, () => orchestrator, () => {
 
 if (orchestrator)
   registerOrchestratorMethods(rpcServer, orchestrator)
+
+// 暴露项目根目录与对应 Cursor Agent 历史会话（供桌面端 Cursor CLI 页面使用）
+rpcServer.register('system.projectRoot', async () => ({ path: projectRoot }))
+rpcServer.register(
+  'system.sessions',
+  async ({ limit, offset }: { limit?: number, offset?: number }) => {
+    const all = listSessionsForRepo(projectRoot)
+    const total = all.length
+    const offsetN = Math.max(0, Math.floor(offset ?? 0))
+    if (limit == null || limit <= 0)
+      return { items: all, total }
+    const cap = Math.min(Math.max(1, limit), 200)
+    return { items: all.slice(offsetN, offsetN + cap), total }
+  },
+)
 
 const rl = createInterface({ input: process.stdin })
 rl.on('line', async (line) => {

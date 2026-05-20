@@ -270,6 +270,98 @@ export function registerOrchestratorMethods(rpc: RpcServer, orchestrator: Orches
     return { success: true }
   })
 
+  /**
+   * Recovery path: user has resolved the merge conflict inside the preserved
+   * worker worktree (committed the fixed result on the worker branch) and
+   * wants sidecar to re-attempt the merge into the main worktree.
+   */
+  rpc.register('orchestrator.retryMergeAssignment', async (params: { assignmentId: string }) => {
+    const assignment = repo.findAssignmentById(params.assignmentId)
+    if (!assignment) throw new Error(`Assignment not found: ${params.assignmentId}`)
+    if (assignment.status !== 'merge_conflict')
+      throw new Error(`Assignment is not in merge_conflict: ${assignment.status}`)
+    if (!assignment.main_worktree_path) throw new Error(`Assignment has no recorded main worktree`)
+    if (!assignment.worktree_path || !assignment.branch_name)
+      throw new Error(`Assignment has no recorded worker worktree/branch`)
+
+    const { git, getHead, mergeNoFf, removeWorktree } = await import('../git/operations')
+    const { AssignmentCommitRepository } = await import('../db/repositories/assignment-commit.repo')
+
+    const main = assignment.main_worktree_path
+    const workerBranch = assignment.branch_name
+    const workerWt = assignment.worktree_path
+    const lock = orchestrator.getMergeLock(main)
+
+    try {
+      await lock.run(async () => {
+        const baseSha = await getHead(main)
+        const workerHead = await getHead(workerWt).catch(() => baseSha)
+        const mergeSha = await mergeNoFf(
+          main,
+          workerBranch,
+          `merge worker ${assignment.role} ${assignment.id.slice(0, 8)} (retry)`,
+        )
+        if (assignment.repo_task_id) {
+          new AssignmentCommitRepository(repo.rawDb).upsert({
+            assignment_id: assignment.id,
+            repo_task_id: assignment.repo_task_id,
+            phase_id: `worker-${assignment.role}`,
+            branch_name: workerBranch,
+            worker_head_sha: workerHead,
+            merge_sha: mergeSha,
+            base_sha: baseSha,
+          })
+        }
+        const repoRoot = workerWt.split('/.worktrees/')[0] || ''
+        if (repoRoot) await removeWorktree(repoRoot, workerWt).catch(() => {})
+        repo.updateAssignmentStatus(assignment.id, 'completed')
+        repo.appendEvent(assignment.run_id, 'worker_merge_retried', assignment.id, JSON.stringify({
+          merge_sha: mergeSha,
+        }))
+      })
+      return { success: true }
+    }
+    catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      repo.updateAssignmentStatus(assignment.id, 'merge_conflict', msg)
+      repo.appendEvent(assignment.run_id, 'worker_merge_conflict', assignment.id, JSON.stringify({
+        error: msg,
+        worker_worktree: workerWt,
+        worker_branch: workerBranch,
+        main_worktree: main,
+        retry: true,
+      }))
+      return { success: false, error: msg }
+    }
+  })
+
+  /**
+   * Recovery path: user gives up on this worker entirely. Cleans up the
+   * preserved worker worktree, drops any assignment_commits row, marks the
+   * assignment cancelled.
+   */
+  rpc.register('orchestrator.dropAssignment', async (params: { assignmentId: string }) => {
+    const assignment = repo.findAssignmentById(params.assignmentId)
+    if (!assignment) throw new Error(`Assignment not found: ${params.assignmentId}`)
+    if (!['merge_conflict', 'failed'].includes(assignment.status))
+      throw new Error(`Assignment cannot be dropped in status: ${assignment.status}`)
+
+    const { removeWorktree } = await import('../git/operations')
+    const { AssignmentCommitRepository } = await import('../db/repositories/assignment-commit.repo')
+
+    if (assignment.worktree_path) {
+      const repoRoot = assignment.worktree_path.split('/.worktrees/')[0] || ''
+      if (repoRoot) await removeWorktree(repoRoot, assignment.worktree_path).catch(() => {})
+    }
+    try {
+      new AssignmentCommitRepository(repo.rawDb).deleteById(assignment.id)
+    }
+    catch {}
+    repo.updateAssignmentStatus(assignment.id, 'cancelled', 'dropped by user')
+    repo.appendEvent(assignment.run_id, 'worker_dropped', assignment.id, JSON.stringify({}))
+    return { success: true }
+  })
+
   rpc.register('orchestrator.pauseAssignment', async (params: { assignmentId: string }) => {
     const assignment = repo.findAssignmentById(params.assignmentId)
     if (!assignment) throw new Error(`Assignment not found: ${params.assignmentId}`)

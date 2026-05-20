@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRequirementsStore } from '../stores/requirements'
+import { useRequirementsStore, parseFeishuFields, type Requirement } from '../stores/requirements'
 import { useReposStore } from '../stores/repos'
 import { useTasksStore } from '../stores/tasks'
 import { useOrchestratorStore } from '../stores/orchestrator'
@@ -21,6 +21,19 @@ const tasksStore = useTasksStore()
 const orchestratorStore = useOrchestratorStore()
 
 const taskMap = ref<Record<string, (RepoTask & { repoName: string })[]>>({})
+
+/**
+ * 用于卡片预览/详情面板「描述」区的展示值。
+ * - feishu 来源：**严格**取飞书「描述」字段原值；为空则返回空串，UI 隐藏该区域，**不回落**到 SPEC/需求文档抓取的 markdown
+ * - 其它来源（manual）：用户手填的 requirement.description
+ */
+function displayDescription(req: Requirement): string {
+  if (req.source === 'feishu') {
+    const f = parseFeishuFields(req.feishu_fields_json)
+    return f?.description ?? ''
+  }
+  return req.description
+}
 
 const requirementPhases = ref<ReqPhase[]>([])
 const workflowStages = ref<WorkflowStage[]>([])
@@ -117,6 +130,9 @@ function deriveEffectiveStatus(req: { id: string, status: string }): string {
 
   const tasks = taskMap.value[req.id] ?? []
   if (tasks.length === 0) return req.status
+
+  if (tasks.every(t => t.lifecycle_status === 'archived'))
+    return 'archived'
 
   if (tasks.every(t => t.workflow_completed))
     return 'completed'
@@ -225,25 +241,8 @@ function parseFeishuUrl(url: string) {
   feishuError.value = '无法识别的飞书项目链接格式'
 }
 
-const createMcpSelectedIds = ref<Set<string>>(new Set())
-
-function preselectFeishuMcp() {
-  const ids = mcpServers.value
-    .filter(s => /feishu|飞书/i.test(s.name) || /feishu|飞书/i.test(s.description))
-    .map(s => s.id)
-  createMcpSelectedIds.value = new Set(ids)
-}
-
 function switchToFeishu() {
   createMode.value = 'feishu'
-  preselectFeishuMcp()
-}
-
-function toggleCreateMcp(serverId: string) {
-  const next = new Set(createMcpSelectedIds.value)
-  if (next.has(serverId)) next.delete(serverId)
-  else next.add(serverId)
-  createMcpSelectedIds.value = next
 }
 
 function resetCreateDialog() {
@@ -255,7 +254,6 @@ function resetCreateDialog() {
   feishuParsed.value = null
   feishuError.value = ''
   createError.value = ''
-  createMcpSelectedIds.value = new Set()
 }
 
 const canSubmit = computed(() => {
@@ -287,23 +285,8 @@ async function submitRequirement() {
         mode: requirementMode.value,
       })
 
-      const mcpIds = [...createMcpSelectedIds.value]
-
-      if (mcpIds.length > 0) {
-        const firstPhase = requirementPhases.value.find(p => !p.optional)
-        if (firstPhase) {
-          await rpc('mcp.setBindings', {
-            stageId: '_requirements',
-            phaseId: firstPhase.id,
-            mcpServerIds: mcpIds,
-          })
-          await loadMcpData()
-        }
-      }
-
       await rpc('requirement.startFetch', {
         requirementId: req.id,
-        mcpServerIds: mcpIds.length > 0 ? mcpIds : undefined,
       })
       await requirementsStore.refreshOne(req.id)
     }
@@ -600,6 +583,36 @@ async function retryTask(taskId: string) {
   }
 }
 
+// ── MR 合并后清理 worktree + 分支重命名 ──
+async function cleanupAfterMerge(task: RepoTask & { repoName: string }) {
+  if (!window.confirm(`确认 MR 已合并到目标分支，并清理 ${task.branch_name} 的本地 worktree？`))
+    return
+  try {
+    await tasksStore.cleanupAfterMerge(task.id)
+    await refreshTaskMap()
+  }
+  catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (window.confirm(`${msg}\n\n是否强制清理（force=true）？`)) {
+      await tasksStore.cleanupAfterMerge(task.id, true)
+      await refreshTaskMap()
+    }
+  }
+}
+
+async function promptRenameBranch(task: RepoTask & { repoName: string }) {
+  const current = task.branch_name.replace(/^feature\//, '')
+  const next = window.prompt(`重命名 feature 分支（kebab-case 英文 slug，无需 feature/ 前缀）`, current)
+  if (!next || next.trim() === current) return
+  try {
+    await tasksStore.renameBranch(task.id, next.trim())
+    await refreshTaskMap()
+  }
+  catch (err) {
+    window.alert(`重命名失败：${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 // ── 会话详情弹窗 ──
 const showReqSessionModal = ref(false)
 const reqSessionModalReqId = ref<string | null>(null)
@@ -772,12 +785,12 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                 <span class="text-[10px] text-gray-400 tabular-nums ml-auto">{{ formatDate(req.created_at) }}</span>
               </div>
 
-              <!-- 描述 -->
+              <!-- 描述（feishu 来源优先取「描述」字段原值） -->
               <p
-                v-if="req.description && req.description !== req.title"
+                v-if="displayDescription(req) && displayDescription(req) !== req.title"
                 class="text-[12px] text-gray-400 mt-1.5 line-clamp-2 leading-relaxed"
               >
-                {{ req.description }}
+                {{ displayDescription(req) }}
               </p>
 
               <!-- 飞书链接 -->
@@ -877,6 +890,39 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                           :class="tasksStore.retrying.has(task.id) ? 'i-carbon-circle-dash animate-spin' : 'i-carbon-restart'"
                         />
                         {{ tasksStore.retrying.has(task.id) ? '重试中' : '重试' }}
+                      </button>
+                      <span
+                        v-if="task.lifecycle_status === 'pending_merge'"
+                        class="ml-auto flex items-center gap-1 text-[10px] text-blue-600 dark:text-blue-400 shrink-0"
+                      >
+                        <div class="i-carbon-pending w-2.5 h-2.5" />
+                        等待 MR 合并
+                      </span>
+                      <span
+                        v-else-if="task.lifecycle_status === 'archived'"
+                        class="ml-auto flex items-center gap-1 text-[10px] text-emerald-600 dark:text-emerald-400 shrink-0"
+                      >
+                        <div class="i-carbon-checkmark-filled w-2.5 h-2.5" />
+                        已归档
+                      </span>
+                    </div>
+                    <div
+                      v-if="task.lifecycle_status === 'pending_merge'"
+                      class="mt-1 flex items-center gap-2 px-2"
+                    >
+                      <button
+                        class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-500/30 transition-colors text-[10px]"
+                        @click.stop="cleanupAfterMerge(task)"
+                      >
+                        <div class="i-carbon-clean w-2.5 h-2.5" />
+                        已合并，清理 worktree
+                      </button>
+                      <button
+                        class="flex items-center gap-1 px-1.5 py-0.5 rounded text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors text-[10px]"
+                        @click.stop="promptRenameBranch(task)"
+                      >
+                        <div class="i-carbon-edit w-2.5 h-2.5" />
+                        重命名分支
                       </button>
                     </div>
                     <div
@@ -1032,37 +1078,6 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                   </p>
                 </div>
 
-                <!-- 按需 MCP 选择器 -->
-                <div v-if="mcpServers.length > 0">
-                  <label class="block text-[12px] font-medium text-gray-400 dark:text-gray-500 mb-1.5">
-                    按需加载 MCP
-                    <span class="font-normal text-gray-300 dark:text-gray-600 ml-1">（可选）</span>
-                  </label>
-                  <div class="space-y-1 max-h-36 overflow-y-auto">
-                    <label
-                      v-for="srv in mcpServers"
-                      :key="srv.id"
-                      class="flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer transition-colors"
-                      :class="createMcpSelectedIds.has(srv.id)
-                        ? 'bg-violet-50 dark:bg-violet-500/10 border border-violet-200 dark:border-violet-500/20'
-                        : 'bg-gray-50 dark:bg-white/3 border border-gray-100 dark:border-white/5 hover:border-violet-200 dark:hover:border-violet-500/20'"
-                      @click.prevent="toggleCreateMcp(srv.id)"
-                    >
-                      <input
-                        type="checkbox"
-                        :checked="createMcpSelectedIds.has(srv.id)"
-                        class="w-3.5 h-3.5 rounded border-gray-300 text-violet-600 focus:ring-violet-500/20 cursor-pointer"
-                      >
-                      <div class="flex-1 min-w-0">
-                        <div class="text-[12px] font-medium text-gray-700 dark:text-gray-200">{{ srv.name }}</div>
-                        <div v-if="srv.description" class="text-[10px] text-gray-400 truncate">{{ srv.description }}</div>
-                      </div>
-                    </label>
-                  </div>
-                  <p class="text-[10px] text-gray-300 dark:text-gray-600 mt-1.5">
-                    选中的 MCP 将在需求收集阶段自动注入到 Agent 运行环境
-                  </p>
-                </div>
               </div>
 
               <!-- 执行模式 -->
@@ -1081,15 +1096,13 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                     <div class="text-[10px] opacity-60 mt-0.5">按阶段推进</div>
                   </button>
                   <button
-                    class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all"
-                    :class="requirementMode === 'orchestrator'
-                      ? 'border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-400'
-                      : 'border-gray-200 text-gray-500 hover:bg-gray-50 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5'"
-                    @click="requirementMode = 'orchestrator'"
+                    disabled
+                    title="多 Agent 编排暂未开放，敬请期待"
+                    class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all border-gray-200 text-gray-500 opacity-50 cursor-not-allowed dark:border-white/10 dark:text-gray-400"
                   >
                     <div class="i-carbon-group w-4 h-4 mx-auto mb-1 opacity-60" />
                     多 Agent 编排
-                    <div class="text-[10px] opacity-60 mt-0.5">自动分配执行</div>
+                    <div class="text-[10px] opacity-60 mt-0.5">暂未开放</div>
                   </button>
                 </div>
               </div>
@@ -1397,11 +1410,9 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                       流水线
                     </button>
                     <button
-                      class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all text-center"
-                      :class="selectedReq.mode === 'orchestrator'
-                        ? 'border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/10 dark:text-indigo-400'
-                        : 'border-gray-200 text-gray-500 hover:bg-gray-50 dark:border-white/10 dark:text-gray-400 dark:hover:bg-white/5'"
-                      @click="requirementsStore.updateMode(selectedReq.id, 'orchestrator')"
+                      disabled
+                      title="多 Agent 编排暂未开放，敬请期待"
+                      class="flex-1 px-3 py-2 rounded-lg text-[12px] font-medium border transition-all text-center border-gray-200 text-gray-500 opacity-50 cursor-not-allowed dark:border-white/10 dark:text-gray-400"
                     >
                       <div class="i-carbon-group w-4 h-4 mx-auto mb-1 opacity-60" />
                       多 Agent 编排
@@ -1477,15 +1488,15 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                   <div class="flex items-center gap-2 mb-3">
                     <template v-if="selectedReq.status === 'fetching'">
                       <div class="i-carbon-circle-dash w-4 h-4 text-violet-500 animate-spin" />
-                      <h3 class="text-[12px] font-semibold text-violet-600 dark:text-violet-400 uppercase tracking-wider">正在获取飞书需求...</h3>
+                      <h3 class="text-[12px] font-semibold text-violet-600 dark:text-violet-400 uppercase tracking-wider">正在通过 meegle 拉取飞书需求...</h3>
                     </template>
                     <template v-else-if="selectedReq.status === 'fetch_failed'">
                       <div class="i-carbon-warning w-4 h-4 text-red-500" />
-                      <h3 class="text-[12px] font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">获取失败</h3>
+                      <h3 class="text-[12px] font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">拉取失败</h3>
                     </template>
                     <template v-else>
                       <div class="i-carbon-checkmark w-4 h-4 text-emerald-500" />
-                      <h3 class="text-[12px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">获取记录</h3>
+                      <h3 class="text-[12px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">拉取摘要</h3>
                     </template>
                   </div>
 
@@ -1513,19 +1524,11 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                   <!-- 错误信息 -->
                   <p v-if="selectedReq.status === 'fetch_failed' && selectedReq.fetch_error" class="text-[12px] text-red-500 dark:text-red-400 mb-3 whitespace-pre-wrap">{{ selectedReq.fetch_error }}</p>
 
-                  <!-- 输出内容 -->
-                  <div v-if="selectedReq.status === 'fetching' && reqLiveOutput" class="rounded-lg bg-gray-900 dark:bg-gray-950 p-4 max-h-80 overflow-y-auto">
-                    <pre class="text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap font-mono">{{ reqLiveOutput }}</pre>
+                  <!-- 拉取摘要 / 失败输出 -->
+                  <div v-if="selectedReq.status === 'fetching'" class="text-[12px] text-gray-400">正在调用 meegle CLI...</div>
+                  <div v-else-if="selectedReq.fetch_output" class="rounded-lg bg-gray-50 dark:bg-white/3 border border-gray-100 dark:border-white/5 p-3">
+                    <pre class="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed whitespace-pre-wrap font-mono">{{ selectedReq.fetch_output }}</pre>
                   </div>
-                  <div v-else-if="selectedReq.status === 'fetching' && !reqLiveOutput" class="text-[12px] text-gray-400">等待 Agent 输出...</div>
-                  <details v-else-if="selectedReq.fetch_output" class="group">
-                    <summary class="cursor-pointer text-[11px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors select-none">
-                      {{ selectedReq.status === 'fetch_failed' ? '查看获取输出' : '展开获取过程' }}
-                    </summary>
-                    <div class="mt-2 rounded-lg bg-gray-900 dark:bg-gray-950 p-4 max-h-80 overflow-y-auto">
-                      <pre class="text-[11px] text-gray-300 leading-relaxed whitespace-pre-wrap font-mono">{{ selectedReq.fetch_output }}</pre>
-                    </div>
-                  </details>
 
                   <!-- 重试按钮 -->
                   <button
@@ -1539,10 +1542,10 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                 </div>
 
                 <!-- 对话历史 -->
-                <!-- 描述 -->
-                <div v-if="selectedReq.description" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
+                <!-- 描述（feishu 来源优先取「描述」字段原值） -->
+                <div v-if="displayDescription(selectedReq)" class="px-6 py-4 border-b border-gray-100 dark:border-white/5">
                   <h3 class="text-[12px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">描述</h3>
-                  <p class="text-[13px] text-gray-600 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">{{ selectedReq.description }}</p>
+                  <p class="text-[13px] text-gray-600 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">{{ displayDescription(selectedReq) }}</p>
                 </div>
 
                 <!-- 关联链接 -->
@@ -1571,6 +1574,45 @@ function reqFormatToolInput(input: Record<string, unknown>): string {
                     </a>
                   </div>
                 </div>
+
+                <!-- 飞书项目文档字段：需求文档 / SPEC 文档（描述已在上方「描述」区显示，不再重复） -->
+                <template v-if="selectedReq.source === 'feishu'">
+                  <div
+                    v-if="parseFeishuFields(selectedReq.feishu_fields_json)?.requirementDocUrl
+                      || parseFeishuFields(selectedReq.feishu_fields_json)?.specDocUrl"
+                    class="px-6 py-4 border-b border-gray-100 dark:border-white/5"
+                  >
+                    <h3 class="text-[12px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">飞书项目字段</h3>
+                    <div class="space-y-2">
+                      <div v-if="parseFeishuFields(selectedReq.feishu_fields_json)?.requirementDocUrl">
+                        <div class="text-[11px] text-gray-400 dark:text-gray-500 mb-1">需求文档</div>
+                        <a
+                          :href="parseFeishuFields(selectedReq.feishu_fields_json)?.requirementDocUrl ?? '#'"
+                          target="_blank"
+                          class="flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/3 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                        >
+                          <div class="i-carbon-document w-3.5 h-3.5 text-blue-500" />
+                          <span class="text-[12px] text-blue-600 dark:text-blue-400 truncate font-mono">
+                            {{ parseFeishuFields(selectedReq.feishu_fields_json)?.requirementDocUrl }}
+                          </span>
+                        </a>
+                      </div>
+                      <div v-if="parseFeishuFields(selectedReq.feishu_fields_json)?.specDocUrl">
+                        <div class="text-[11px] text-gray-400 dark:text-gray-500 mb-1">需求 SPEC 文档</div>
+                        <a
+                          :href="parseFeishuFields(selectedReq.feishu_fields_json)?.specDocUrl ?? '#'"
+                          target="_blank"
+                          class="flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-50 dark:bg-white/3 hover:bg-gray-100 dark:hover:bg-white/5 transition-colors"
+                        >
+                          <div class="i-carbon-document-blank w-3.5 h-3.5 text-emerald-500" />
+                          <span class="text-[12px] text-emerald-600 dark:text-emerald-400 truncate font-mono">
+                            {{ parseFeishuFields(selectedReq.feishu_fields_json)?.specDocUrl }}
+                          </span>
+                        </a>
+                      </div>
+                    </div>
+                  </div>
+                </template>
 
                 <!-- 关联任务 -->
                 <div class="px-6 py-4">

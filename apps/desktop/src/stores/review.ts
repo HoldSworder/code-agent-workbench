@@ -8,13 +8,16 @@ import {
 import { rpc } from '../composables/use-sidecar'
 import type { ParticipantRole } from '../composables/use-review-ws'
 
-export interface FeishuMcpStatus {
-  configured: boolean
-  healthy: boolean
-  mcpId: string | null
-  mcpName: string | null
-  toolCount: number | null
-  lastError: string | null
+/**
+ * meegle CLI 登录态。由 sidecar `feishuProject.checkAuth` RPC 返回。
+ * 与 `MeegleAuthResult`（@code-agent/shared/meegle）字段对齐。
+ */
+export interface MeegleAuthStatus {
+  installed: boolean
+  authenticated: boolean
+  host: string | null
+  expiresInMinutes: number | null
+  error: string | null
 }
 
 export interface ReviewServerHealth {
@@ -61,7 +64,7 @@ export interface ParticipantDto {
 
 export const useReviewStore = defineStore('review', () => {
   const lark = ref<LarkIdentityResult | null>(null)
-  const feishuMcp = ref<FeishuMcpStatus | null>(null)
+  const meegle = ref<MeegleAuthStatus | null>(null)
   const reviewServer = ref<ReviewServerHealth>({ healthy: false, error: null, lastCheckedAt: null })
   const baseUrl = ref(reviewServerBaseUrl.value)
 
@@ -80,9 +83,9 @@ export const useReviewStore = defineStore('review', () => {
     else if (!lark.value.installed) reasons.push('lark-cli 未安装')
     else if (!lark.value.loggedIn) reasons.push(lark.value.error ?? 'lark-cli 未登录')
 
-    if (!feishuMcp.value) reasons.push('尚未检测飞书项目 MCP')
-    else if (!feishuMcp.value.configured) reasons.push('飞书项目 MCP 未在 MCP 页面标记')
-    else if (!feishuMcp.value.healthy) reasons.push(feishuMcp.value.lastError ?? '飞书项目 MCP 不健康')
+    if (!meegle.value) reasons.push('尚未检测 meegle CLI 状态')
+    else if (!meegle.value.installed) reasons.push('meegle CLI 未安装（npm i -g meegle-cli）')
+    else if (!meegle.value.authenticated) reasons.push(meegle.value.error ?? 'meegle CLI 未登录')
 
     if (!reviewServer.value.healthy) reasons.push(reviewServer.value.error ?? `评审中心服务不可达（${baseUrl.value}）`)
     return { blocked: reasons.length > 0, reasons }
@@ -95,18 +98,17 @@ export const useReviewStore = defineStore('review', () => {
     }
   }
 
-  async function refreshFeishuMcpStatus(): Promise<void> {
+  async function refreshMeegleStatus(): Promise<void> {
     try {
-      feishuMcp.value = await rpc<FeishuMcpStatus>('review.checkFeishuProjectMcp', {})
+      meegle.value = await rpc<MeegleAuthStatus>('feishuProject.checkAuth', {})
     }
     catch (err) {
-      feishuMcp.value = {
-        configured: false,
-        healthy: false,
-        mcpId: null,
-        mcpName: null,
-        toolCount: null,
-        lastError: err instanceof Error ? err.message : String(err),
+      meegle.value = {
+        installed: false,
+        authenticated: false,
+        host: null,
+        expiresInMinutes: null,
+        error: err instanceof Error ? err.message : String(err),
       }
     }
   }
@@ -122,7 +124,7 @@ export const useReviewStore = defineStore('review', () => {
   }
 
   async function refreshAll(): Promise<void> {
-    await Promise.all([refreshLarkIdentity(), refreshFeishuMcpStatus(), refreshReviewServerHealth()])
+    await Promise.all([refreshLarkIdentity(), refreshMeegleStatus(), refreshReviewServerHealth()])
   }
 
   function applySnapshot(payload: {
@@ -173,7 +175,7 @@ export const useReviewStore = defineStore('review', () => {
 
   return {
     lark,
-    feishuMcp,
+    meegle,
     reviewServer,
     baseUrl,
     role,
@@ -186,7 +188,7 @@ export const useReviewStore = defineStore('review', () => {
     wsConnected,
     blocking,
     refreshLarkIdentity,
-    refreshFeishuMcpStatus,
+    refreshMeegleStatus,
     refreshReviewServerHealth,
     refreshAll,
     applySnapshot,

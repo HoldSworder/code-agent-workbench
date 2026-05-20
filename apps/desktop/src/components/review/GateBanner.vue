@@ -1,10 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { useReviewStore } from '../../stores/review'
 import { setReviewServerBaseUrl, reviewServerBaseUrl } from '../../composables/use-review-server'
 
-const router = useRouter()
 const store = useReviewStore()
 
 const baseUrl = ref(reviewServerBaseUrl.value)
@@ -26,12 +24,8 @@ async function recheckLark(): Promise<void> {
   await store.refreshLarkIdentity()
 }
 
-async function recheckFeishuMcp(): Promise<void> {
-  await store.refreshFeishuMcpStatus()
-}
-
-function gotoMcp(): void {
-  router.push('/mcp')
+async function recheckMeegle(): Promise<void> {
+  await store.refreshMeegleStatus()
 }
 </script>
 
@@ -96,32 +90,27 @@ function gotoMcp(): void {
 
     <div class="px-4 py-3 rounded-lg bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10">
       <div class="flex items-center justify-between mb-2">
-        <div class="text-[13px] font-semibold text-gray-700 dark:text-gray-200">3. 飞书项目 MCP（streamable HTTP）</div>
+        <div class="text-[13px] font-semibold text-gray-700 dark:text-gray-200">3. meegle CLI 登录态</div>
         <button
           class="px-2 py-0.5 text-[11px] rounded-md border border-gray-200 dark:border-white/10 hover:bg-gray-50 dark:hover:bg-white/5"
-          @click="recheckFeishuMcp"
+          @click="recheckMeegle"
         >
           重新检测
         </button>
       </div>
-      <div v-if="!store.feishuMcp" class="text-[12px] text-gray-500">检测中…</div>
+      <div v-if="!store.meegle" class="text-[12px] text-gray-500">检测中…</div>
       <template v-else>
-        <div v-if="!store.feishuMcp.configured" class="space-y-1">
-          <div class="text-[12px] text-rose-600">尚未配置飞书项目 MCP</div>
-          <div class="text-[11px] text-gray-500">请在 MCP 页面顶部「飞书项目 MCP」快捷卡片中填写 streamable HTTP 地址。</div>
-          <button
-            class="px-2 py-1 text-[12px] rounded-md bg-indigo-500 text-white hover:bg-indigo-600"
-            @click="gotoMcp"
-          >
-            前往 MCP 配置
-          </button>
+        <div v-if="!store.meegle.installed" class="text-[12px] text-rose-600">
+          未检测到 meegle CLI。请先安装：
+          <code class="px-1 bg-gray-100 dark:bg-white/10 rounded">npm i -g meegle-cli</code>
         </div>
-        <div v-else-if="!store.feishuMcp.healthy" class="space-y-1">
-          <div class="text-[12px] text-rose-600">{{ store.feishuMcp.lastError ?? '不健康' }}</div>
-          <div class="text-[11px] text-gray-500">已选用：{{ store.feishuMcp.mcpName }} (id={{ store.feishuMcp.mcpId }})</div>
+        <div v-else-if="!store.meegle.authenticated" class="space-y-1">
+          <div class="text-[12px] text-rose-600">{{ store.meegle.error ?? '未登录' }}</div>
+          <div class="text-[12px] text-gray-500">请在终端执行 <code class="px-1 bg-gray-100 dark:bg-white/10 rounded">meegle auth login --host project.feishu.cn</code> 后点击「重新检测」。</div>
         </div>
         <div v-else class="text-[12px] text-emerald-600">
-          已连通 · {{ store.feishuMcp.mcpName }} <span v-if="store.feishuMcp.toolCount != null" class="text-gray-500 ml-1">({{ store.feishuMcp.toolCount }} 个工具)</span>
+          已登录 · {{ store.meegle.host ?? 'project.feishu.cn' }}
+          <span v-if="store.meegle.expiresInMinutes != null" class="text-gray-500 ml-1">(剩余 {{ store.meegle.expiresInMinutes }} 分钟)</span>
         </div>
       </template>
     </div>

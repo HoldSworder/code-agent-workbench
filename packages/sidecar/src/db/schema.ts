@@ -36,6 +36,7 @@ export function applySchema(db: Database.Database): void {
       worktree_path TEXT NOT NULL,
       workflow_id TEXT,
       workflow_completed INTEGER NOT NULL DEFAULT 0,
+      lifecycle_status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -113,7 +114,6 @@ export function applySchema(db: Database.Database): void {
       oauth_redirect_mode TEXT CHECK (oauth_redirect_mode IN ('deeplink', 'loopback')),
       oauth_last_error TEXT,
       oauth_connected_at TEXT,
-      is_feishu_project INTEGER NOT NULL DEFAULT 0,
       created_at  TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -180,7 +180,25 @@ export function applySchema(db: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (repo_task_id, phase_id)
     );
+
+    CREATE TABLE IF NOT EXISTS assignment_commits (
+      assignment_id TEXT PRIMARY KEY REFERENCES assignments(id),
+      repo_task_id TEXT NOT NULL REFERENCES repo_tasks(id),
+      phase_id TEXT NOT NULL,
+      branch_name TEXT NOT NULL,
+      worker_head_sha TEXT NOT NULL,
+      merge_sha TEXT NOT NULL,
+      base_sha TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_assignment_commits_task ON assignment_commits(repo_task_id, phase_id);
   `)
+
+  // Migration: add base_sha column to repo_tasks (locks worktree base ref)
+  const taskColsBase = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
+  if (!taskColsBase.some(c => c.name === 'base_sha')) {
+    db.exec(`ALTER TABLE repo_tasks ADD COLUMN base_sha TEXT`)
+  }
 
   // Migrations: add doc_url column to requirements for existing DBs
   const reqCols = db.prepare(`PRAGMA table_info(requirements)`).all() as { name: string }[]
@@ -233,6 +251,14 @@ export function applySchema(db: Database.Database): void {
   }
   if (!reqCols4.some(c => c.name === 'fetch_model')) {
     db.exec(`ALTER TABLE requirements ADD COLUMN fetch_model TEXT`)
+  }
+
+  // Migration: add feishu_fields_json column to requirements
+  // 飞书项目工作项里「描述/需求文档/SPEC文档」三件套的原始值，供 UI 卡片展示。
+  // 使用 JSON 而非三列，是为了将来扩展（例如附件/迭代）不再动 schema。
+  const reqCols5 = db.prepare(`PRAGMA table_info(requirements)`).all() as { name: string }[]
+  if (!reqCols5.some(c => c.name === 'feishu_fields_json')) {
+    db.exec(`ALTER TABLE requirements ADD COLUMN feishu_fields_json TEXT`)
   }
 
   // Migration: add alias column to repos
@@ -289,11 +315,28 @@ export function applySchema(db: Database.Database): void {
   if (!assignCols.some(c => c.name === 'repo_id')) {
     db.exec(`ALTER TABLE assignments ADD COLUMN repo_id TEXT`)
   }
+  // Migration: assignments.main_worktree_path so merge-conflict recovery can
+  // locate the target worktree without an assignment_commits row.
+  if (!assignCols.some(c => c.name === 'main_worktree_path')) {
+    db.exec(`ALTER TABLE assignments ADD COLUMN main_worktree_path TEXT`)
+  }
+  // Migration: assignments.repo_task_id so RepoTask-rooted orchestrator runs
+  // can be traced back to their owning RepoTask (for rollback / cleanup).
+  if (!assignCols.some(c => c.name === 'repo_task_id')) {
+    db.exec(`ALTER TABLE assignments ADD COLUMN repo_task_id TEXT`)
+  }
 
   // Migration: add workflow_completed flag to repo_tasks
   const taskCols3 = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
   if (!taskCols3.some(c => c.name === 'workflow_completed')) {
     db.exec(`ALTER TABLE repo_tasks ADD COLUMN workflow_completed INTEGER NOT NULL DEFAULT 0`)
+  }
+
+  // Migration: lifecycle_status drives "active / pending_merge / archived" UI states.
+  // archive-deploy phase 完成后写 pending_merge；task.cleanupAfterMerge 写 archived。
+  const taskCols4 = db.prepare(`PRAGMA table_info(repo_tasks)`).all() as { name: string }[]
+  if (!taskCols4.some(c => c.name === 'lifecycle_status')) {
+    db.exec(`ALTER TABLE repo_tasks ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'active'`)
   }
 
   // Migration: add MCP probe result columns
@@ -361,7 +404,10 @@ export function applySchema(db: Database.Database): void {
   if (!mcpCols.some(c => c.name === 'oauth_connected_at')) {
     db.exec(`ALTER TABLE mcp_servers ADD COLUMN oauth_connected_at TEXT`)
   }
-  if (!mcpCols.some(c => c.name === 'is_feishu_project')) {
-    db.exec(`ALTER TABLE mcp_servers ADD COLUMN is_feishu_project INTEGER NOT NULL DEFAULT 0`)
+  // 历史 is_feishu_project 列已废弃；存在则尝试 DROP（SQLite 3.35+），不存在则跳过。
+  // 失败也不影响后续运行（列存在但被忽略）。
+  if (mcpCols.some(c => c.name === 'is_feishu_project')) {
+    try { db.exec(`ALTER TABLE mcp_servers DROP COLUMN is_feishu_project`) }
+    catch { /* SQLite < 3.35 不支持 DROP COLUMN，忽略 */ }
   }
 }

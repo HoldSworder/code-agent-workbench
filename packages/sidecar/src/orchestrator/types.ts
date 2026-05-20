@@ -39,7 +39,7 @@ export interface LeaderDecision {
 }
 
 export type OrchestratorRunStatus = 'running' | 'completed' | 'failed' | 'blocked' | 'cancelled'
-export type AssignmentStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+export type AssignmentStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'merge_conflict'
 export type RequirementMode = 'workflow' | 'orchestrator'
 
 export interface OrchestratorRun {
@@ -62,6 +62,8 @@ export interface Assignment {
   acceptance_criteria: string | null
   worktree_path: string | null
   branch_name: string | null
+  main_worktree_path: string | null
+  repo_task_id: string | null
   status: AssignmentStatus
   agent_provider: string | null
   agent_model: string | null
@@ -78,6 +80,10 @@ export type OrchestratorEventType =
   | 'task_assigned'
   | 'worker_started'
   | 'worker_output'
+  | 'worker_heartbeat'
+  | 'worker_merge_conflict'
+  | 'worker_merge_retried'
+  | 'worker_dropped'
   | 'worker_completed'
   | 'worker_failed'
   | 'worker_timeout'

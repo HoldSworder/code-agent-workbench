@@ -90,6 +90,25 @@ glab mr create \
 
 ---
 
+## 步骤 5：等待 MR 合并（任务进入 pending_merge）
+
+phase 完成后任务自动进入 `pending_merge` 生命周期：
+
+- 本地 worktree 目录（`.worktrees/<change_id>`）与 feature 分支 **保留**，方便对 MR 评审意见做后续修改并直接 push
+- 桌面端 Dashboard 任务卡片会展示「等待 MR 合并」标记，并提供「已合并，清理 worktree」按钮
+- MR 在 GitLab 被合并到目标分支后，由用户在桌面端点击该按钮触发 `task.cleanupAfterMerge` RPC：
+  - sidecar 会校验本地 feature 分支已合入 default branch（master / main）
+  - 校验通过 → `git worktree remove --force` + `git branch -d feature/<change_id>`，任务变为 `archived`
+  - 校验未通过（MR 实际未合并）→ 拒绝清理；用户须先确认 MR 状态
+
+**本 phase 自身不得执行以下任何清理命令**：
+
+- `git worktree remove ...`
+- `git branch -d feature/...` / `git branch -D feature/...`
+- 删除 `.worktrees/<change_id>` 目录
+
+---
+
 ## 护栏
 
 - 仅提交 openspec 目录的归档 commit 时，**不得误含无关未审变更**；若一并推送功能代码，须已通过 E2E 浏览器测试（`e2e-test.md`）门禁
@@ -98,3 +117,4 @@ glab mr create \
 - 目标分支默认为 `develop`，除非上下文另有指定
 - 不得执行 `--force` 推送
 - 验收未通过且用户未同意带债时，不得执行本阶段归档与 MR
+- **禁止**在本 phase 内执行 `git worktree remove` / `git branch -d` 等清理动作；清理统一由 `task.cleanupAfterMerge` RPC 在 MR 合并后处理

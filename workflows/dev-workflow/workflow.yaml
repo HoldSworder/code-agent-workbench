@@ -160,8 +160,8 @@ state_inference:
 
     - condition: no_change_dir
       stage: planning
-      phase: create-branch
-      description: 无变更目录 → 先创建 feature 分支，再进入 Spec 落盘
+      phase: spec-create
+      description: 无变更目录 → 直接进入 Spec 落盘（worktree + 分支由 sidecar 在 task.create 时创建）
 
     - condition: has_proposal_and_specs_no_tasks
       stage: planning
@@ -200,13 +200,10 @@ stages:
   - id: planning
     name: 任务规划
     gate: has_tasks
+    # NOTE: feature 分支与 worktree 由 sidecar 在 task.create RPC 时通过 LLM 翻译需求
+    # 标题为英文 slug 后直接创建（git worktree add -b feature/<slug> ...），
+    # 因此本 stage 不再需要 create-branch phase。如需重命名分支可调 task.renameBranch RPC。
     phases:
-      - id: create-branch
-        name: 创建分支
-        provider: external-cli
-        skill: skills/create-branch.md
-        entry_gate: working_tree_clean
-
       # Skill 节点：复用根级 skills/feishu-branch-link/ 可复用能力包
       # 由 engine 直接加载 SKILL.md + 执行变量插值，无需在 workflow 中重复编写
       - id: link-feishu

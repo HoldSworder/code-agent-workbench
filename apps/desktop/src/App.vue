@@ -32,6 +32,16 @@ onBeforeUnmount(() => {
       </div>
       <div class="flex-1 overflow-y-auto px-2">
         <router-link
+          to="/cursor-cli"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150"
+          :class="route.path === '/cursor-cli'
+            ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white font-medium shadow-sm'
+            : 'text-gray-600 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5'"
+        >
+          <div class="i-carbon-terminal w-4 h-4 opacity-60" />
+          Cursor CLI
+        </router-link>
+        <router-link
           to="/"
           class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150"
           :class="route.path === '/'
@@ -40,6 +50,16 @@ onBeforeUnmount(() => {
         >
           <div class="i-carbon-dashboard w-4 h-4 opacity-60" />
           需求看板
+        </router-link>
+        <router-link
+          to="/feishu-project"
+          class="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-[13px] transition-all duration-150"
+          :class="route.path === '/feishu-project'
+            ? 'bg-white dark:bg-white/10 text-gray-900 dark:text-white font-medium shadow-sm'
+            : 'text-gray-600 dark:text-gray-400 hover:bg-white/60 dark:hover:bg-white/5'"
+        >
+          <div class="i-carbon-task-view w-4 h-4 opacity-60" />
+          飞书项目
         </router-link>
 
         <div class="px-3 mt-5 mb-1.5 text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-widest">
@@ -134,7 +154,11 @@ onBeforeUnmount(() => {
     </nav>
 
     <main class="flex-1 overflow-y-auto">
-      <router-view v-if="sidecarReady" />
+      <router-view v-if="sidecarReady" v-slot="{ Component }">
+        <keep-alive :include="['CursorCliView']">
+          <component :is="Component" />
+        </keep-alive>
+      </router-view>
       <div v-else class="flex items-center justify-center h-full">
         <div class="flex items-center gap-3 text-gray-400 text-sm">
           <div class="w-4 h-4 border-2 border-gray-300 border-t-indigo-500 rounded-full animate-spin" />

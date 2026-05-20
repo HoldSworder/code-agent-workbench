@@ -14,9 +14,32 @@ export interface Requirement {
   fetch_prompt: string | null
   fetch_cli_type: string | null
   fetch_model: string | null
+  /** 飞书项目「描述/需求文档/SPEC文档」三件套（JSON 字符串）。源不是 feishu 时为 null。 */
+  feishu_fields_json: string | null
   status: string
   mode: string
   created_at: string
+}
+
+export interface FeishuRequirementFields {
+  description: string | null
+  requirementDocUrl: string | null
+  specDocUrl: string | null
+}
+
+export function parseFeishuFields(json: string | null | undefined): FeishuRequirementFields | null {
+  if (!json) return null
+  try {
+    const o = JSON.parse(json) as Partial<FeishuRequirementFields>
+    return {
+      description: o.description ?? null,
+      requirementDocUrl: o.requirementDocUrl ?? null,
+      specDocUrl: o.specDocUrl ?? null,
+    }
+  }
+  catch {
+    return null
+  }
 }
 
 export interface CreateRequirementInput {

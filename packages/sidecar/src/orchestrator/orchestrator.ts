@@ -7,6 +7,7 @@ import { OrchestratorRepository } from './repository'
 import { LeaderLoop } from './leader'
 import type { TeamConfig, RoleConfig } from './types'
 import { AgentOutputBuffer } from './output-buffer'
+import { AsyncLock } from './worker-runner'
 
 export interface OrchestratorOptions {
   db: Database.Database
@@ -30,6 +31,21 @@ export class Orchestrator {
   private onChunk?: RunOptions['onChunk']
   private onEvent?: (event: string, data?: unknown) => void
   readonly outputBuffer = new AgentOutputBuffer()
+  /**
+   * Per main-worktree merge locks. Lazily created; reused across the initial
+   * `runWorker` merge and any subsequent `retryMergeAssignment` calls so a
+   * conflict recovery cannot race a fresh worker's merge.
+   */
+  private readonly mergeLocks = new Map<string, AsyncLock>()
+
+  getMergeLock(mainWorktreePath: string): AsyncLock {
+    let l = this.mergeLocks.get(mainWorktreePath)
+    if (!l) {
+      l = new AsyncLock()
+      this.mergeLocks.set(mainWorktreePath, l)
+    }
+    return l
+  }
 
   constructor(private options: OrchestratorOptions) {
     this.repo = new OrchestratorRepository(options.db)

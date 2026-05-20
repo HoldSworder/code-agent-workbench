@@ -2,16 +2,16 @@ import type Database from 'better-sqlite3'
 import { errorMessage } from '@code-agent/shared/util'
 import { getLarkAuthStatus } from '@code-agent/shared/lark'
 import type { LarkIdentityResult } from '@code-agent/shared/lark'
+import { listMetaFields, updateWorkItem } from '@code-agent/shared/meegle'
 import type { RpcServer } from './server'
-import { McpServerRepository } from '../db/repositories/mcp-server.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { FeishuProjectMcpClient } from '../review/feishu-project-mcp'
 import * as feishuDoc from '../review/feishu-doc'
 import { generateFrontendDesign } from '../review/design-generator'
 import { resolveRequirementDoc, type RequirementSource } from '../review/feishu-requirement'
 import { evaluateStoryPoints, formatAssessmentMarkdown, type RoleResult } from '../review/story-point-evaluator'
 import { ReviewServerClient } from '../review/client'
-import { extractMcpText, normalizeViewItems, parseMarkdownTableItems, parseMcpJson, type NormalizedViewItem } from '../review/mcp-text'
+import { listViewItems } from '../review/meegle-view'
+import type { NormalizedViewItem } from '../review/meegle-view'
 import { detectStoryPointFields, flattenFieldList, type DetectStoryPointFieldsResult, type StoryPointFieldRef } from '../review/story-point-detector'
 import { isCliProvider, loadAgentRuntimeFromSettings, type AgentRuntimeSettings } from '../providers/factory'
 
@@ -34,9 +34,7 @@ async function checkLarkIdentity(): Promise<LarkIdentityResult> {
 }
 
 export function registerReviewMethods(server: RpcServer, db: Database.Database): void {
-  const mcpServerRepo = new McpServerRepository(db)
   const settingsRepo = new SettingsRepository(db)
-  const feishuMcp = new FeishuProjectMcpClient(mcpServerRepo)
 
   /**
    * 实时从设置解析 LLM runtime（CLI provider 或 custom-api），避免 sidecar 启动后无法热更新。
@@ -63,19 +61,9 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
 
   server.register('review.checkLarkIdentity', async () => checkLarkIdentity())
 
-  server.register('review.checkFeishuProjectMcp', async () => feishuMcp.checkStatus())
-
-  server.register('review.feishuProjectMcpCall', async ({ tool, args }: { tool: string, args?: Record<string, unknown> }) => {
-    const result = await feishuMcp.callTool(tool, args ?? {})
-    return { result }
-  })
-
   /**
    * 拉取飞书项目视图下的工作项列表，标准化后返回，供「评审入口」选择需求。
-   * - 不缓存、不持久化，每次实时调用 MCP。
-   * - 入参 viewId 是飞书侧的视图 ID，projectKey/workItemType 用于拼回详情链接。
-   * - 工具名按关键字 `get_view_detail` 在 tools/list 里动态匹配，兼容不同 MCP 部署的命名。
-   * - 当解析不出条目时回传 debug 字段（实际工具名 + 原始响应摘要），便于前端排错。
+   * 现在通过 meegle CLI 直接 fetch（不再走 MCP）。
    */
   server.register('review.listViewWorkItems', async (params: {
     projectKey: string
@@ -87,55 +75,19 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
     items: NormalizedViewItem[]
     pageNum: number
     pageSize: number
-    toolName: string
-    debug?: { availableTools: string[], rawSnippet: string | null }
+    hasMore: boolean
+    total: number | null
+    debug?: { rawSnippet: string | null }
   }> => {
-    const projectKey = params.projectKey?.trim()
-    const workItemType = params.workItemType?.trim()
-    const viewId = params.viewId?.trim()
-    if (!projectKey || !workItemType || !viewId)
-      throw new Error('projectKey/workItemType/viewId 三者均必填')
-
-    const pageNum = Math.max(1, Number(params.pageNum) || 1)
-    const pageSize = Math.min(200, Math.max(1, Number(params.pageSize) || 50))
-
-    const allTools = await feishuMcp.listToolNames()
-    const toolName = allTools.find(n => /(^|[-_/])get_view_detail$/i.test(n))
-      ?? allTools.find(n => n.toLowerCase().includes('get_view_detail'))
-    if (!toolName) {
-      throw new Error(
-        `飞书项目 MCP 未暴露 get_view_detail 工具。可用工具：${allTools.join(', ') || '（空）'}`,
-      )
+    const r = await listViewItems(params)
+    return {
+      items: r.items,
+      pageNum: r.pageNum,
+      pageSize: Math.min(200, Math.max(1, Number(params.pageSize) || 50)),
+      hasMore: r.hasMore,
+      total: r.total,
+      ...(r.items.length === 0 && r.rawSnippet ? { debug: { rawSnippet: r.rawSnippet } } : {}),
     }
-
-    const result = await feishuMcp.callTool(toolName, {
-      view_id: viewId,
-      project_key: projectKey,
-      page_num: pageNum,
-      page_size: pageSize,
-    })
-    const rawText = extractMcpText(result)
-
-    // 飞书项目 MCP 既可能返回 JSON 文本（list/items/data.list），也可能返回 markdown 表格。
-    // 先按 JSON 路径，再回退到 markdown 表格解析。
-    let items = normalizeViewItems(parseMcpJson(result), { projectKey, workItemType })
-    if (items.length === 0)
-      items = parseMarkdownTableItems(rawText, { projectKey, workItemType })
-
-    if (items.length === 0) {
-      return {
-        items,
-        pageNum,
-        pageSize,
-        toolName,
-        debug: {
-          availableTools: allTools,
-          rawSnippet: rawText ? rawText.slice(0, 800) : null,
-        },
-      }
-    }
-
-    return { items, pageNum, pageSize, toolName }
   })
 
   // ── 飞书云文档（lark-cli 包装） ──
@@ -161,7 +113,6 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
     if (!params.workItemUrl?.trim())
       throw new Error('workItemUrl 必填')
     return resolveRequirementDoc({
-      feishuMcp,
       workItemUrl: params.workItemUrl.trim(),
     })
   })
@@ -212,9 +163,9 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
     rulesFilePath?: string
     cwd?: string
     feishuSpecDocTokenOrUrl?: string
-    /** 写回飞书项目工作项时使用：{tool, requirementId, fieldMap} */
+    /** 写回飞书项目工作项时使用。projectKey 必填（meegle update 需要）。 */
     writebackPlan?: {
-      tool: string
+      projectKey: string
       requirementId: string | number
       fields: Array<{ fieldKey: string, role: RoleResult['role'] }>
     }
@@ -244,18 +195,22 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
 
     if (params.writebackPlan) {
       const byRole = new Map<RoleResult['role'], number>(results.map(r => [r.role, r.points]))
+      const fieldsToUpdate: Array<{ field_key: string, field_value: unknown }> = []
       for (const f of params.writebackPlan.fields) {
         const points = byRole.get(f.role)
         if (points == null) continue
+        fieldsToUpdate.push({ field_key: f.fieldKey, field_value: points })
+      }
+      if (fieldsToUpdate.length > 0) {
         try {
-          await feishuMcp.callTool(params.writebackPlan.tool, {
+          await updateWorkItem({
+            projectKey: params.writebackPlan.projectKey,
             workItemId: params.writebackPlan.requirementId,
-            fieldKey: f.fieldKey,
-            value: points,
+            fields: fieldsToUpdate,
           })
         }
         catch (err) {
-          warnings.push(`回写字段 ${f.fieldKey} 失败: ${errorMessage(err)}`)
+          warnings.push(`回写飞书故事点失败: ${errorMessage(err)}`)
         }
       }
     }
@@ -294,31 +249,8 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
     if (!projectKey) throw new Error('projectKey 必填')
     if (!workItemType) throw new Error('workItemType 必填')
 
-    const allTools = await feishuMcp.listToolNames()
-    const toolName = allTools.find(n => /(^|[-_/])list_workitem_field_config$/i.test(n))
-      ?? allTools.find(n => n.toLowerCase().includes('list_workitem_field_config'))
-    if (!toolName) {
-      throw new Error(`飞书项目 MCP 未提供 list_workitem_field_config 工具。已知工具：${allTools.slice(0, 20).join(', ')}`)
-    }
-
-    let allFields: StoryPointFieldRef[] = []
-    let pageNum = 1
-    while (pageNum <= 10) {
-      const result = await feishuMcp.callTool(toolName, {
-        project_key: projectKey,
-        work_item_type: workItemType,
-        page_num: pageNum,
-      })
-      const json = parseMcpJson<unknown>(result)
-      const page = flattenFieldList(json)
-      if (page.length === 0) break
-      const seen = new Set(allFields.map(f => f.fieldKey))
-      for (const f of page) if (!seen.has(f.fieldKey)) allFields.push(f)
-      // 单页通常 50 条；不到 50 视为最后一页。
-      if (page.length < 50) break
-      pageNum += 1
-    }
-
+    const list = await listMetaFields({ projectKey, workItemType })
+    const allFields: StoryPointFieldRef[] = flattenFieldList({ list })
     const matched = detectStoryPointFields(allFields)
     return { ...matched, writebackTool: 'update_field' }
   })

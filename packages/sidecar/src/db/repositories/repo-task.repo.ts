@@ -12,8 +12,11 @@ export interface RepoTask {
   phase_status: string
   openspec_path: string
   worktree_path: string
+  base_sha: string | null
   workflow_id: string | null
   workflow_completed: number
+  /** 任务生命周期：active（开发中）/ pending_merge（已发 MR，等合并）/ archived（已清理） */
+  lifecycle_status: 'active' | 'pending_merge' | 'archived'
   created_at: string
   updated_at: string
 }
@@ -25,6 +28,7 @@ export interface CreateRepoTaskInput {
   change_id: string
   openspec_path: string
   worktree_path: string
+  base_sha?: string | null
   workflow_id?: string
 }
 
@@ -39,9 +43,9 @@ export class RepoTaskRepository {
       INSERT INTO repo_tasks (
         id, requirement_id, repo_id, branch_name, change_id,
         current_stage, current_phase, phase_status,
-        openspec_path, worktree_path, workflow_id
+        openspec_path, worktree_path, base_sha, workflow_id
       )
-      VALUES (?, ?, ?, ?, ?, 'planning', 'task-breakdown', 'pending', ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'planning', 'task-breakdown', 'pending', ?, ?, ?, ?)
     `,
       )
       .run(
@@ -52,6 +56,7 @@ export class RepoTaskRepository {
         input.change_id,
         input.openspec_path,
         input.worktree_path,
+        input.base_sha ?? null,
         input.workflow_id ?? null,
       )
     return this.findById(id)!
@@ -111,6 +116,20 @@ export class RepoTaskRepository {
       .run(id)
   }
 
+  setLifecycleStatus(id: string, status: 'active' | 'pending_merge' | 'archived'): void {
+    this.db
+      .prepare(`UPDATE repo_tasks SET lifecycle_status = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(status, id)
+  }
+
+  markPendingMerge(id: string): void {
+    this.setLifecycleStatus(id, 'pending_merge')
+  }
+
+  markArchived(id: string): void {
+    this.setLifecycleStatus(id, 'archived')
+  }
+
   updatePhase(id: string, currentStage: string, currentPhase: string, phaseStatus: string): void {
     this.db
       .prepare(
@@ -126,6 +145,7 @@ export class RepoTaskRepository {
   delete(id: string): void {
     const deleteRelated = this.db.transaction(() => {
       this.db.prepare('DELETE FROM activated_phases WHERE repo_task_id = ?').run(id)
+      this.db.prepare('DELETE FROM assignment_commits WHERE repo_task_id = ?').run(id)
       this.db.prepare('DELETE FROM phase_commits WHERE repo_task_id = ?').run(id)
       this.db.prepare('DELETE FROM conversation_messages WHERE repo_task_id = ?').run(id)
       this.db.prepare('DELETE FROM agent_runs WHERE repo_task_id = ?').run(id)

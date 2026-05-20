@@ -15,6 +15,7 @@ export interface RepoTask {
   worktree_path: string
   workflow_id: string | null
   workflow_completed: number
+  lifecycle_status: 'active' | 'pending_merge' | 'archived'
   created_at: string
   updated_at: string
 }
@@ -115,6 +116,21 @@ export const useTasksStore = defineStore('tasks', () => {
     return await rpc('workflow.checkDependencies')
   }
 
+  async function renameBranch(taskId: string, newSlug: string): Promise<RepoTask> {
+    const { task } = await rpc<{ task: RepoTask, changed: boolean }>('task.renameBranch', { taskId, newSlug })
+    if (currentTask.value?.id === taskId) currentTask.value = task
+    const idx = tasks.value.findIndex(t => t.id === taskId)
+    if (idx !== -1) tasks.value[idx] = task
+    return task
+  }
+
+  async function cleanupAfterMerge(taskId: string, force = false): Promise<void> {
+    await rpc('task.cleanupAfterMerge', { taskId, force })
+    if (currentTask.value?.id === taskId) await fetchTask(taskId)
+    const t = tasks.value.find(x => x.id === taskId)
+    if (t) t.lifecycle_status = 'archived'
+  }
+
   return {
     tasks, currentTask, messages, taskErrors, retrying,
     fetchByRepo, fetchByRequirement, fetchTask, fetchMessages,
@@ -122,5 +138,6 @@ export const useTasksStore = defineStore('tasks', () => {
     createTask, startWorkflow,
     retry, finishRetry, confirm, sendFeedback, cancel,
     checkDependencies,
+    renameBranch, cleanupAfterMerge,
   }
 })
