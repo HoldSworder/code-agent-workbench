@@ -44,23 +44,42 @@ function extractToolInput(evt: Record<string, any>): string {
 }
 
 /**
- * 抽取一行人类可读的活动条目；返回 null 表示该事件不需要打 activity 日志。
+ * 结构化活动事件：
+ * - `thinking-delta` / `text-delta` 携带原始 delta 文本，调用方可缓冲合并
+ * - `event` 已是格式化好的整行（含时间戳和 emoji）
  */
-export function extractActivityEntry(line: string): string | null {
+export type ActivityEvent =
+  | { kind: 'thinking-delta', text: string }
+  | { kind: 'text-delta', text: string }
+  | { kind: 'event', line: string }
+
+/** 把缓冲后的 delta 文本格式化成 activity 日志一行。 */
+export function formatDeltaEntry(kind: 'thinking' | 'text', text: string): string {
+  const ts = activityTimestamp()
+  const snippet = (kind === 'text' ? stripThinkTags(text) : text)
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!snippet) return ''
+  return kind === 'thinking' ? `[${ts}] 🧠 ${snippet}` : `[${ts}] ✍️ ${snippet}`
+}
+
+/**
+ * 抽取结构化活动事件。delta 类返回原始 text 供调用方缓冲合并，
+ * 其它事件直接返回格式化好的整行。
+ */
+export function extractActivityEvent(line: string): ActivityEvent | null {
   try {
     const evt = JSON.parse(line) as Record<string, any>
     const ts = activityTimestamp()
 
     if (evt.type === 'thinking' && evt.subtype === 'delta' && typeof evt.text === 'string') {
-      const snippet = evt.text.replace(/\n/g, ' ').trim().slice(-60)
-      if (snippet) return `[${ts}] 🧠 ${snippet}`
-      return null
+      if (!evt.text) return null
+      return { kind: 'thinking-delta', text: evt.text }
     }
 
     if (evt.type === 'assistant' && evt.subtype === 'delta' && typeof evt.text === 'string') {
-      const snippet = stripThinkTags(evt.text).replace(/\n/g, ' ').slice(0, 80)
-      if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
-      return null
+      if (!evt.text) return null
+      return { kind: 'text-delta', text: evt.text }
     }
 
     if (evt.type === 'assistant' && !evt.subtype) {
@@ -70,39 +89,38 @@ export function extractActivityEntry(line: string): string | null {
       if (lastBlock.type === 'tool_use') {
         const name = lastBlock.name ?? 'unknown'
         const input = extractToolInput(lastBlock)
-        return `[${ts}] 🔧 Tool: ${name}${input ? ` → ${input}` : ''}`
+        return { kind: 'event', line: `[${ts}] 🔧 Tool: ${name}${input ? ` → ${input}` : ''}` }
       }
       if (lastBlock.type === 'tool_result') {
         const status = lastBlock.is_error ? '❌' : '✅'
         const len = typeof lastBlock.content === 'string' ? lastBlock.content.length : 0
-        return `[${ts}] ${status} Tool result${len ? ` (${len} chars)` : ''}`
+        return { kind: 'event', line: `[${ts}] ${status} Tool result${len ? ` (${len} chars)` : ''}` }
       }
-      if (lastBlock.type === 'text') {
-        const snippet = (lastBlock.text ?? '').replace(/\n/g, ' ').trim().slice(-60)
-        if (snippet) return `[${ts}] ✍️ ${snippet}`
+      if (lastBlock.type === 'text' && typeof lastBlock.text === 'string') {
+        if (!lastBlock.text) return null
+        return { kind: 'text-delta', text: lastBlock.text }
       }
       return null
     }
 
     if (evt.type === 'user')
-      return `[${ts}] 📨 User message received`
+      return { kind: 'event', line: `[${ts}] 📨 User message received` }
 
     if (evt.type === 'system') {
       if (evt.subtype === 'init')
-        return `[${ts}] ⚙️ Init | Model: ${evt.model ?? 'unknown'}`
-      return `[${ts}] ⚙️ System: ${evt.subtype ?? evt.message ?? ''}`
+        return { kind: 'event', line: `[${ts}] ⚙️ Init | Model: ${evt.model ?? 'unknown'}` }
+      return { kind: 'event', line: `[${ts}] ⚙️ System: ${evt.subtype ?? evt.message ?? ''}` }
     }
 
     if (evt.type === 'text' && typeof evt.text === 'string') {
-      const snippet = stripThinkTags(evt.text).replace(/\n/g, ' ').slice(0, 80)
-      if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
-      return null
+      if (!evt.text) return null
+      return { kind: 'text-delta', text: evt.text }
     }
 
     if (evt.type === 'tool_use' || evt.subtype === 'tool_use') {
       const tool = extractToolName(evt)
       const input = extractToolInput(evt)
-      return `[${ts}] 🔧 Tool: ${tool}${input ? ` → ${input}` : ''}`
+      return { kind: 'event', line: `[${ts}] 🔧 Tool: ${tool}${input ? ` → ${input}` : ''}` }
     }
 
     if (evt.type === 'assistant' && evt.subtype === 'tool_use_delta')
@@ -111,7 +129,7 @@ export function extractActivityEntry(line: string): string | null {
     if (evt.type === 'tool_result' || evt.subtype === 'tool_result') {
       const len = typeof evt.output === 'string' ? evt.output.length : (evt.content?.length ?? 0)
       const status = evt.is_error ? '❌' : '✅'
-      return `[${ts}] ${status} Tool result${len ? ` (${len} chars)` : ''}`
+      return { kind: 'event', line: `[${ts}] ${status} Tool result${len ? ` (${len} chars)` : ''}` }
     }
 
     if (evt.type === 'stream_event') {
@@ -119,15 +137,14 @@ export function extractActivityEntry(line: string): string | null {
       if (!inner) return null
       const delta = inner.delta
       if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-        const snippet = delta.text.replace(/\n/g, ' ').slice(0, 80)
-        if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
-        return null
+        if (!delta.text) return null
+        return { kind: 'text-delta', text: delta.text }
       }
       if (delta?.type === 'input_json_delta') return null
       if (inner.type === 'content_block_start') {
         const block = inner.content_block
         if (block?.type === 'tool_use')
-          return `[${ts}] 🔧 Tool: ${block.name ?? 'unknown'}`
+          return { kind: 'event', line: `[${ts}] 🔧 Tool: ${block.name ?? 'unknown'}` }
         return null
       }
       if (inner.type === 'content_block_stop' || inner.type === 'message_start'
@@ -136,19 +153,29 @@ export function extractActivityEntry(line: string): string | null {
     }
 
     if (evt.type === 'content_block_delta') {
-      if (evt.delta?.type === 'text_delta') {
-        const snippet = (evt.delta.text ?? '').replace(/\n/g, ' ').slice(0, 80)
-        if (snippet.trim()) return `[${ts}] ✍️ ${snippet}`
-      }
+      if (evt.delta?.type === 'text_delta' && typeof evt.delta.text === 'string' && evt.delta.text)
+        return { kind: 'text-delta', text: evt.delta.text }
       return null
     }
 
     if (evt.type === 'result')
-      return `[${ts}] 🏁 Agent completed`
+      return { kind: 'event', line: `[${ts}] 🏁 Agent completed` }
 
     return null
   }
   catch { return null }
+}
+
+/**
+ * 兼容包装：把单条 delta 直接 format，event 返回 line。
+ * 不做跨行合并；如需合并多 delta 请改用 `extractActivityEvent` + 自行缓冲。
+ */
+export function extractActivityEntry(line: string): string | null {
+  const evt = extractActivityEvent(line)
+  if (!evt) return null
+  if (evt.kind === 'event') return evt.line
+  const formatted = formatDeltaEntry(evt.kind === 'thinking-delta' ? 'thinking' : 'text', evt.text)
+  return formatted || null
 }
 
 /**

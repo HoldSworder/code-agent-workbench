@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   extractActivityEntry,
+  extractActivityEvent,
   extractSessionId,
   extractStreamText,
   extractTokenUsage,
+  formatDeltaEntry,
   normalizeLine,
   parseJsonOutput,
   parseStreamResult,
@@ -78,6 +80,50 @@ describe('extractActivityEntry', () => {
 
   it('非 JSON 返回 null', () => {
     expect(extractActivityEntry('garbage')).toBeNull()
+  })
+})
+
+describe('extractActivityEvent', () => {
+  it('thinking delta 返回 thinking-delta 原始文本', () => {
+    const r = extractActivityEvent(JSON.stringify({ type: 'thinking', subtype: 'delta', text: 'I ' }))
+    expect(r).toEqual({ kind: 'thinking-delta', text: 'I ' })
+  })
+
+  it('assistant delta 返回 text-delta 原始文本', () => {
+    const r = extractActivityEvent(JSON.stringify({ type: 'assistant', subtype: 'delta', text: 'hello' }))
+    expect(r).toEqual({ kind: 'text-delta', text: 'hello' })
+  })
+
+  it('tool_use 返回 event 整行', () => {
+    const r = extractActivityEvent(JSON.stringify({ type: 'tool_use', name: 'Read', input: { path: '/a' } }))
+    expect(r?.kind).toBe('event')
+    expect((r as any).line).toMatch(/🔧 Tool: Read/)
+  })
+
+  it('result 返回 event', () => {
+    const r = extractActivityEvent(JSON.stringify({ type: 'result' }))
+    expect(r?.kind).toBe('event')
+    expect((r as any).line).toMatch(/🏁/)
+  })
+
+  it('非 JSON 返回 null', () => {
+    expect(extractActivityEvent('garbage')).toBeNull()
+  })
+})
+
+describe('formatDeltaEntry', () => {
+  it('thinking 合并多 token 空白', () => {
+    const out = formatDeltaEntry('thinking', 'I\nneed   to understand\nthe user')
+    expect(out).toMatch(/🧠 I need to understand the user$/)
+  })
+
+  it('text 同时剥离 <think> 标签', () => {
+    const out = formatDeltaEntry('text', 'hello <think>x</think>world')
+    expect(out).toMatch(/✍️ hello xworld$/)
+  })
+
+  it('空文本返回空串', () => {
+    expect(formatDeltaEntry('thinking', '   \n  ')).toBe('')
   })
 })
 

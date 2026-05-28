@@ -155,7 +155,7 @@ onBeforeUnmount(() => {
 
     <main class="flex-1 overflow-y-auto">
       <router-view v-if="sidecarReady" v-slot="{ Component }">
-        <keep-alive :include="['CursorCliView']">
+        <keep-alive :include="['CursorCliView', 'FeishuProjectView']">
           <component :is="Component" />
         </keep-alive>
       </router-view>

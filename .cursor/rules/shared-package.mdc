@@ -93,7 +93,8 @@ packages/shared/src/
   http/   readBody / sendJson / sendError / parseRequest / applyCors / extractClientIp
   db/     createSqliteConnection
   cli/    CliRunner / buildCliArgs / buildAgentEnv / buildSniProxyPatch / resolveBinary
-          + stream-parse: extractStreamText / extractActivityEntry / extractSessionId
+          + stream-parse: extractStreamText / extractActivityEntry / extractActivityEvent
+                          / formatDeltaEntry / extractSessionId
                           / extractTokenUsage / parseStreamResult / parseJsonOutput
                           / normalizeLine / stripThinkTags
   llm/    createLlmClient / callAnthropic

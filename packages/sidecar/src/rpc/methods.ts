@@ -15,10 +15,8 @@ import { existsSync, writeFileSync, readFileSync } from 'node:fs'
 import { stringify as yamlStringify } from 'yaml'
 import type { WorkflowEngine } from '../workflow/engine'
 import { parseWorkflow } from '../workflow/parser'
-import { getChangedFiles, getFileDiff, getMergeBase, git, createWorktree, removeWorktree, listWorktrees, ensureLocalExclude, detectDefaultBranch, renameCurrentBranch, isBranchMergedInto, deleteBranch } from '../git/operations'
-import { llmCall } from '../review/llm'
-import { BRANCH_SLUG_SYSTEM_PROMPT, normalizeSlug } from '@code-agent/shared/llm'
-import { loadAgentRuntimeFromSettings } from '../providers/factory'
+import { getChangedFiles, getFileDiff, getMergeBase, git, removeWorktree, listWorktrees, ensureLocalExclude, detectDefaultBranch, renameCurrentBranch, isBranchMergedInto, deleteBranch } from '../git/operations'
+import { normalizeSlug } from '@code-agent/shared/llm'
 import { errorMessage } from '@code-agent/shared/util'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 import { readTranscript, listSessionsForRepo } from '../transcript/reader'
@@ -50,28 +48,26 @@ const __dirname = dirname(__filename)
 const projectRoot = resolve(__dirname, '../../..')
 
 /**
- * 通过用户已配置的 LLM runtime（CLI provider 或 custom-api）将中文需求标题
- * 翻译/规范化为 kebab-case 英文 slug。
+ * 生成初始 changeId（占位 slug）。
  *
- * 失败语义：所有异常向上抛，由 task.create 决定回滚还是兜底。
+ * 仅作为 `task.create` 写 DB 时的临时分支名，真实的语义化英文 slug 由
+ * `create-branch` workflow phase 的 agent 在主仓库根目录运行后生成，
+ * engine 的 post-phase 钩子会扫 `git worktree list` 把新创建的 worktree
+ * 路径与分支名回写到 repo_tasks。
  */
-async function generateChangeIdViaLlm(
-  title: string,
-  description: string | undefined,
-  runtime: ReturnType<typeof loadAgentRuntimeFromSettings>,
-  cwd: string,
-): Promise<string> {
-  const userPrompt = description?.trim()
-    ? `Title: ${title}\nDescription: ${description}`
-    : title
-  const text = await llmCall({
-    systemPrompt: BRANCH_SLUG_SYSTEM_PROMPT,
-    userPrompt,
-    maxTokens: 64,
-    runtime,
-    cwd,
-  })
-  return normalizeSlug(text)
+function changeIdFromRequirement(title: string, description?: string): string {
+  const text = (title || description || '').trim()
+  const slug = text
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  const suffix = Date.now().toString(36).slice(-4)
+  if (!slug) return `pending-${suffix}`
+  const truncated = slug.slice(0, 40).replace(/-$/, '')
+  return `${truncated}-${suffix}`
 }
 
 export function registerMethods(
@@ -342,6 +338,7 @@ export function registerMethods(
       catch { /* keep DB value */ }
 
       // Resolve baseSha: prefer remote default branch, fall back to local.
+      // 作为回滚锚点写入 repo_tasks.base_sha；真实 worktree 由 create-branch phase 创建。
       let baseSha: string | null = null
       try { baseSha = await git(repo.local_path, ['rev-parse', `origin/${detectedBranch}`]) }
       catch {
@@ -351,31 +348,17 @@ export function registerMethods(
       if (!baseSha)
         throw new Error(`Cannot resolve base sha for ${detectedBranch} in ${repo.local_path}`)
 
-      // Generate semantic English slug via configured LLM runtime.
-      // 失败直接抛错——所有工作流都依赖 LLM，用户已配置 provider 不应失败；
-      // 若运行时确实不可用，前端会展示错误并允许重试。
-      const runtime = loadAgentRuntimeFromSettings(settingsRepo)
-      const slug = await generateChangeIdViaLlm(
-        requirement.title,
-        requirement.description,
-        runtime,
-        repo.local_path,
-      )
-      const changeId = slug
-      const branchName = `feature/${changeId}`
-      const openspecPath = `openspec/changes/${changeId}`
-
-      const worktreePath = join(repo.local_path, '.worktrees', changeId)
-      // Hide internal worktree directory from main repo's git status.
+      // Hide future .worktrees/ directory from main repo's git status now;
+      // worktree itself is created by the create-branch phase agent.
       await ensureLocalExclude(repo.local_path, '.worktrees/')
 
-      try {
-        await createWorktree(repo.local_path, worktreePath, branchName, baseSha)
-      }
-      catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        throw new Error(`Failed to create worktree at ${worktreePath}: ${msg}`)
-      }
+      // 占位 changeId / branchName / worktreePath：真实值由 create-branch phase
+      // 的 agent 在主仓库根目录运行 `git worktree add -b feature/<slug>` 后产生，
+      // engine 的 post-phase 钩子会回写到 repo_tasks。
+      const changeId = changeIdFromRequirement(requirement.title, requirement.description)
+      const branchName = `feature/${changeId}`
+      const openspecPath = `openspec/changes/${changeId}`
+      const worktreePath = join(repo.local_path, '.worktrees', changeId)
 
       const task = taskRepo.create({
         requirement_id: requirement.id,
@@ -390,9 +373,6 @@ export function registerMethods(
       // Seed phase_commits INITIAL_PHASE_ID so downstream rollback chain has an
       // anchor without depending on getMergeBase against remote.
       try { commitRepo.save(task.id, INITIAL_PHASE_ID, baseSha) } catch {}
-
-      // Best-effort 飞书项目同步：失败仅 elog，不阻塞任务创建。
-      engine.syncBranchToFeishuProject(task.id).catch(() => {})
 
       return task
     },

@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import { rpc } from '../composables/use-sidecar'
 import { useRequirementsStore, type Requirement } from '../stores/requirements'
 
+defineOptions({ name: 'FeishuProjectView' })
+
 interface ViewWorkItem {
   id: string
   title: string | null

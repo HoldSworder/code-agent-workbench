@@ -110,6 +110,12 @@ export class RepoTaskRepository {
       .run(branchName, changeId, openspecPath, id)
   }
 
+  updateWorktreePath(id: string, worktreePath: string): void {
+    this.db
+      .prepare(`UPDATE repo_tasks SET worktree_path = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(worktreePath, id)
+  }
+
   markWorkflowCompleted(id: string): void {
     this.db
       .prepare(`UPDATE repo_tasks SET workflow_completed = 1, updated_at = datetime('now') WHERE id = ?`)

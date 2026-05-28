@@ -18,8 +18,11 @@ export {
   stripThinkTags,
   extractStreamText,
   extractActivityEntry,
+  extractActivityEvent,
+  formatDeltaEntry,
   extractSessionId,
   extractTokenUsage,
   parseStreamResult,
   parseJsonOutput,
 } from './stream-parse'
+export type { ActivityEvent } from './stream-parse'

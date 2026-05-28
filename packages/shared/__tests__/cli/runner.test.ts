@@ -92,6 +92,65 @@ describe('CliRunner.run（基于真实 spawn / node 子进程）', () => {
     expect(result.error).toMatch(/No agent activity/)
   }, 10_000)
 
+  it('连续 thinking delta 合并成单行 activity，遇到 tool_use 时 flush', async () => {
+    const stream = [
+      { type: 'thinking', subtype: 'delta', text: 'I ' },
+      { type: 'thinking', subtype: 'delta', text: 'need ' },
+      { type: 'thinking', subtype: 'delta', text: 'to ' },
+      { type: 'thinking', subtype: 'delta', text: 'understand ' },
+      { type: 'thinking', subtype: 'delta', text: 'the ' },
+      { type: 'thinking', subtype: 'delta', text: 'request' },
+      { type: 'tool_use', name: 'Read', input: { path: '/a' } },
+      { type: 'result', result: 'ok' },
+    ].map(o => JSON.stringify(o)).join('\n')
+
+    const activities: string[] = []
+    const script = `process.stdout.write(${JSON.stringify(stream)} + '\\n'); process.exit(0)`
+    await CliRunner.run({
+      binary: NODE,
+      args: ['-e', script],
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      useStreamJson: true,
+      timeoutMs: 5_000,
+      activityTimeoutMs: 5_000,
+      onActivity: (a) => activities.push(a),
+    })
+    const thinkingLines = activities.filter(a => a.includes('🧠'))
+    expect(thinkingLines).toHaveLength(1)
+    expect(thinkingLines[0]).toContain('I need to understand the request')
+    expect(activities.some(a => a.includes('🔧 Tool: Read'))).toBe(true)
+  })
+
+  it('thinking → text delta 切换时各自合并 flush', async () => {
+    const stream = [
+      { type: 'thinking', subtype: 'delta', text: 'plan ' },
+      { type: 'thinking', subtype: 'delta', text: 'first' },
+      { type: 'assistant', subtype: 'delta', text: 'answer ' },
+      { type: 'assistant', subtype: 'delta', text: 'is here' },
+      { type: 'result', result: 'answer is here' },
+    ].map(o => JSON.stringify(o)).join('\n')
+
+    const activities: string[] = []
+    const script = `process.stdout.write(${JSON.stringify(stream)} + '\\n'); process.exit(0)`
+    await CliRunner.run({
+      binary: NODE,
+      args: ['-e', script],
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      useStreamJson: true,
+      timeoutMs: 5_000,
+      activityTimeoutMs: 5_000,
+      onActivity: (a) => activities.push(a),
+    })
+    const thinking = activities.filter(a => a.includes('🧠'))
+    const writing = activities.filter(a => a.includes('✍️'))
+    expect(thinking).toHaveLength(1)
+    expect(thinking[0]).toContain('plan first')
+    expect(writing).toHaveLength(1)
+    expect(writing[0]).toContain('answer is here')
+  })
+
   it('回调：onText / onActivity / onSessionId 被触发', async () => {
     const stream = [
       { type: 'assistant', subtype: 'delta', text: 'hi' },

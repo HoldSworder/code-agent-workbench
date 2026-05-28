@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import {
-  extractActivityEntry,
+  extractActivityEvent,
   extractSessionId,
   extractStreamText,
   extractTokenUsage,
+  formatDeltaEntry,
   normalizeLine,
   parseJsonOutput,
   parseStreamResult,
@@ -54,6 +55,8 @@ export interface CliRunResult {
 const DEFAULT_ACTIVITY_TIMEOUT_MS = 3 * 60 * 1000
 const DEFAULT_MAX_TIMEOUT_MS = 15 * 60 * 1000
 const GRACE_KILL_MS = 5_000
+const DELTA_FLUSH_IDLE_MS = 400
+const DELTA_FLUSH_MAX_LEN = 200
 
 /**
  * 通用 Agent CLI 子进程执行器。
@@ -82,10 +85,32 @@ export class CliRunner {
       let stdoutChunks = 0
       let lastActivityEntry = ''
       let child: ChildProcess | null = null
+      let pendingDelta: { kind: 'thinking' | 'text', text: string } | null = null
+      let deltaFlushTimer: NodeJS.Timeout | null = null
+
+      const emitActivity = (entry: string) => {
+        if (!onActivity || !entry || entry === lastActivityEntry) return
+        lastActivityEntry = entry
+        onActivity(`${entry}\n`)
+      }
+
+      const flushPendingDelta = () => {
+        if (deltaFlushTimer) { clearTimeout(deltaFlushTimer); deltaFlushTimer = null }
+        if (!pendingDelta) return
+        const formatted = formatDeltaEntry(pendingDelta.kind, pendingDelta.text)
+        pendingDelta = null
+        if (formatted) emitActivity(formatted)
+      }
+
+      const schedulePendingFlush = () => {
+        if (deltaFlushTimer) clearTimeout(deltaFlushTimer)
+        deltaFlushTimer = setTimeout(flushPendingDelta, DELTA_FLUSH_IDLE_MS)
+      }
 
       const finish = (result: CliRunResult) => {
         if (resolved) return
         resolved = true
+        flushPendingDelta()
         clearTimeout(maxTimer)
         clearTimeout(activityTimer)
         signal?.removeEventListener('abort', onAbort)
@@ -169,11 +194,21 @@ export class CliRunner {
         }
 
         if (onActivity) {
-          const entry = extractActivityEntry(normalized)
-          if (entry && entry !== lastActivityEntry) {
-            lastActivityEntry = entry
-            onActivity(`${entry}\n`)
+          const evt = extractActivityEvent(normalized)
+          if (!evt) return
+          if (evt.kind === 'event') {
+            flushPendingDelta()
+            emitActivity(evt.line)
+            return
           }
+          const kind: 'thinking' | 'text' = evt.kind === 'thinking-delta' ? 'thinking' : 'text'
+          if (pendingDelta && pendingDelta.kind !== kind) flushPendingDelta()
+          if (!pendingDelta) pendingDelta = { kind, text: '' }
+          pendingDelta.text += evt.text
+          if (pendingDelta.text.length > DELTA_FLUSH_MAX_LEN || pendingDelta.text.includes('\n\n'))
+            flushPendingDelta()
+          else
+            schedulePendingFlush()
         }
       }
 

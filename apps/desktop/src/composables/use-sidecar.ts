@@ -157,7 +157,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         },
         state_inference: {
           rules: [
-            { condition: 'no_change_dir', stage: 'planning', phase: 'spec-create', description: '无变更目录 → 直接进入 Spec 落盘（worktree 由 sidecar 在 task.create 时创建）' },
+            { condition: 'no_change_dir', stage: 'planning', phase: 'create-branch', description: '无变更目录 → 先创建 feature 分支与 worktree' },
             { condition: 'has_proposal_and_specs_no_tasks', stage: 'planning', phase: 'task-breakdown', description: '有 proposal + specs 但无 tasks → 任务拆分' },
             { condition: 'tasks_has_unchecked', stage: 'development', phase: 'tdd-dev', description: 'tasks.md 有未勾选项 → 代码开发' },
             { condition: 'e2e_report_pass', stage: 'release', phase: 'archive-deploy', description: 'e2e-report 通过 → 可归档发布' },
@@ -171,6 +171,7 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         ],
         stages: [
           { id: 'planning', name: '任务规划', gate: 'has_tasks', phases: [
+            { id: 'create-branch', name: '创建分支', provider: 'external-cli', skill: 'skills/frontend/create-branch.md', requires_confirm: false, entry_gate: 'working_tree_clean' },
             { id: 'spec-create', name: 'Spec 落盘', provider: 'external-cli', skill: 'skills/frontend/spec-create.md', requires_confirm: true, invoke_commands: ['openspec new change "{{change_id}}"'], guardrails: ['no_openspec_write_before_confirm'], confirm_files: ['{{openspec_path}}/proposal.md', '{{openspec_path}}/specs/*/spec.md'] },
             { id: 'task-breakdown', name: '任务拆分', provider: 'external-cli', skill: 'skills/frontend/task-breakdown.md', requires_confirm: true, invoke_commands: ['openspec instructions tasks --change "{{change_id}}"'] },
             { id: 'task-validate', name: '任务验证', provider: 'external-cli', skill: 'skills/frontend/task-validate.md', requires_confirm: false, invoke_commands: ['openspec validate "{{change_id}}"'] },

@@ -160,8 +160,8 @@ state_inference:
 
     - condition: no_change_dir
       stage: planning
-      phase: spec-create
-      description: 无变更目录 → 直接进入 Spec 落盘（worktree + 分支由 sidecar 在 task.create 时创建）
+      phase: create-branch
+      description: 无变更目录 → 先在主仓库根目录创建 feature worktree + 分支，再进入 Spec 落盘
 
     - condition: has_proposal_and_specs_no_tasks
       stage: planning
@@ -200,22 +200,23 @@ stages:
   - id: planning
     name: 任务规划
     gate: has_tasks
-    # NOTE: feature 分支与 worktree 由 sidecar 在 task.create RPC 时通过 LLM 翻译需求
-    # 标题为英文 slug 后直接创建（git worktree add -b feature/<slug> ...），
-    # 因此本 stage 不再需要 create-branch phase。如需重命名分支可调 task.renameBranch RPC。
     phases:
-      # Skill 节点：复用根级 skills/feishu-branch-link/ 可复用能力包
-      # 由 engine 直接加载 SKILL.md + 执行变量插值，无需在 workflow 中重复编写
-      - id: link-feishu
-        name: 关联飞书工作项
-        type: skill
-        skill_ref: feishu-branch-link
-        skill_inputs:
-          branch_name: "{{branch_name}}"
-          task_url: "{{requirement_source_url}}"
-        optional: true
+      # 本 phase 在主仓库根目录运行（cwd = repo.local_path），由 agent：
+      # 1) 验证主仓库 working tree 干净 + 默认分支为 master/main
+      # 2) 把需求标题翻译为 kebab-case 英文 slug
+      # 3) 执行 `git worktree add -b feature/<slug> .worktrees/<slug> <base-sha>`
+      # phase 结束后，engine 扫 `git worktree list` 把真实分支名 / worktree 路径回写到 repo_tasks。
+      - id: create-branch
+        name: 创建分支
+        provider: external-cli
+        skill: skills/create-branch.md
+        entry_gate: working_tree_clean
         mcp_servers:
           - lark-project
+
+      # NOTE: 关联飞书工作项的逻辑已迁移到 engine 的 post-create-branch 钩子
+      # （WorkflowEngine.syncBranchToFeishuProject，直接走 meegle CLI 写回
+      # "前端关联代码库" compound_field），不再需要独立 phase。
 
       - id: spec-create
         name: 需求对齐 & Spec 落盘

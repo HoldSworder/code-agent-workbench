@@ -112,8 +112,19 @@ export class ExternalCliProvider implements AgentProvider {
       logger: log,
     })
 
-    if (result.status === 'success') {
-      return { status: 'success', output: result.output, tokenUsage: result.tokenUsage }
+    // Agent 在 stdout 末尾输出 <<PHASE_COMPLETE>> / <<PENDING_INPUT>> 视为已表达完成意图，
+    // 即使子进程退出码非 0（MCP 工具失败 / stream 末尾计算异常 / abort 但已写完结论），
+    // 也按 success 上报，由 engine.handlePhaseResult 通过 parsePhaseSignal 路由到正确状态。
+    // "agent 是否完成" 是 agent 域语义，OS 进程退出码是进程域语义，二者不应混淆。
+    const hasSignal = /<<(?:PHASE_COMPLETE|PENDING_INPUT)>>/.test(result.output ?? '')
+
+    if (result.status === 'success' || hasSignal) {
+      return {
+        status: 'success',
+        output: result.output,
+        tokenUsage: result.tokenUsage,
+        error: result.status !== 'success' ? result.error : undefined,
+      }
     }
     return { status: 'failed', error: result.error, output: result.output }
   }

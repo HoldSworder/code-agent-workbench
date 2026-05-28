@@ -26,7 +26,7 @@ import { AssignmentCommitRepository } from '../db/repositories/assignment-commit
 import type { McpServer } from '../db/repositories/mcp-server.repo'
 import { RepoRepository } from '../db/repositories/repo.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { git, getHead, getMergeBase, resetHard, resetHardClean, stashIfDirty, getCurrentBranch, removeWorktree, createWorktree, cherryPick } from '../git/operations'
+import { git, getHead, getMergeBase, resetHard, resetHardClean, stashIfDirty, getCurrentBranch, removeWorktree, createWorktree, cherryPick, listWorktrees } from '../git/operations'
 import { getConfigWriter } from '../mcp/config-writer'
 import type { McpServerConfig } from '../mcp/config-writer'
 import { McpOAuthService, resolveOAuthAccessToken } from '../mcp/oauth'
@@ -1613,14 +1613,20 @@ export class WorkflowEngine {
 
     try {
       const task = this.taskRepo.findById(repoTaskId)!
-      this.clearPhaseSignal(task.worktree_path)
-      this.clearUIElements(task.worktree_path)
+      // create-branch phase 在主仓库根目录运行（worktree 尚未创建），
+      // 其它所有 phase 都在任务自己的 worktree 内运行。
+      const repoForTask = this.repoRepo.findById(task.repo_id)
+      const phaseCwd = phase.id === 'create-branch' && repoForTask
+        ? repoForTask.local_path
+        : task.worktree_path
+      this.clearPhaseSignal(phaseCwd)
+      this.clearUIElements(phaseCwd)
       const wf = this.resolveConfigForTask(repoTaskId)
 
       if (phase.entry_gate && !options?.skipEntryGate) {
         const gatePassed = this.evaluateGate(
           phase.entry_gate,
-          task.worktree_path,
+          phaseCwd,
           task.openspec_path,
           wf,
         )
@@ -1678,7 +1684,7 @@ export class WorkflowEngine {
         db: this.db,
         repoTaskId,
         currentPhaseId: phase.id,
-        worktreePath: task.worktree_path,
+        worktreePath: phaseCwd,
         dbPath: this.dbPath,
         openspecPath: task.openspec_path,
         gateDefinitions: wf.gate_definitions,
@@ -1712,7 +1718,7 @@ export class WorkflowEngine {
             phase,
             stage.id,
             stage.name,
-            task.worktree_path,
+            phaseCwd,
             task.openspec_path,
             task.branch_name,
             task.change_id,
@@ -1730,7 +1736,7 @@ export class WorkflowEngine {
             phase,
             stage.id,
             stage.name,
-            task.worktree_path,
+            phaseCwd,
             task.openspec_path,
             task.branch_name,
             task.change_id,
@@ -1787,7 +1793,7 @@ export class WorkflowEngine {
       }
 
       const configWriter = getConfigWriter(effectiveCliType)
-      const cwd = task.worktree_path
+      const cwd = phaseCwd
 
       if (mcpServers.length === 0) {
         elog(`executePhase: no MCP servers for ${stage.id}/${phase.id}`)
@@ -1852,6 +1858,18 @@ export class WorkflowEngine {
       if (agentRunId)
         this.runRepo.finish(agentRunId, 'failed', undefined, errMsg)
 
+      try {
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: phase.id,
+          role: 'system',
+          content: `阶段「${phase.name}」执行异常：${errMsg}`,
+        })
+      }
+      catch (msgErr) {
+        elog(`executePhase: failed to persist crash message: ${errorMessage(msgErr)}`)
+      }
+
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'failed')
       process.stderr.write(`[workflow] executePhase crashed for ${repoTaskId}/${stage.id}/${phase.id}: ${errMsg}\n`)
     }
@@ -1872,6 +1890,17 @@ export class WorkflowEngine {
     elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} agentSignal=${agentSignal} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} autoAdvance=${shouldAutoAdvance} planMode=${isPlanMode} error=${result.error?.slice(0, 200) ?? 'none'}`)
 
     if (result.status === 'failed' || result.status === 'cancelled') {
+      // Provider 层已经处理了 "agent 已表达完成意图但进程异常退出" 的场景（信号覆盖退出码）。
+      // 走到这里的 failed/cancelled 都是真实的失败/取消，无需再做信号优先级特例。
+      if (result.status === 'failed') {
+        const reason = result.error?.trim() || 'agent 进程异常退出（无具体错误信息，请查看 stderr 日志）'
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: phase.id,
+          role: 'system',
+          content: `阶段「${phase.name}」执行失败：${reason}`,
+        })
+      }
       this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, result.status)
       return
     }
@@ -1907,6 +1936,29 @@ export class WorkflowEngine {
         return
       }
       elog(`handlePhaseResult: autoAdvance overrides pending_input, proceeding`)
+    }
+
+    // create-branch phase 完成后：在主仓库扫 `git worktree list`，把新创建的
+    // worktree 路径与分支名回写到 repo_tasks（DB 中此前是占位值）。失败则把任务
+    // 标为 failed，让用户重跑本 phase——agent 没真正创建 worktree 是 hard error。
+    if (phase.id === 'create-branch') {
+      const synced = await this.syncWorktreeAfterCreateBranch(repoTaskId).catch((err) => {
+        elog(`syncWorktreeAfterCreateBranch failed: ${errorMessage(err)}`)
+        return false
+      })
+      if (!synced) {
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: phase.id,
+          role: 'system',
+          content: '未能在主仓库的 .worktrees/ 下检测到新创建的 worktree。请检查 agent 是否执行了 `git worktree add -b feat/<slug> .worktrees/<slug> <base>` 并重试本阶段。',
+        })
+        this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
+        return
+      }
+      this.syncBranchToFeishuProject(repoTaskId).catch(err => {
+        elog(`syncBranchToFeishuProject failed: ${errorMessage(err)}`)
+      })
     }
 
     try {
@@ -2069,7 +2121,8 @@ export class WorkflowEngine {
    */
   private parsePhaseSignal(output?: string): 'complete' | 'pending_input' | null {
     if (!output) return null
-    const tail = output.slice(-500)
+    // 扫描末尾 2000 字符以容忍 agent 在信号后追加 token 统计 / shutdown 日志。
+    const tail = output.slice(-2000)
     if (tail.includes('<<PENDING_INPUT>>')) return 'pending_input'
     if (tail.includes('<<PHASE_COMPLETE>>')) return 'complete'
     return null
@@ -2080,10 +2133,71 @@ export class WorkflowEngine {
   }
 
   /**
+   * create-branch phase 完成后，从主仓库扫 `git worktree list`，把 agent 新创建的
+   * worktree 路径与分支名回写到 repo_tasks。
+   *
+   * 识别策略：
+   * 1. 列出主仓库所有 worktrees
+   * 2. 过滤出 `<repo>/.worktrees/<slug>` 形态的条目
+   * 3. 剔除已绑定到任何 repo_task.worktree_path 的条目
+   * 4. 剩下应该恰好一个，即本任务的新 worktree
+   *
+   * 若不止一个或一个都没有 → 返回 false（让上层把 phase 标记为待用户介入）。
+   */
+  private async syncWorktreeAfterCreateBranch(repoTaskId: string): Promise<boolean> {
+    const task = this.taskRepo.findById(repoTaskId)
+    if (!task) return false
+    const repo = this.repoRepo.findById(task.repo_id)
+    if (!repo) return false
+
+    let entries: Awaited<ReturnType<typeof listWorktrees>>
+    try { entries = await listWorktrees(repo.local_path) }
+    catch (err) {
+      elog(`syncWorktreeAfterCreateBranch: listWorktrees failed: ${errorMessage(err)}`)
+      return false
+    }
+
+    const worktreePrefix = `${repo.local_path}/.worktrees/`
+    const allTasks = this.taskRepo.findByRepoId(repo.id)
+    const claimedPaths = new Set(
+      allTasks
+        .filter(t => t.id !== repoTaskId)
+        .map(t => t.worktree_path),
+    )
+
+    const candidates = entries.filter(e =>
+      e.path.startsWith(worktreePrefix)
+      && !e.path.includes('/orchestrator-')
+      && !claimedPaths.has(e.path),
+    )
+
+    if (candidates.length === 0) {
+      elog(`syncWorktreeAfterCreateBranch: no candidate worktree found under ${worktreePrefix}`)
+      return false
+    }
+    if (candidates.length > 1) {
+      elog(`syncWorktreeAfterCreateBranch: ambiguous, found ${candidates.length} candidates: ${candidates.map(c => c.path).join(', ')}`)
+      return false
+    }
+
+    const wt = candidates[0]
+    if (!wt.branch) {
+      elog(`syncWorktreeAfterCreateBranch: candidate ${wt.path} is detached, skipping`)
+      return false
+    }
+
+    const slug = wt.branch.replace(/^(?:feature|feat)\//, '')
+    const openspecPath = `openspec/changes/${slug}`
+
+    elog(`syncWorktreeAfterCreateBranch: ${task.branch_name} → ${wt.branch}, ${task.worktree_path} → ${wt.path}`)
+    this.taskRepo.updateChangeInfo(repoTaskId, wt.branch, slug, openspecPath)
+    this.taskRepo.updateWorktreePath(repoTaskId, wt.path)
+    return true
+  }
+
+  /**
    * 将分支名写入飞书项目工作项的"前端关联代码库"字段。
    * 仅在需求关联了飞书项目链接时执行；meegle 未登录或字段缺失时静默跳过（仅 elog）。
-   *
-   * 由 task.create RPC 在 worktree 创建完成后直接调用（best-effort，不阻塞任务创建）。
    */
   async syncBranchToFeishuProject(repoTaskId: string): Promise<void> {
     const task = this.taskRepo.findById(repoTaskId)
