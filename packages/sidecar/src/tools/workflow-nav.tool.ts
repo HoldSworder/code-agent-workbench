@@ -1,22 +1,5 @@
-import { resolve, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { WorkflowTool, ToolInjectionContext } from './types'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'workflow-nav', 'run.mjs')
-  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'workflow-nav', 'run.mjs')
-  try {
-    // eslint-disable-next-line ts/no-require-imports
-    const { existsSync } = require('node:fs') as typeof import('node:fs')
-    if (existsSync(devPath)) return devPath
-    if (existsSync(prodPath)) return prodPath
-  }
-  catch { /* fallback */ }
-  return devPath
-}
+import { resolveToolScript } from './resolve-script'
 
 export const workflowNavTool: WorkflowTool = {
   id: 'workflow-nav',
@@ -30,7 +13,7 @@ export const workflowNavTool: WorkflowTool = {
   },
 
   resolveScript(_ctx: ToolInjectionContext): string | null {
-    return resolveScriptPath()
+    return resolveToolScript('workflow-nav', 'run.mjs')
   },
 
   getPromptSection(ctx: ToolInjectionContext, scriptAbsPath: string): string {

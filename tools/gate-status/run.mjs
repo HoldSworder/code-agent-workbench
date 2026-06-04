@@ -56,6 +56,12 @@ function resolveTemplate(template, vars) {
 
 function evaluateCheck(check, worktreePath, vars) {
   try {
+    if (check.type === 'llm_judge') {
+      // worktree 内脚本无 LLM 访问能力：透出判定标准给 agent 自评，不误报失败。
+      // 真正的 LLM 判定由 engine 在 advance-phase 时执行。
+      return { type: check.type, prompt: check.prompt ?? '', passed: true, note: '此项由 agent 自评，请对照标准自行判断' }
+    }
+
     if (check.type === 'command_succeeds') {
       if (!check.command) return { type: check.type, command: check.command, passed: false }
       const resolved = resolveTemplate(check.command, vars)

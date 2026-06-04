@@ -17,22 +17,20 @@ function createMockProvider(result: PhaseResult): AgentProvider {
 const WORKFLOW_YAML = `
 name: test
 description: test workflow
-phases:
-  - id: design
-    name: 设计
-    requires_confirm: true
-    provider: api
-    skill: skills/design.md
-  - id: dev
-    name: 开发
-    requires_confirm: false
-    provider: external-cli
-    skill: skills/dev.md
-  - id: verify
-    name: 验证
-    requires_confirm: false
-    provider: script
-    script: scripts/verify.sh
+stages:
+  - id: main
+    name: 主阶段
+    phases:
+      - id: design
+        name: 设计
+        requires_confirm: true
+        provider: api
+        skill: skills/design.md
+      - id: dev
+        name: 开发
+        requires_confirm: false
+        provider: external-cli
+        skill: skills/dev.md
 `
 
 describe('WorkflowEngine', () => {
@@ -79,7 +77,9 @@ describe('WorkflowEngine', () => {
 
     const task = new RepoTaskRepository(db).findById(taskId)!
     expect(task.current_phase).toBe('design')
-    expect(task.phase_status).toBe('waiting_confirm')
+    // 单会话模式：requires_confirm 阶段在 agent 未调用 advance-phase 时停在 waiting_input，
+    // 等待用户反馈（mock provider 不写 advance 信号文件）。
+    expect(task.phase_status).toBe('waiting_input')
   })
 
   it('confirmPhase advances to next phase', async () => {
@@ -96,7 +96,7 @@ describe('WorkflowEngine', () => {
 
     const task = new RepoTaskRepository(db).findById(taskId)!
     expect(task.current_phase).toBe('design')
-    expect(task.phase_status).toBe('waiting_confirm')
+    expect(task.phase_status).toBe('waiting_input')
     expect(mockProvider.run).toHaveBeenCalledTimes(2)
   })
 

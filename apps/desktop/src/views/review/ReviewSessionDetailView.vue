@@ -46,14 +46,14 @@ const ws = useReviewWs({
 })
 
 /**
- * 装饰底层 LLM/CLI 报错为可操作引导：cursor-cli 区域不支持时建议切换 provider。
+ * 装饰底层 LLM 报错为可操作引导：模型区域/可用性问题时建议更换模型。
  */
 function decorateLlmError(raw: string): string {
   if (!raw) return raw
   const lower = raw.toLowerCase()
   const isRegion = lower.includes('not supported in your region') || lower.includes('model not available')
   if (!isRegion) return raw
-  return `${raw}\n\n提示：cursor-cli 当前账号所在区域不支持。请到「设置 → Agent」切换 provider 为 claude-code / codex / custom-api 后重试。`
+  return `${raw}\n\n提示：当前 Cursor 账号或区域不支持该模型。请到「设置 → Agent」更换模型或检查 Cursor API Key 后重试。`
 }
 
 function isHost(): boolean {

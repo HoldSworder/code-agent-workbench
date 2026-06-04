@@ -160,9 +160,7 @@ const activePhaseProvider = computed(() => {
 const { models: availableModels, loading: loadingModels, fetchModels } = useModelList(activePhaseProvider)
 
 const agentProviders = [
-  { value: 'cursor-cli', label: 'Cursor CLI' },
-  { value: 'claude-code', label: 'Claude Code' },
-  { value: 'codex', label: 'Codex' },
+  { value: 'cursor-sdk', label: 'Cursor' },
 ]
 
 const agentDropdownOpen = ref(false)

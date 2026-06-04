@@ -73,9 +73,6 @@ stages:
         name: 创建分支
         provider: external-cli
         skill: skills/create-branch.md
-        entry_gate: working_tree_clean
-        mcp_servers:
-          - lark-project
 
       - id: dev
         name: 开发

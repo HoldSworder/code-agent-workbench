@@ -31,19 +31,15 @@ interface ProviderOption {
   disabled?: boolean
 }
 
-const cliProviders: ProviderOption[] = [
-  { value: 'cursor-cli', label: 'Cursor CLI' },
-  { value: 'claude-code', label: 'Claude Code', disabled: true },
-  { value: 'codex', label: 'Codex', disabled: true },
-]
+// 全面 SDK 化后仅 Cursor 一个 provider；Claude / Codex 待后续接入官方 SDK。
+const allProviders = computed<ProviderOption[]>(() => [
+  { value: 'cursor-sdk', label: 'Cursor' },
+  { value: 'claude-code', label: 'Claude（待接入）', disabled: true },
+  { value: 'codex', label: 'Codex（待接入）', disabled: true },
+])
 
-const allProviders = computed<ProviderOption[]>(() =>
-  props.showApiOption
-    ? [...cliProviders, { value: 'custom-api', label: 'Custom API', disabled: true }]
-    : cliProviders,
-)
-
-const isCliMode = computed(() => ['cursor-cli', 'claude-code', 'codex'].includes(props.provider))
+// SDK 模式下始终展示模型选择。
+const isCliMode = computed(() => true)
 
 const selectedModelLabel = computed(() => {
   if (!props.model) return ''
@@ -74,6 +70,9 @@ watch(() => props.model, (v) => {
 })
 
 onMounted(async () => {
+  // 历史存量可能是 cursor-cli / custom-api 等旧值，统一归一到 cursor-sdk。
+  if (props.provider !== 'cursor-sdk')
+    emit('update:provider', 'cursor-sdk')
   await fetchModels()
   if (props.model && availableModels.value.length > 0) {
     if (!availableModels.value.some(m => m.id === props.model))
@@ -116,7 +115,7 @@ function switchToCustomInput() {
   <div :class="compact ? 'space-y-3' : 'space-y-5'">
     <!-- Provider -->
     <div>
-      <label class="block text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">Agent CLI</label>
+      <label class="block text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1.5">Agent Provider</label>
       <div :class="compact ? 'flex gap-1.5 flex-wrap' : 'grid grid-cols-2 gap-2'">
         <button
           v-for="p in allProviders"

@@ -13,12 +13,11 @@ import { WorkflowEngine } from './workflow/engine'
 import { Orchestrator } from './orchestrator/orchestrator'
 import { parseTeamConfig } from './orchestrator/team-parser'
 import { registerOrchestratorMethods, registerTeamConfigMethods } from './orchestrator/rpc'
-import { buildSniProxyPatch } from '@code-agent/shared/cli'
 import {
-  createApiProvider,
-  createCliProvider,
+  createCursorSdkProvider,
   loadAgentRuntimeFromSettings,
 } from './providers/factory'
+import { applyGlobalProxy } from './providers/proxy'
 import { SettingsRepository } from './db/repositories/settings.repo'
 import { ConsultServer } from './consult/server'
 import type { ConsultConfig } from './consult/types'
@@ -131,7 +130,6 @@ function resolveSkillContent(skillPath: string): string {
 
 function readdirSafe(dir: string): string[] {
   try {
-    const { readdirSync } = require('node:fs')
     return readdirSync(dir) as string[]
   }
   catch {
@@ -141,11 +139,16 @@ function readdirSafe(dir: string): string[] {
 
 const settingsRepo = new SettingsRepository(db)
 
-const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
+// 仅用于 recoverMcpBackups 清理历史遗留的 .cursor/mcp.json 备份（旧 CLI 模式产物）。
+const currentCliType = () => 'cursor-cli'
 
-const currentCliType = () => settingsRepo.get('agent.provider') ?? 'cursor-cli'
-
-/** ApiProvider 走 fetch，需要进程级代理；CLI provider 不需要（已通过 buildAgentEnv 注入子进程）。 */
+/**
+ * 同步代理设置到当前进程。
+ *
+ * 1. env 变量：供 fork 出去的子进程（如 consult 的 cursor-cli）继承。
+ * 2. undici 全局 dispatcher：env 对 native fetch（@cursor/sdk）无效，必须显式设置，
+ *    否则父进程内的 SDK 调用（models.list / review / consult）会一直直连。
+ */
 function syncProcessProxyEnv(proxyUrl: string | undefined): void {
   if (proxyUrl) {
     process.env.HTTP_PROXY = proxyUrl
@@ -157,39 +160,30 @@ function syncProcessProxyEnv(proxyUrl: string | undefined): void {
     delete process.env.HTTPS_PROXY
     delete process.env.ALL_PROXY
   }
+  applyGlobalProxy(proxyUrl)
 }
+
+// 启动即应用一次，覆盖首个 run 之前发生的父进程 SDK 调用（如模型列表）。
+syncProcessProxyEnv(
+  settingsRepo.get('proxy.enabled') === 'true' ? (settingsRepo.get('proxy.url') ?? undefined) : undefined,
+)
 
 const engine = new WorkflowEngine({
   db,
   dbPath,
   workflowYaml,
   cliType: currentCliType(),
-  resolveProvider: (providerType, options) => {
+  resolveProvider: (_providerType, options) => {
+    // 全面 SDK 化后所有 provider 统一走 CursorSdkProvider；
+    // workflow.yaml 中的 provider 字段（external-cli / codex / api）已不再区分后端，
+    // 仅保留 modelOverride / resumeSessionId(cursor agentId) 语义。
     const runtime = loadAgentRuntimeFromSettings(settingsRepo)
-    runtime.sniProxyPatch = (runtime.proxyUrl && existsSync(sniPatchPath))
-      ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl: runtime.proxyUrl })
-      : undefined
-    syncProcessProxyEnv(runtime.proxyUrl)
-
-    switch (providerType) {
-      case 'external-cli':
-        return createCliProvider({
-          runtime,
-          agentOverride: options?.agentOverride,
-          modelOverride: options?.modelOverride,
-          resumeSessionId: options?.resumeSessionId,
-        })
-      case 'codex':
-        return createCliProvider({
-          runtime,
-          agentOverride: 'codex',
-          modelOverride: options?.modelOverride,
-        })
-      case 'api':
-        return createApiProvider({ runtime, modelOverride: options?.modelOverride })
-      default:
-        throw new Error(`Unknown provider: ${providerType}`)
-    }
+    syncProcessProxyEnv(settingsRepo.get('proxy.enabled') === 'true' ? (settingsRepo.get('proxy.url') ?? undefined) : undefined)
+    return createCursorSdkProvider({
+      runtime,
+      modelOverride: options?.modelOverride,
+      resumeAgentId: options?.resumeSessionId,
+    })
   },
   resolveSkillContent,
 })
@@ -224,19 +218,12 @@ try {
     const repoPath = settingsRepo.get('repo.path') ?? process.cwd()
     const defaultBranch = settingsRepo.get('repo.defaultBranch') ?? 'main'
 
-    const orchProxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
-    const orchProxyUrl = orchProxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
-    const orchSniPatch = (orchProxyUrl && existsSync(sniPatchPath))
-      ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl: orchProxyUrl })
-      : undefined
-
     orchestrator = new Orchestrator({
       db,
       teamConfig,
       teamYamlPath,
       repoPath,
       defaultBranch,
-      sniProxyPatch: orchSniPatch,
       onEvent: (event, data) => {
         process.stderr.write(`orchestrator: ${event} ${JSON.stringify(data ?? {})}\n`)
       },
@@ -250,18 +237,10 @@ catch (err) {
 // ── Consultation server (read-only WebUI for LAN access) ──
 
 function buildConsultConfig(): ConsultConfig {
-  const provider = (settingsRepo.get('consult.provider') ?? settingsRepo.get('agent.provider') ?? 'cursor-cli') as ConsultConfig['provider']
   const model = settingsRepo.get('consult.model') ?? settingsRepo.get('agent.model') ?? undefined
-  const binaryPath = settingsRepo.get('consult.binaryPath') ?? settingsRepo.get('agent.binaryPath') ?? undefined
+  const cursorApiKey = settingsRepo.get('agent.cursorApiKey') ?? process.env.CURSOR_API_KEY ?? ''
   const port = Number(settingsRepo.get('consult.port')) || 3100
-  const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
-  const proxyUrl = proxyEnabled ? (settingsRepo.get('proxy.url') ?? undefined) : undefined
-
-  const sniProxyPatch = (proxyUrl && existsSync(sniPatchPath))
-    ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl })
-    : undefined
-
-  return { provider, model, binaryPath, port, proxyUrl, sniProxyPatch }
+  return { cursorApiKey, model, port }
 }
 
 const consultStaticDir = resolve(projectRoot, 'apps/consult/dist')

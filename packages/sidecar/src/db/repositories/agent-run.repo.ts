@@ -106,4 +106,20 @@ export class AgentRunRepository {
     if (!row || row.status !== 'success') return null
     return row.session_id
   }
+
+  /**
+   * 任务级 sessionId 查询：忽略 phase_id，返回该任务最近一次成功 run 的 session_id。
+   * 用于单会话工作流：所有 phase 共享同一个 CLI session，便于 resume。
+   */
+  findLastSessionIdForTask(repoTaskId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT session_id, status FROM agent_runs
+         WHERE repo_task_id = ? AND session_id IS NOT NULL
+         ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(repoTaskId) as { session_id: string, status: string } | undefined
+    if (!row || row.status !== 'success') return null
+    return row.session_id
+  }
 }

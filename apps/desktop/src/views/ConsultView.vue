@@ -4,9 +4,9 @@ import { rpc } from '../composables/use-sidecar'
 import AgentSelector from '../components/AgentSelector.vue'
 
 // --- Config ---
-const consultProvider = ref('cursor-cli')
+// 全面 SDK 化后 consult 复用全局 agent.cursorApiKey，仅本地可配模型与端口。
+const consultProvider = ref('cursor-sdk')
 const consultModel = ref('')
-const consultBinaryPath = ref('')
 const consultPort = ref('3100')
 const consultRunning = ref(false)
 const consultLocalIp = ref<string | null>(null)
@@ -35,9 +35,7 @@ const expandedLoading = ref(false)
 onMounted(async () => {
   try {
     const all = await rpc<Record<string, string>>('settings.getAll')
-    if (all['consult.provider']) consultProvider.value = all['consult.provider']
     if (all['consult.model']) consultModel.value = all['consult.model']
-    if (all['consult.binaryPath']) consultBinaryPath.value = all['consult.binaryPath']
     if (all['consult.port']) consultPort.value = all['consult.port']
 
     const status = await rpc<{ running: boolean, port: number | null, localIp: string | null }>('consult.status')
@@ -53,11 +51,8 @@ onMounted(async () => {
 async function saveConfig() {
   savingConsult.value = true
   try {
-    await rpc('settings.set', { key: 'consult.provider', value: consultProvider.value })
     if (consultModel.value)
       await rpc('settings.set', { key: 'consult.model', value: consultModel.value })
-    if (consultBinaryPath.value)
-      await rpc('settings.set', { key: 'consult.binaryPath', value: consultBinaryPath.value })
     await rpc('settings.set', { key: 'consult.port', value: consultPort.value })
   } finally {
     savingConsult.value = false
@@ -195,27 +190,15 @@ const inputClass = 'w-full h-9 px-3 py-2 rounded-xl bg-[#fafafa] dark:bg-white/[
             </div>
           </section>
 
-          <!-- CLI config -->
+          <!-- Server config -->
           <section class="card">
             <div class="card-header">
               <div class="w-7 h-7 rounded-md bg-emerald-50 dark:bg-emerald-500/10 flex items-center justify-center shrink-0">
-                <div class="i-carbon-terminal w-3.5 h-3.5 text-emerald-500" />
+                <div class="i-carbon-network-4 w-3.5 h-3.5 text-emerald-500" />
               </div>
-              <h3 class="card-title">CLI 配置</h3>
+              <h3 class="card-title">服务配置</h3>
             </div>
             <div class="p-3 space-y-3">
-              <div>
-                <label class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1 block">Binary 路径</label>
-                <div class="relative">
-                  <div class="absolute left-2.5 top-1/2 -translate-y-1/2 i-carbon-terminal w-3 h-3 text-gray-300 dark:text-gray-600" />
-                  <input
-                    v-model="consultBinaryPath"
-                    type="text"
-                    :placeholder="consultProvider === 'claude-code' ? 'claude' : consultProvider === 'codex' ? 'codex' : 'agent'"
-                    :class="[inputClass, 'pl-7 !h-8 !text-[12px]']"
-                  >
-                </div>
-              </div>
               <div>
                 <label class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1 block">端口</label>
                 <div class="relative">

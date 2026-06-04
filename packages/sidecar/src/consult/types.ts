@@ -9,8 +9,8 @@ export interface ConsultSession {
   repoId: string
   repoPath: string
   messages: ConsultMessage[]
-  /** Currently running CLI child process abort controller */
-  abort: AbortController | null
+  /** 续接用的 cursor agentId（首轮后写入）。 */
+  agentId: string | null
   createdAt: number
   clientIp: string | null
 }
@@ -26,16 +26,10 @@ export interface ConsultSessionSummary {
 }
 
 export interface ConsultConfig {
-  provider: 'cursor-cli' | 'claude-code' | 'codex'
+  /** Cursor API Key。 */
+  cursorApiKey: string
   model?: string
-  binaryPath?: string
   port: number
-  proxyUrl?: string
-  sniProxyPatch?: {
-    scriptPath: string
-    socks5Host: string
-    socks5Port: number
-  }
 }
 
 export interface ConsultServerStatus {

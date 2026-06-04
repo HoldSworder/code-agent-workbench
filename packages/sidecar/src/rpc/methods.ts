@@ -6,8 +6,9 @@ import { RepoTaskRepository } from '../db/repositories/repo-task.repo'
 import { MessageRepository } from '../db/repositories/message.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { SettingsRepository } from '../db/repositories/settings.repo'
-import { spawn as spawnChild } from 'node:child_process'
-import { CliRunner, buildAgentEnv, buildSniProxyPatch, resolveBinary as resolveSharedBinary, type CliBackend } from '@code-agent/shared/cli'
+import { Agent, Cursor, CursorAgentError } from '@cursor/sdk'
+import { DEFAULT_CURSOR_MODEL } from '../providers/cursor-sdk.provider'
+import { applyGlobalProxy } from '../providers/proxy'
 import { resolve, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -16,7 +17,7 @@ import { stringify as yamlStringify } from 'yaml'
 import type { WorkflowEngine } from '../workflow/engine'
 import { parseWorkflow } from '../workflow/parser'
 import { getChangedFiles, getFileDiff, getMergeBase, git, removeWorktree, listWorktrees, ensureLocalExclude, detectDefaultBranch, renameCurrentBranch, isBranchMergedInto, deleteBranch } from '../git/operations'
-import { normalizeSlug } from '@code-agent/shared/llm'
+import { normalizeSlug } from '@code-agent/shared/util'
 import { errorMessage } from '@code-agent/shared/util'
 import { PhaseCommitRepository, INITIAL_PHASE_ID } from '../db/repositories/phase-commit.repo'
 import { readTranscript, listSessionsForRepo } from '../transcript/reader'
@@ -578,12 +579,6 @@ export function registerMethods(
     })
     return { ok: true }
   })
-  server.register('workflow.rollbackToStage', async ({ repoTaskId, targetStageId }) => {
-    engine.rollbackToStage(repoTaskId, targetStageId).catch((err) => {
-      process.stderr.write(`[workflow] rollback to stage ${targetStageId} failed for ${repoTaskId}: ${err}\n`)
-    })
-    return { ok: true }
-  })
   server.register('workflow.retry', async ({ repoTaskId }) => {
     const task = taskRepo.findById(repoTaskId)
     if (!task)
@@ -607,25 +602,6 @@ export function registerMethods(
     return { ok: true }
   })
 
-  server.register('workflow.resetPhase', async ({ repoTaskId }) => {
-    engine.resetCurrentPhase(repoTaskId).catch((err) => {
-      process.stderr.write(`[workflow] resetPhase failed for ${repoTaskId}: ${err}\n`)
-    })
-    return { ok: true }
-  })
-
-  server.register('workflow.rollback', async ({ repoTaskId, targetStageId, targetPhaseId }) => {
-    engine.rollbackToPhase(repoTaskId, targetStageId, targetPhaseId).catch((err) => {
-      process.stderr.write(`[workflow] rollback to ${targetStageId}/${targetPhaseId} failed for ${repoTaskId}: ${err}\n`)
-    })
-    return { ok: true }
-  })
-  server.register('workflow.rollbackPaused', async ({ repoTaskId, targetStageId, targetPhaseId }) => {
-    engine.rollbackToPhase(repoTaskId, targetStageId, targetPhaseId, { pauseAfterRollback: true }).catch((err) => {
-      process.stderr.write(`[workflow] rollbackPaused to ${targetStageId}/${targetPhaseId} failed for ${repoTaskId}: ${err}\n`)
-    })
-    return { ok: true }
-  })
   server.register('workflow.rollbackAssignment', async ({ repoTaskId, assignmentId }) => {
     try {
       await engine.rollbackAssignment(repoTaskId, assignmentId)
@@ -642,19 +618,6 @@ export function registerMethods(
     const repoX = new AssignmentCommitRepository(db)
     return repoX.findByTask(repoTaskId)
   })
-  server.register('workflow.rollbackToMessage', async ({ repoTaskId, messageId }) => {
-    engine.rollbackToMessage(repoTaskId, messageId).catch((err) => {
-      process.stderr.write(`[workflow] rollbackToMessage ${messageId} failed for ${repoTaskId}: ${err}\n`)
-    })
-    return { ok: true }
-  })
-  server.register('workflow.retryFromPrompt', async ({ repoTaskId, messageId }) => {
-    engine.retryFromPrompt(repoTaskId, messageId).catch((err) => {
-      process.stderr.write(`[workflow] retryFromPrompt ${messageId} failed for ${repoTaskId}: ${err}\n`)
-    })
-    return { ok: true }
-  })
-
   server.register('workflow.phases', async ({ workflowId }: { workflowId?: string } = {}) => {
     return { stages: engine.getStagesAndPhases(workflowId) }
   })
@@ -1029,124 +992,90 @@ export function registerMethods(
   })
   server.register('settings.set', async ({ key, value }) => {
     settingsRepo.set(key, value)
+    // 代理设置变更后即时刷新父进程 undici dispatcher（覆盖 models.list / review / consult 等进程内 SDK 调用）。
+    if (key === 'proxy.enabled' || key === 'proxy.url') {
+      applyGlobalProxy(
+        settingsRepo.get('proxy.enabled') === 'true' ? (settingsRepo.get('proxy.url') ?? undefined) : undefined,
+      )
+    }
     return { ok: true }
   })
   server.register('settings.getAll', async () => {
     return settingsRepo.getAll()
   })
 
-  // ── Agent models ──
-  const sniPatchPath = resolve(projectRoot, 'scripts', 'agent-socks5-patch.cjs')
-
-  function buildModelListEnv(): Record<string, string> {
-    const proxyEnabled = settingsRepo.get('proxy.enabled') === 'true'
-    const proxyUrl = proxyEnabled ? settingsRepo.get('proxy.url') : null
-    const useSniPatch = !!proxyUrl && existsSync(sniPatchPath)
-    return buildAgentEnv({
-      proxyUrl: useSniPatch ? null : proxyUrl,
-      sniProxyPatch: useSniPatch ? buildSniProxyPatch({ scriptPath: sniPatchPath, proxyUrl: proxyUrl! }) : null,
-      extraEnv: { NO_COLOR: '1', TERM: 'dumb' },
-    })
+  // ── Agent models（Cursor SDK）──
+  function cursorApiKey(): string {
+    return settingsRepo.get('agent.cursorApiKey') ?? process.env.CURSOR_API_KEY ?? ''
   }
 
-  function parseModelList(raw: string): { id: string, label: string }[] {
-    const strip = (s: string) => s.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').replace(/\x1B\[\d*[GK]/g, '').trim()
-    return raw.split('\n')
-      .map(strip)
-      .filter(l => l && l.includes(' - '))
-      .map((l) => {
-        const [id, ...rest] = l.split(' - ')
-        return { id: id.trim(), label: rest.join(' - ').trim() }
-      })
-      .filter(m => m.id && m.id !== 'Available models')
-  }
-
-  function resolveBinary(provider: string): string | null {
-    const KNOWN: CliBackend[] = ['cursor-cli', 'claude-code', 'codex']
-    if (!KNOWN.includes(provider as CliBackend)) return null
-    const globalProvider = settingsRepo.get('agent.provider') ?? 'cursor-cli'
-    const override = provider === globalProvider ? settingsRepo.get('agent.binaryPath') : null
-    return resolveSharedBinary(provider as CliBackend, override)
-  }
-
-  function fetchCodexModels(binary: string): Promise<{ id: string, label: string }[]> {
-    return new Promise((resolve, reject) => {
-      const child = spawnChild(binary, ['app-server'], {
-        env: buildModelListEnv(),
-        stdio: ['pipe', 'pipe', 'pipe'],
-        shell: false,
-      })
-
-      let buf = ''
-      let initDone = false
-      const timer = setTimeout(() => {
-        child.kill('SIGTERM')
-        reject(new Error('codex app-server timeout'))
-      }, 15_000)
-
-      child.stdout?.on('data', (d) => {
-        buf += String(d)
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.trim()) continue
-          try {
-            const msg = JSON.parse(line)
-            if (!initDone && msg.id === 0 && msg.result) {
-              initDone = true
-              child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method: 'model/list', id: 1, params: {} }) + '\n')
-            }
-            else if (msg.id === 1) {
-              clearTimeout(timer)
-              child.kill('SIGTERM')
-              const data: any[] = msg.result?.data ?? []
-              resolve(data.filter((m: any) => !m.hidden).map((m: any) => ({
-                id: m.id,
-                label: m.displayName || m.description || '',
-              })))
-            }
-          }
-          catch { /* ignore non-JSON lines */ }
-        }
-      })
-      child.on('error', (err) => { clearTimeout(timer); reject(err) })
-      child.on('close', () => { clearTimeout(timer); resolve([]) })
-
-      child.stdin?.write(JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'initialize',
-        id: 0,
-        params: { clientInfo: { name: 'code-agent', version: '1.0' }, capabilities: {} },
-      }) + '\n')
-    })
-  }
-
-  server.register('agent.listModels', async (params?: { provider?: string }) => {
-    const provider = params?.provider || settingsRepo.get('agent.provider') || 'cursor-cli'
-    const binary = resolveBinary(provider)
-    if (!binary) return { models: [] }
-
+  server.register('agent.listModels', async () => {
+    const apiKey = cursorApiKey()
+    if (!apiKey) return { models: [] }
     try {
-      if (provider === 'codex') {
-        const models = await fetchCodexModels(binary)
-        return { models }
-      }
-      const result = await CliRunner.run({
-        binary,
-        args: ['--list-models'],
-        cwd: process.cwd(),
-        env: buildModelListEnv(),
-        useStreamJson: false,
-        timeoutMs: 30_000,
-        activityTimeoutMs: 30_000,
-      })
-      if (result.status !== 'success') return { models: [] }
-      const models = parseModelList(result.output)
+      const list = await Cursor.models.list({ apiKey })
+      const models = list.map(m => ({ id: m.id, label: m.displayName || m.id }))
       return { models }
     }
     catch {
       return { models: [] }
     }
+  })
+
+  /** 校验 Cursor 凭证：成功返回账号信息，失败返回友好错误。供设置页提示。 */
+  server.register('agent.checkCursorAuth', async () => {
+    const apiKey = cursorApiKey()
+    if (!apiKey) return { ok: false, error: '未配置 Cursor API Key' }
+    try {
+      const me = await Cursor.me({ apiKey })
+      return { ok: true, apiKeyName: me.apiKeyName, userEmail: me.userEmail ?? null }
+    }
+    catch (err) {
+      if (err instanceof CursorAgentError)
+        return { ok: false, error: err.message }
+      return { ok: false, error: errorMessage(err) }
+    }
+  })
+
+  /**
+   * 端到端测试运行：发一条最小 one-shot prompt 走完整流式链路。
+   *
+   * 与 checkCursorAuth（仅 Cursor.me 验 key）不同，本接口真实经过 run 流式通道，
+   * 能暴露边际网络下的「建流超时」问题，并返回真实耗时。
+   * 失败时 agent 零输出无副作用，故内部对零输出失败安全重试 2 次。
+   */
+  server.register('agent.testRun', async () => {
+    const apiKey = cursorApiKey()
+    if (!apiKey) return { ok: false, error: '未配置 Cursor API Key' }
+    const model = settingsRepo.get('agent.model') ?? DEFAULT_CURSOR_MODEL
+    const prompt = '只回复一个词：OK。不要使用任何工具，不要解释。'
+    const maxAttempts = 3
+    let lastError = ''
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const startedAt = Date.now()
+      try {
+        const result = await Agent.prompt(prompt, {
+          apiKey,
+          model: { id: model },
+          local: { cwd: homedir(), settingSources: [] },
+        })
+        const durationMs = Date.now() - startedAt
+        const output = (result.result ?? '').trim()
+        if (result.status === 'finished')
+          return { ok: true, durationMs, output, model, attempts: attempt }
+        // 零输出失败可安全重试。
+        lastError = `status=${result.status}`
+        if (output || attempt >= maxAttempts)
+          return { ok: false, durationMs, output, model, attempts: attempt, error: `测试运行失败：${lastError}` }
+      }
+      catch (err) {
+        lastError = err instanceof CursorAgentError ? err.message : errorMessage(err)
+        if (attempt >= maxAttempts)
+          return { ok: false, model, attempts: attempt, error: `测试运行异常：${lastError}` }
+      }
+      await new Promise(r => setTimeout(r, attempt * 1000))
+    }
+    return { ok: false, model, attempts: maxAttempts, error: `测试运行多次失败（疑似网络/连接不稳）：${lastError}` }
   })
 
   // ── Consultation mode ──

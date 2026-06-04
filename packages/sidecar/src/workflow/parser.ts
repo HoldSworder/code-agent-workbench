@@ -135,8 +135,9 @@ const GateCheckSchema = z.object({
     'file_section_matches',
     'file_section_not_matches',
     'command_succeeds',
+    'llm_judge',
   ]),
-  /** 文件路径，支持 {{openspec_path}} 等模板变量。command_succeeds 类型不需要 */
+  /** 文件路径，支持 {{openspec_path}} 等模板变量。command_succeeds / llm_judge 类型不需要 */
   path: z.string().optional(),
   /** 用于 file_contains / file_not_contains 的子串匹配 */
   pattern: z.string().optional(),
@@ -144,6 +145,10 @@ const GateCheckSchema = z.object({
   after: z.string().optional(),
   /** 用于 command_succeeds，在 worktree 目录下执行的 shell 命令，exit 0 = 通过 */
   command: z.string().optional(),
+  /** 用于 llm_judge，描述判定标准/问题，由 LLM 给出 PASS/FAIL */
+  prompt: z.string().optional(),
+  /** 用于 llm_judge，作为证据喂给 LLM 的文件路径列表，支持模板变量 */
+  context_files: z.array(z.string()).optional(),
 })
 
 const GateDefinitionSchema = z.object({

@@ -1,15 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import {
-  buildAgentEnv,
-  buildCliArgs,
-  CliRunner,
-  resolveBinary,
-} from '@code-agent/shared/cli'
+import { Agent, CursorAgentError, type Run, type SDKAgent } from '@cursor/sdk'
 import { PromptBuilder } from '@code-agent/shared/util'
+import { DEFAULT_CURSOR_MODEL } from '../providers/cursor-sdk.provider'
 import type { ConsultConfig, ConsultMessage, ConsultSession, ConsultSessionSummary } from './types'
-
-const ACTIVITY_TIMEOUT_MS = 3 * 60 * 1000
-const MAX_TIMEOUT_MS = 15 * 60 * 1000
 
 const READONLY_GUARDRAIL = [
   '## 只读咨询模式（最高优先级规则）',
@@ -27,7 +20,7 @@ const READONLY_GUARDRAIL = [
 
 export class ConsultChatHandler {
   private sessions = new Map<string, ConsultSession>()
-  private activeAborts = new Map<string, AbortController>()
+  private activeRuns = new Map<string, Run>()
   private config: ConsultConfig
 
   constructor(config: ConsultConfig) {
@@ -44,7 +37,7 @@ export class ConsultChatHandler {
       repoId,
       repoPath,
       messages: [],
-      abort: null,
+      agentId: null,
       createdAt: Date.now(),
       clientIp: clientIp ?? null,
     }
@@ -81,11 +74,11 @@ export class ConsultChatHandler {
   }
 
   cancelSession(sessionId: string): void {
-    const ctl = this.activeAborts.get(sessionId)
-    if (ctl) ctl.abort()
-    this.activeAborts.delete(sessionId)
-    const session = this.sessions.get(sessionId)
-    if (session) session.abort = null
+    const run = this.activeRuns.get(sessionId)
+    if (run && run.supports('cancel')) {
+      run.cancel().catch(() => {})
+    }
+    this.activeRuns.delete(sessionId)
   }
 
   destroyAll(): void {
@@ -104,67 +97,72 @@ export class ConsultChatHandler {
     const session = this.sessions.get(sessionId)
     if (!session) throw new Error(`Session not found: ${sessionId}`)
 
+    if (!this.config.cursorApiKey)
+      throw new Error('未配置 Cursor API Key，无法发起咨询对话。')
+
     session.messages.push({ role: 'user', content: userMessage, timestamp: Date.now() })
 
-    const prompt = this.buildPrompt(session)
-    const binary = resolveBinary(this.config.provider, this.config.binaryPath)
-    const { args, stdinData, useStreamJson } = buildCliArgs({
-      backend: this.config.provider,
-      cwd: session.repoPath,
-      mode: 'readonly',
-      model: this.config.model,
-      prompt,
-    })
-    const env = buildAgentEnv({
-      proxyUrl: this.config.proxyUrl,
-      sniProxyPatch: this.config.sniProxyPatch,
-    })
+    // 首轮把只读护栏 + 用户问题合并发送；后续轮次走 Agent.resume，仅发新消息，复用会话上下文。
+    // mode:'plan' 让 SDK 在协议层强制只读（不写文件），优于纯 prompt 约束。
+    const isFirstTurn = !session.agentId
+    const prompt = isFirstTurn
+      ? new PromptBuilder().text(READONLY_GUARDRAIL).divider().text(userMessage).build()
+      : userMessage
 
-    const ctl = new AbortController()
-    this.activeAborts.set(sessionId, ctl)
+    let agent: SDKAgent
+    try {
+      agent = isFirstTurn
+        ? await Agent.create({
+            apiKey: this.config.cursorApiKey,
+            model: { id: this.config.model ?? DEFAULT_CURSOR_MODEL },
+            local: { cwd: session.repoPath, settingSources: [] },
+            mode: 'plan',
+          })
+        : await Agent.resume(session.agentId!, {
+            apiKey: this.config.cursorApiKey,
+            local: { cwd: session.repoPath, settingSources: [] },
+            mode: 'plan',
+          })
+    }
+    catch (err) {
+      if (err instanceof CursorAgentError)
+        throw new Error(`Cursor agent 启动失败：${err.message}`)
+      throw err
+    }
+    session.agentId = agent.agentId
 
     let assistantText = ''
-    const result = await CliRunner.run({
-      binary,
-      args,
-      cwd: session.repoPath,
-      stdinData,
-      env,
-      useStreamJson,
-      timeoutMs: MAX_TIMEOUT_MS,
-      activityTimeoutMs: ACTIVITY_TIMEOUT_MS,
-      signal: ctl.signal,
-      onText: (text) => {
-        assistantText += text
-        onChunk(text)
-      },
-    })
+    try {
+      const run = await agent.send(prompt)
+      this.activeRuns.set(sessionId, run)
 
-    this.activeAborts.delete(sessionId)
-    session.abort = null
+      for await (const event of run.stream()) {
+        if (event.type === 'assistant') {
+          for (const block of event.message.content) {
+            if (block.type === 'text') {
+              assistantText += block.text
+              onChunk(block.text)
+            }
+          }
+        }
+      }
 
-    if (result.status !== 'success') {
-      throw new Error(result.error ?? 'Agent failed')
+      const result = await run.wait()
+      if (result.status !== 'finished' && !assistantText.trim())
+        throw new Error(`Cursor run 执行失败（status=${result.status}）`)
+
+      const cleaned = (assistantText.trim() || result.result?.trim() || '')
+      session.messages.push({ role: 'assistant', content: cleaned, timestamp: Date.now() })
+      return { assistantMessage: cleaned }
     }
-
-    const cleaned = (result.output || assistantText).replace(/<<PHASE_COMPLETE>>|<<PENDING_INPUT>>/g, '').trim()
-    session.messages.push({ role: 'assistant', content: cleaned, timestamp: Date.now() })
-    return { assistantMessage: cleaned }
-  }
-
-  private buildPrompt(session: ConsultSession): string {
-    const builder = new PromptBuilder().text(READONLY_GUARDRAIL)
-
-    if (session.messages.length > 1) {
-      const history = session.messages.slice(0, -1)
-      const formatted = history
-        .map(m => `**${m.role === 'user' ? '用户' : '助手'}**: ${m.content}`)
-        .join('\n')
-      builder.section('对话历史', formatted).divider()
+    catch (err) {
+      if (err instanceof CursorAgentError)
+        throw new Error(`Cursor agent 调用失败：${err.message}`)
+      throw err
     }
-
-    const lastMsg = session.messages[session.messages.length - 1]
-    builder.text(lastMsg.content)
-    return builder.build()
+    finally {
+      this.activeRuns.delete(sessionId)
+      try { agent.close() } catch {}
+    }
   }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { useReposStore } from '../stores/repos'
@@ -18,15 +18,47 @@ onMounted(async () => {
 const activeTab = ref<'agent' | 'proxy' | 'workflow' | 'repos'>('agent')
 
 // --- Agent config ---
-const agentProvider = ref('cursor-cli')
-const agentApiKey = ref('')
-const agentBaseUrl = ref('https://api.openai.com/v1')
+const agentProvider = ref('cursor-sdk')
 const agentModel = ref('')
-const agentBinaryPath = ref('')
+const cursorApiKey = ref('')
 const saving = ref(false)
 
-const isApiMode = computed(() => agentProvider.value === 'custom-api')
-const isCliMode = computed(() => ['cursor-cli', 'claude-code', 'codex'].includes(agentProvider.value))
+// Cursor 凭证校验状态
+type AuthState = { ok: boolean, apiKeyName?: string, userEmail?: string | null, error?: string } | null
+const authStatus = ref<AuthState>(null)
+const checkingAuth = ref(false)
+
+async function checkCursorAuth() {
+  checkingAuth.value = true
+  try {
+    authStatus.value = await rpc<NonNullable<AuthState>>('agent.checkCursorAuth')
+  }
+  catch (e) {
+    authStatus.value = { ok: false, error: String(e) }
+  }
+  finally {
+    checkingAuth.value = false
+  }
+}
+
+// 端到端测试运行状态：真实跑一次最小 run，验证流式链路连通性与延迟
+type TestRunState = { ok: boolean, durationMs?: number, output?: string, attempts?: number, error?: string } | null
+const testRunStatus = ref<TestRunState>(null)
+const testingRun = ref(false)
+
+async function testCursorRun() {
+  testingRun.value = true
+  testRunStatus.value = null
+  try {
+    testRunStatus.value = await rpc<NonNullable<TestRunState>>('agent.testRun')
+  }
+  catch (e) {
+    testRunStatus.value = { ok: false, error: String(e) }
+  }
+  finally {
+    testingRun.value = false
+  }
+}
 
 // --- Proxy config ---
 const proxyEnabled = ref(false)
@@ -36,13 +68,11 @@ const savingProxy = ref(false)
 async function loadSettings() {
   try {
     const all = await rpc<Record<string, string>>('settings.getAll')
-    if (all['agent.provider']) agentProvider.value = all['agent.provider']
     if (all['agent.model']) agentModel.value = all['agent.model']
-    if (all['agent.binaryPath']) agentBinaryPath.value = all['agent.binaryPath']
-    if (all['agent.apiKey']) agentApiKey.value = all['agent.apiKey']
-    if (all['agent.baseUrl']) agentBaseUrl.value = all['agent.baseUrl']
+    if (all['agent.cursorApiKey']) cursorApiKey.value = all['agent.cursorApiKey']
     proxyEnabled.value = all['proxy.enabled'] === 'true'
     if (all['proxy.url']) proxyUrl.value = all['proxy.url']
+    if (cursorApiKey.value) await checkCursorAuth()
   }
   catch { /* sidecar may not be ready */ }
 }
@@ -50,15 +80,11 @@ async function loadSettings() {
 async function saveAgentConfig() {
   saving.value = true
   try {
-    await rpc('settings.set', { key: 'agent.provider', value: agentProvider.value })
+    await rpc('settings.set', { key: 'agent.provider', value: 'cursor-sdk' })
+    await rpc('settings.set', { key: 'agent.cursorApiKey', value: cursorApiKey.value })
     if (agentModel.value)
       await rpc('settings.set', { key: 'agent.model', value: agentModel.value })
-    if (agentBinaryPath.value)
-      await rpc('settings.set', { key: 'agent.binaryPath', value: agentBinaryPath.value })
-    if (isApiMode.value) {
-      await rpc('settings.set', { key: 'agent.apiKey', value: agentApiKey.value })
-      await rpc('settings.set', { key: 'agent.baseUrl', value: agentBaseUrl.value })
-    }
+    await checkCursorAuth()
   }
   finally {
     saving.value = false
@@ -202,73 +228,63 @@ const inputClass = 'w-full h-9 px-3 py-2 rounded-xl bg-[#fafafa] dark:bg-white/[
               <AgentSelector
                 :provider="agentProvider"
                 :model="agentModel"
-                show-api-option
                 @update:provider="agentProvider = $event"
                 @update:model="agentModel = $event"
               />
             </div>
           </section>
 
-          <!-- CLI Binary path -->
-          <section v-if="isCliMode" class="settings-card">
-            <div class="settings-card-header">
-              <div class="settings-card-icon bg-emerald-50 dark:bg-emerald-500/10">
-                <div class="i-carbon-terminal w-4 h-4 text-emerald-500" />
-              </div>
-              <div>
-                <h3 class="settings-card-title">CLI 配置</h3>
-                <p class="settings-card-desc">设置命令行工具路径</p>
-              </div>
-            </div>
-            <div class="settings-card-body">
-              <div>
-                <label class="settings-label">Binary 路径</label>
-                <div class="relative">
-                  <div class="absolute left-3 top-1/2 -translate-y-1/2 i-carbon-terminal w-3.5 h-3.5 text-gray-300 dark:text-gray-600" />
-                  <input
-                    v-model="agentBinaryPath"
-                    type="text"
-                    :placeholder="agentProvider === 'claude-code' ? 'claude' : agentProvider === 'codex' ? 'codex' : 'agent'"
-                    :class="[inputClass, 'pl-9']"
-                  >
-                </div>
-                <p class="settings-hint">留空使用默认路径</p>
-              </div>
-            </div>
-          </section>
-
-          <!-- API settings -->
-          <section v-if="isApiMode" class="settings-card">
+          <!-- Cursor API Key -->
+          <section class="settings-card">
             <div class="settings-card-header">
               <div class="settings-card-icon bg-violet-50 dark:bg-violet-500/10">
-                <div class="i-carbon-api w-4 h-4 text-violet-500" />
+                <div class="i-carbon-password w-4 h-4 text-violet-500" />
               </div>
-              <div>
-                <h3 class="settings-card-title">API 配置</h3>
-                <p class="settings-card-desc">自定义 API 端点和认证信息</p>
+              <div class="flex-1">
+                <h3 class="settings-card-title">Cursor API Key</h3>
+                <p class="settings-card-desc">用于通过 @cursor/sdk 运行 agent，可在 Cursor 控制台生成</p>
               </div>
+              <button
+                class="settings-icon-btn"
+                :disabled="testingRun || !cursorApiKey"
+                title="测试运行（真实跑一次最小 run，验证流式链路）"
+                @click="testCursorRun"
+              >
+                <div class="i-carbon-play w-4 h-4" :class="testingRun && 'animate-pulse'" />
+              </button>
+              <button
+                class="settings-icon-btn"
+                :disabled="checkingAuth || !cursorApiKey"
+                title="校验凭证"
+                @click="checkCursorAuth"
+              >
+                <div class="i-carbon-renew w-4 h-4" :class="checkingAuth && 'animate-spin'" />
+              </button>
             </div>
-            <div class="settings-card-body space-y-5">
-              <div>
-                <label class="settings-label">API Key</label>
-                <div class="relative">
-                  <div class="absolute left-3 top-1/2 -translate-y-1/2 i-carbon-password w-3.5 h-3.5 text-gray-300 dark:text-gray-600" />
-                  <input v-model="agentApiKey" type="password" placeholder="sk-..." :class="[inputClass, 'pl-9']">
-                </div>
+            <div class="settings-card-body space-y-3">
+              <div class="relative">
+                <div class="absolute left-3 top-1/2 -translate-y-1/2 i-carbon-password w-3.5 h-3.5 text-gray-300 dark:text-gray-600" />
+                <input v-model="cursorApiKey" type="password" placeholder="key_..." :class="[inputClass, 'pl-9']">
               </div>
-              <div>
-                <label class="settings-label">Base URL</label>
-                <div class="relative">
-                  <div class="absolute left-3 top-1/2 -translate-y-1/2 i-carbon-cloud w-3.5 h-3.5 text-gray-300 dark:text-gray-600" />
-                  <input v-model="agentBaseUrl" type="text" placeholder="https://api.openai.com/v1" :class="[inputClass, 'pl-9']">
-                </div>
+              <div v-if="authStatus?.ok" class="flex items-center gap-1.5 text-[12px] text-emerald-500">
+                <div class="i-carbon-checkmark-filled w-3.5 h-3.5" />
+                凭证有效{{ authStatus.apiKeyName ? `（${authStatus.apiKeyName}` : '' }}{{ authStatus.userEmail ? ` · ${authStatus.userEmail}）` : (authStatus.apiKeyName ? '）' : '') }}
               </div>
-              <div>
-                <label class="settings-label">模型</label>
-                <div class="relative">
-                  <div class="absolute left-3 top-1/2 -translate-y-1/2 i-carbon-machine-learning-model w-3.5 h-3.5 text-gray-300 dark:text-gray-600" />
-                  <input v-model="agentModel" type="text" placeholder="gpt-4o" :class="[inputClass, 'pl-9']">
-                </div>
+              <div v-else-if="authStatus && !authStatus.ok" class="flex items-center gap-1.5 text-[12px] text-red-500">
+                <div class="i-carbon-warning-filled w-3.5 h-3.5" />
+                凭证无效：{{ authStatus.error }}
+              </div>
+              <div v-if="testingRun" class="flex items-center gap-1.5 text-[12px] text-gray-400">
+                <div class="i-carbon-circle-dash w-3.5 h-3.5 animate-spin" />
+                正在测试运行（端到端验证流式链路，可能需数秒）…
+              </div>
+              <div v-else-if="testRunStatus?.ok" class="flex items-center gap-1.5 text-[12px] text-emerald-500">
+                <div class="i-carbon-checkmark-filled w-3.5 h-3.5" />
+                测试运行成功（耗时 {{ ((testRunStatus.durationMs ?? 0) / 1000).toFixed(1) }}s{{ testRunStatus.attempts && testRunStatus.attempts > 1 ? `，重试 ${testRunStatus.attempts - 1} 次` : '' }}）
+              </div>
+              <div v-else-if="testRunStatus && !testRunStatus.ok" class="flex items-center gap-1.5 text-[12px] text-red-500">
+                <div class="i-carbon-warning-filled w-3.5 h-3.5" />
+                {{ testRunStatus.error }}
               </div>
             </div>
           </section>

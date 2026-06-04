@@ -210,9 +210,6 @@ stages:
         name: 创建分支
         provider: external-cli
         skill: skills/create-branch.md
-        entry_gate: working_tree_clean
-        mcp_servers:
-          - lark-project
 
       # NOTE: 关联飞书工作项的逻辑已迁移到 engine 的 post-create-branch 钩子
       # （WorkflowEngine.syncBranchToFeishuProject，直接走 meegle CLI 写回
@@ -242,13 +239,6 @@ stages:
         invoke_commands:
           - openspec instructions tasks --change "{{change_id}}"
           - openspec validate "{{change_id}}"
-
-      - id: codex-cross-review-planning
-        name: Codex 交叉 Review
-        provider: codex
-        skill: skills/codex-cross-review-planning.md
-        optional: true
-        requires_confirm: true
 
   # ──────────────────────────────────────────────
   # Stage 2: 代码开发

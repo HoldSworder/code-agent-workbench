@@ -1,22 +1,6 @@
-import { resolve, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { resolve } from 'node:path'
 import type { WorkflowTool, ToolInjectionContext } from './types'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'task-checklist', 'run.mjs')
-  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'task-checklist', 'run.mjs')
-  try {
-    // eslint-disable-next-line ts/no-require-imports
-    const { existsSync } = require('node:fs') as typeof import('node:fs')
-    if (existsSync(devPath)) return devPath
-    if (existsSync(prodPath)) return prodPath
-  }
-  catch { /* fallback */ }
-  return devPath
-}
+import { resolveToolScript } from './resolve-script'
 
 function resolveTasksPath(ctx: ToolInjectionContext): string {
   if (ctx.openspecPath) {
@@ -37,7 +21,7 @@ export const taskChecklistTool: WorkflowTool = {
   },
 
   resolveScript(_ctx: ToolInjectionContext): string | null {
-    return resolveScriptPath()
+    return resolveToolScript('task-checklist', 'run.mjs')
   },
 
   getPromptSection(ctx: ToolInjectionContext, scriptAbsPath: string): string {

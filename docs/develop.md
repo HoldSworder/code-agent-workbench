@@ -33,14 +33,12 @@
 │  └─────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
                           │
-         ┌────────────────┼────────────────┐
-         ▼                ▼                ▼
-   ┌──────────┐    ┌──────────┐    ┌──────────┐
-   │ LLM API  │    │ CLI Agent│    │  Shell   │
-   │(Anthropic│    │(Claude / │    │ Script   │
-   │  / OAI)  │    │ Cursor / │    │(verify/  │
-   │          │    │ Codex)   │    │ mr/...)  │
-   └──────────┘    └──────────┘    └──────────┘
+                          ▼
+                   ┌──────────────┐
+                   │  @cursor/sdk │
+                   │ (local agent │
+                   │  会话/流式)   │
+                   └──────────────┘
 ```
 
 ### 通信流
@@ -105,19 +103,26 @@ interface AgentProvider {
 }
 ```
 
-三种实现：
+当前唯一实现：
 
 | Provider | 场景 | 机制 |
 |----------|------|------|
-| `ApiProvider` | 设计、规划、审查 | 直调 Anthropic/OpenAI API |
-| `ExternalCliProvider` | 编码、联调、E2E | 启动 Claude Code / Cursor / Codex 子进程 |
-| `ScriptProvider` | 验证、MR、归档 | 执行 Shell 脚本 |
+| `CursorSdkProvider` | 全部阶段 / review / consult | 通过 `@cursor/sdk` 的 `Agent.create` / `Agent.resume` / `Agent.prompt` 运行 local agent |
 
-每个阶段可在 `workflow.yaml` 中独立指定 Provider 和 MCP 配置。优先级：阶段级 > 仓库级 > 全局默认。
+- 凭证统一读 `agent.cursorApiKey` 设置项（或 `CURSOR_API_KEY` 环境变量），模型读 `agent.model`。
+- 实例化必须经 `packages/sidecar/src/providers/factory.ts` 的 `loadAgentRuntimeFromSettings` + `createCursorSdkProvider`，不要直接 `new CursorSdkProvider` 或裸调 `Agent.create`。
+- `workflow.yaml` 里历史保留的 `provider` 字段（`api` / `external-cli` / `codex`）已不再区分后端，仅作 schema 兼容；运行时一律走 Cursor SDK。
+- Claude / Codex 官方 SDK 后续再接入；届时在 factory 增加分支即可，调用方无需改动。
 
-### 跨阶段状态传递
+> MCP 注入：SDK local agent 默认 `settingSources=[]`，不读项目 `.cursor/mcp.json`。engine 把阶段绑定的 MCP server 转成 inline 配置塞进 `PhaseContext.sdkMcpServers`，由 `CursorSdkProvider` 透传给 `Agent.create`。
 
-Agent 之间不共享上下文。每个阶段启动全新的 Agent 进程，所有状态通过 **OpenSpec 文件系统**传递：
+### 单会话与跨阶段状态传递
+
+整个工作流是**同一个 agent 会话**：首个 phase 用 `Agent.create` 建会话，后续 phase 通过 `Agent.resume(agentId)` 续接，仅追加一条 follow-up 用户消息，无需重灌完整 system prompt。`agentId` 即 provider 的 `sessionId`。
+
+agent 通过 **advance-phase 工具**写信号文件声明阶段意图（next / target / pending_input / terminal），engine 据此推进；回合是否结束由 SDK 的 `RunResult.status` 判定。不再使用 `<<PHASE_COMPLETE>>` / `<<PENDING_INPUT>>` 文本标记。
+
+阶段产出仍落盘到 **OpenSpec 文件系统**，便于门禁校验与人工查看：
 
 ```
 {repo}/.worktrees/{change_id}/openspec/changes/{change_id}/
@@ -133,7 +138,7 @@ Agent 之间不共享上下文。每个阶段启动全新的 Agent 进程，所�
 
 | 阶段 | 触发 | DB 状态 | 副作用 |
 |---|---|---|---|
-| 创建 | `task.create` RPC | `lifecycle_status='active'` | 用配置的 LLM provider 把需求标题翻译成 kebab-case 英文 slug → `git worktree add -b feature/<slug> .worktrees/<slug>` → 写入 DB → best-effort 飞书项目同步 |
+| 创建 | `task.create` RPC | `lifecycle_status='active'` | 用需求标题生成占位 slug（`changeIdFromRequirement`）→ `git worktree add -b feature/<slug> .worktrees/<slug>` → 写入 DB → best-effort 飞书项目同步；语义化英文 slug 由 create-branch 阶段的 agent 生成后经 `task.renameBranch`（内部 `normalizeSlug`）回写 |
 | 开发 | workflow phases 执行 | 同上 | Agent cwd 指向 worktree，正常推进各 phase |
 | 等待合并 | `archive-deploy` phase 完成 | `lifecycle_status='pending_merge'` | 已推送 origin + 创建 MR，但本地 worktree 与分支**保留**，方便处理 review 反馈 |
 | 清理 | 用户在 Dashboard 点「已合并，清理 worktree」 | `lifecycle_status='archived'` | 调 `task.cleanupAfterMerge`，校验本地 feature 分支已合入 default branch → `git worktree remove --force` → `git branch -d feature/<slug>` |
@@ -316,25 +321,26 @@ code-agent/                    # pnpm workspace root
 
 ## 添加新的工作流阶段
 
-1. 在 `workflow.yaml` 的 `phases` 或 `events` 中添加阶段定义
+1. 在 `workflow.yaml` 的某个 stage 的 `phases` 下添加阶段定义
 2. 创建对应的 `skills/{phase-id}.md` 文件
-3. 如果是 `external-cli` Provider，创建 `mcp-configs/{phase-id}.json`
-4. 如果是 `script` Provider，创建 `scripts/{phase-id}.sh`
+3. 阶段需要 MCP 时，在数据库绑定或 phase 的 `mcp_servers` 里声明（engine 会 inline 注入 SDK，无需写 `mcp-configs/*.json`）
 
 引擎会自动识别新阶段，无需修改代码。
 
-## 添加新的 Agent Provider
+## 接入新的 Agent 后端（Claude / Codex 等）
 
-1. 在 `packages/sidecar/src/providers/` 下创建新的 Provider 类
-2. 实现 `AgentProvider` 接口（`run` + `cancel`）
-3. 在 `packages/sidecar/src/index.ts` 的 `resolveProvider` 中注册
-4. 在 `workflow.yaml` 的阶段 `provider` 字段中使用新的类型名
+当前所有调用都走 `CursorSdkProvider`。后续接入其它官方 SDK 时：
+
+1. 在 `packages/sidecar/src/providers/` 下新增 Provider 类，实现 `AgentProvider` 接口（`run` + `cancel`）
+2. 在 `packages/sidecar/src/providers/factory.ts` 的 `createCursorSdkProvider` 旁新增 `createXxxProvider`，并扩展 `AgentProviderKind`
+3. 调用方（`WorkflowEngine.resolveProvider` / `Orchestrator.resolveProviderForRole` / `review/llm.ts`）按 runtime 选择对应工厂
 
 ## 关键设计决策
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| 每阶段独立 Agent | 无跨阶段上下文 | 简化状态管理，OpenSpec 文件即共享状态 |
+| 单会话 + advance-phase 工具 | 全流程同一 agent 会话，工具信号驱动推进 | 保留跨阶段上下文，去掉文本信号协议 |
+| 统一走 @cursor/sdk | 移除自写 CLI spawn 与 Anthropic 直调 | 收敛后端、复用 SDK 的会话/流式/错误处理 |
 | YAML + Skill 分离 | 骨架与肉分开 | 调度逻辑确定性，Agent 指令灵活可调 |
 | git worktree 隔离 | 同仓库多任务并行 | 避免分支切换冲突 |
 | JSON-RPC over stdio | 前后端通信 | 简单可靠，与 Tauri sidecar 模式匹配 |

@@ -1,28 +1,5 @@
-import { resolve, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { WorkflowTool, ToolInjectionContext } from './types'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-/**
- * Resolve absolute path to project-root `tools/inspect-logs.sh`.
- * Layout (from this file's perspective):
- *   dev:  packages/sidecar/src/tools/  -> 4 levels up -> <root>/tools/
- *   prod: packages/sidecar/dist/       -> 3 levels up -> <root>/tools/
- */
-function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'inspect-logs', 'run.sh')
-  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'inspect-logs', 'run.sh')
-  try {
-    // eslint-disable-next-line ts/no-require-imports
-    const { existsSync } = require('node:fs') as typeof import('node:fs')
-    if (existsSync(devPath)) return devPath
-    if (existsSync(prodPath)) return prodPath
-  }
-  catch { /* fallback */ }
-  return devPath
-}
+import { resolveToolScript } from './resolve-script'
 
 export const inspectLogsTool: WorkflowTool = {
   id: 'inspect-logs',
@@ -36,7 +13,7 @@ export const inspectLogsTool: WorkflowTool = {
   },
 
   resolveScript(_ctx: ToolInjectionContext): string | null {
-    return resolveScriptPath()
+    return resolveToolScript('inspect-logs', 'run.sh')
   },
 
   getPromptSection(_ctx: ToolInjectionContext, scriptAbsPath: string): string {

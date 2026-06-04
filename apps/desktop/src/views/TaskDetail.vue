@@ -905,36 +905,8 @@ async function handleResume() {
   if (t) task.value = t
 }
 
-async function handleRollbackToMessage(messageId: string) {
-  if (!task.value) return
-  await rpc('workflow.rollbackToMessage', { repoTaskId: task.value.id, messageId })
-  await new Promise(r => setTimeout(r, 300))
-  const t = await rpc<RepoTask>('task.get', { id: taskId })
-  if (t) {
-    task.value = t
-    viewingPhaseId.value = t.current_phase
-  }
-  await refreshMessages()
-}
-
-async function handleRetryFromPrompt(messageId: string) {
-  if (!task.value || retryingPrompt.value) return
-  retryingPrompt.value = messageId
-  try {
-    await rpc('workflow.retryFromPrompt', { repoTaskId: task.value.id, messageId })
-    await new Promise(r => setTimeout(r, 300))
-    const t = await rpc<RepoTask>('task.get', { id: taskId })
-    if (t) {
-      task.value = t
-      viewingPhaseId.value = t.current_phase
-    }
-    await refreshMessages()
-    startPolling()
-  }
-  finally {
-    retryingPrompt.value = null
-  }
-}
+// 单会话工作流模式：phase 级 / 消息级回滚已移除，统一使用 workflow.reset 重置整任务。
+// 保留空函数以兼容尚未清理的引用（如有）。
 
 const composing = ref(false)
 let compositionEndTimer: ReturnType<typeof setTimeout> | null = null
@@ -1051,19 +1023,8 @@ async function confirmReset() {
   if (!task.value || resetting.value) return
   resetting.value = true
   try {
-    if (isViewingPastPhase.value && viewingPhaseId.value) {
-      rollingBack.value = true
-      const targetPhase = flatPhases.value.find(p => p.id === viewingPhaseId.value)
-      const rpcMethod = rollbackPauseMode.value ? 'workflow.rollbackPaused' : 'workflow.rollback'
-      await rpc(rpcMethod, {
-        repoTaskId: task.value.id,
-        targetStageId: targetPhase?.stageId ?? task.value.current_stage,
-        targetPhaseId: viewingPhaseId.value,
-      })
-    }
-    else {
-      await rpc('workflow.resetPhase', { repoTaskId: task.value.id })
-    }
+    // 单会话模式：phase 级回滚已移除，统一执行整任务重置。
+    await rpc('workflow.reset', { repoTaskId: task.value.id })
     liveOutput.value = ''
     liveActivity.value = ''
     processExpanded.value = false
@@ -1075,7 +1036,6 @@ async function confirmReset() {
       viewingPhaseId.value = t.current_phase
     }
     await refreshMessages()
-    if (!rollbackPauseMode.value) startPolling()
   }
   finally {
     resetting.value = false
@@ -1480,15 +1440,6 @@ async function handleCancel() {
                       <div class="prose-chat text-[12px] leading-relaxed text-gray-600 dark:text-gray-400" v-html="md.render(msg.content)" />
                     </div>
                   </div>
-                  <button
-                    v-if="!isRunning && !isPending"
-                    class="mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/prompt:opacity-100 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-all"
-                    :disabled="retryingPrompt === msg.id"
-                    @click="handleRetryFromPrompt(msg.id)"
-                  >
-                    <div class="w-3 h-3" :class="retryingPrompt === msg.id ? 'i-carbon-circle-dash animate-spin' : 'i-carbon-restart'" />
-                    {{ retryingPrompt === msg.id ? '重试中...' : '重试' }}
-                  </button>
                 </div>
 
                 <!-- System notification bubble -->
@@ -1514,14 +1465,6 @@ async function handleCancel() {
                         {{ formatTime(msg.created_at) }}
                       </div>
                     </div>
-                    <button
-                      v-if="!isRunning && !isPending"
-                      class="self-end mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/msg:opacity-100 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-all"
-                      @click="handleRollbackToMessage(msg.id)"
-                    >
-                      <div class="i-carbon-undo w-3 h-3" />
-                      回滚到此处
-                    </button>
                   </div>
                 </div>
 
@@ -1555,14 +1498,6 @@ async function handleCancel() {
                       </div>
                     </div>
 
-                    <button
-                      v-if="!isRunning && !isPending"
-                      class="self-end mt-0.5 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] text-gray-400 dark:text-gray-500 opacity-0 group-hover/msg:opacity-100 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10 transition-all"
-                      @click="handleRollbackToMessage(msg.id)"
-                    >
-                      <div class="i-carbon-undo w-3 h-3" />
-                      回滚到此处
-                    </button>
                   </div>
                 </div>
               </template>

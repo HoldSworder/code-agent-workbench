@@ -7,10 +7,16 @@ import { defineConfig } from 'tsup'
  * ERR_UNKNOWN_FILE_EXTENSION 直接崩，导致桌面端卡在“正在启动服务”。
  */
 export default defineConfig({
-  entry: ['src/index.ts'],
+  // worker 必须作为独立入口产出 dist/cursor-sdk.worker.js，供 provider fork。
+  entry: {
+    'index': 'src/index.ts',
+    'cursor-sdk.worker': 'src/providers/cursor-sdk.worker.ts',
+  },
   format: 'esm',
   target: 'node20',
   splitting: false,
-  external: ['better-sqlite3'],
+  // @cursor/sdk 携带平台原生二进制（sqlite3 / connectrpc），必须保持 external，
+  // 由运行时从 node_modules resolve，不能被 esbuild 内联。
+  external: ['better-sqlite3', '@cursor/sdk'],
   noExternal: ['@code-agent/shared'],
 })

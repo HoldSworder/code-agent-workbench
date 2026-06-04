@@ -1,10 +1,7 @@
 import { execSync } from 'node:child_process'
-import { basename, dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { basename } from 'node:path'
 import type { ToolInjectionContext, WorkflowTool } from './types'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
+import { resolveToolScript } from './resolve-script'
 
 let _cliVersion: string | false | null = null
 
@@ -25,19 +22,6 @@ function detectOpenspecCli(): string | false {
   return _cliVersion
 }
 
-function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'openspec-query', 'run.mjs')
-  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'openspec-query', 'run.mjs')
-  try {
-    // eslint-disable-next-line ts/no-require-imports
-    const { existsSync } = require('node:fs') as typeof import('node:fs')
-    if (existsSync(devPath)) return devPath
-    if (existsSync(prodPath)) return prodPath
-  }
-  catch { /* fallback */ }
-  return devPath
-}
-
 export const openspecQueryTool: WorkflowTool = {
   id: 'openspec-query',
   name: 'OpenSpec 查询',
@@ -50,7 +34,7 @@ export const openspecQueryTool: WorkflowTool = {
   },
 
   resolveScript(_ctx: ToolInjectionContext): string | null {
-    return resolveScriptPath()
+    return resolveToolScript('openspec-query', 'run.mjs')
   },
 
   getPromptSection(ctx: ToolInjectionContext, scriptAbsPath: string): string {

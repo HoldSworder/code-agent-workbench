@@ -76,9 +76,6 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
     case 'workflow.start':
     case 'workflow.retry':
     case 'workflow.reset':
-    case 'workflow.resetPhase':
-    case 'workflow.rollback':
-    case 'workflow.rollbackToStage':
     case 'repo.delete':
     case 'requirement.delete':
     case 'workflow.confirm':
@@ -107,13 +104,11 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
         { id: 'planning', name: '任务规划', phases: [
           { id: 'task-breakdown', name: '任务拆分' },
           { id: 'task-validate', name: '任务验证' },
-          { id: 'codex-cross-review-planning', name: 'Codex 交叉 Review' },
         ] },
         { id: 'development', name: '代码开发', phases: [
           { id: 'tdd-dev', name: '开发' },
           { id: 'integration', name: '联调' },
           { id: 'self-test', name: '代码 Review' },
-          { id: 'codex-cross-review-dev', name: 'Codex 交叉 Review' },
         ] },
         { id: 'testing', name: '测试', phases: [
           { id: 'e2e-test', name: 'E2E 浏览器测试' },
@@ -175,13 +170,11 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
             { id: 'spec-create', name: 'Spec 落盘', provider: 'external-cli', skill: 'skills/frontend/spec-create.md', requires_confirm: true, invoke_commands: ['openspec new change "{{change_id}}"'], guardrails: ['no_openspec_write_before_confirm'], confirm_files: ['{{openspec_path}}/proposal.md', '{{openspec_path}}/specs/*/spec.md'] },
             { id: 'task-breakdown', name: '任务拆分', provider: 'external-cli', skill: 'skills/frontend/task-breakdown.md', requires_confirm: true, invoke_commands: ['openspec instructions tasks --change "{{change_id}}"'] },
             { id: 'task-validate', name: '任务验证', provider: 'external-cli', skill: 'skills/frontend/task-validate.md', requires_confirm: false, invoke_commands: ['openspec validate "{{change_id}}"'] },
-            { id: 'codex-cross-review-planning', name: 'Codex 交叉 Review', provider: 'external-cli', skill: 'skills/frontend/codex-cross-review-planning.md', optional: true, requires_confirm: false },
           ] },
           { id: 'development', name: '代码开发', gate: 'tasks_all_checked', phases: [
             { id: 'tdd-dev', name: '开发', provider: 'external-cli', skill: 'skills/frontend/tdd-dev.md', requires_confirm: false, invoke_skills: ['superpowers:test-driven-development', 'superpowers:verification-before-completion'], guardrails: ['no_skip_tdd', 'no_uncommitted_claim'], completion_check: 'tasks_all_checked' },
             { id: 'integration', name: '联调', provider: 'external-cli', skill: 'skills/frontend/integration.md', optional: true, requires_confirm: false, triggers: ['后端spec到了', '联调', 'API文档到了', '后端接口文档来了'] },
             { id: 'self-test', name: '代码 Review', provider: 'external-cli', skill: 'skills/frontend/self-test.md', requires_confirm: false, invoke_skills: ['superpowers:verification-before-completion'] },
-            { id: 'codex-cross-review-dev', name: 'Codex 交叉 Review', provider: 'external-cli', skill: 'skills/frontend/codex-cross-review-dev.md', optional: true, requires_confirm: false },
           ] },
           { id: 'testing', name: '测试', gate: 'e2e_report_pass', phases: [
             { id: 'e2e-test', name: 'E2E 浏览器测试', provider: 'external-cli', skill: 'skills/frontend/e2e-test.md', requires_confirm: false, completion_check: 'e2e_report_pass' },
@@ -230,10 +223,12 @@ function mockRpc<T>(method: string, params: Record<string, any>): T {
       return {} as T
     case 'agent.listModels':
       return { models: [
-        { id: 'auto', label: 'Auto' },
-        { id: 'sonnet-4-thinking', label: 'Sonnet 4 Thinking' },
+        { id: 'composer-2.5', label: 'Composer 2.5' },
+        { id: 'sonnet-4.5', label: 'Claude Sonnet 4.5' },
         { id: 'gpt-5', label: 'GPT-5' },
       ] } as T
+    case 'agent.checkCursorAuth':
+      return { ok: true, apiKeyName: 'mock-key', userEmail: 'dev@example.com' } as T
     case 'mcp.list':
       return [
         {

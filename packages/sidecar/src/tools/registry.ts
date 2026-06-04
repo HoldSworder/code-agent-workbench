@@ -11,6 +11,7 @@ import { taskChecklistTool } from './task-checklist.tool'
 import { workflowNavTool } from './workflow-nav.tool'
 import { repoInfoTool } from './repo-info.tool'
 import { uiElementTool } from './ui-element.tool'
+import { advancePhaseTool } from './advance-phase.tool'
 
 const tools: WorkflowTool[] = []
 
@@ -68,3 +69,4 @@ registerTool(taskChecklistTool)
 registerTool(workflowNavTool)
 registerTool(repoInfoTool)
 registerTool(uiElementTool)
+registerTool(advancePhaseTool)

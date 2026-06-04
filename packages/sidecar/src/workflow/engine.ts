@@ -10,10 +10,11 @@ function elog(msg: string) {
 import type Database from 'better-sqlite3'
 import { errorMessage } from '@code-agent/shared/util'
 import type { AgentProvider, PhaseResult } from '../providers/types'
-import { buildPromptFromContext } from '../providers/cli.provider'
-import { parseWorkflow, findPhaseById, findPhaseInStages, flattenPhases, getLastMandatoryPhaseId } from './parser'
+import { buildPromptFromContext } from '../providers/prompt-builder'
+import { toSdkMcpServers } from '../providers/cursor-sdk.provider'
+import { parseWorkflow, findPhaseById, findPhaseInStages, getLastMandatoryPhaseId } from './parser'
 import type { GateCheck, GateDefinition, PhaseConfig, StageConfig, WorkflowConfig } from './parser'
-import { buildPhaseContext } from './context-builder'
+import { buildPhaseContext, buildWorkflowOverview, buildWorkflowSkillBundle } from './context-builder'
 import { RepoTaskRepository } from '../db/repositories/repo-task.repo'
 import { AgentRunRepository } from '../db/repositories/agent-run.repo'
 import { MessageRepository } from '../db/repositories/message.repo'
@@ -32,6 +33,8 @@ import type { McpServerConfig } from '../mcp/config-writer'
 import { McpOAuthService, resolveOAuthAccessToken } from '../mcp/oauth'
 import { collectTools } from '../tools/registry'
 import { renderWorkflowSkill } from '../workflow-skills/registry'
+import { loadAgentRuntimeFromSettings } from '../providers/factory'
+import { llmCall } from '../review/llm'
 
 export interface ResolveProviderOptions {
   resumeSessionId?: string
@@ -74,6 +77,13 @@ export class WorkflowEngine {
   private requirementLiveOutputs = new Map<string, string>()
   private pendingAdvance = new Map<string, string>()
   private pendingPlanMode = new Set<string>()
+  /**
+   * A1: 单会话下 agent 反复 advance-phase 但门禁始终不过，会无限 re-spawn。
+   * 用 `${repoTaskId}:${phaseId}` 计数连续失败次数，达上限后转 waiting_input 交还用户。
+   * 进入新 phase（成功推进 / target 跳转）时由 clearGateFailCount 清零。
+   */
+  private gateFailCounts = new Map<string, number>()
+  private static readonly MAX_GATE_FAILS = 3
   private mcpOAuthService = new McpOAuthService()
 
   /** 供 context-builder 加载根级 skill（skills/<id>/）的回调 */
@@ -308,6 +318,48 @@ export class WorkflowEngine {
     }
   }
 
+  /**
+   * 读取 Agent 通过 advance-phase 工具写入的推进请求。
+   * 返回 null 表示当前 phase 未发起推进请求。
+   */
+  private readAdvanceRequest(worktreePath: string): {
+    fromPhaseId: string
+    mode: 'next' | 'target' | 'pending_input' | 'terminal'
+    target?: string
+    note?: string
+  } | null {
+    try {
+      const reqPath = join(worktreePath, '.code-agent', 'advance-request.json')
+      if (!existsSync(reqPath)) return null
+      const raw = JSON.parse(readFileSync(reqPath, 'utf-8'))
+      const mode = raw.mode
+      if (!['next', 'target', 'pending_input', 'terminal'].includes(mode)) {
+        elog(`readAdvanceRequest: invalid mode "${mode}", ignoring`)
+        return null
+      }
+      return {
+        fromPhaseId: raw.fromPhaseId ?? '',
+        mode,
+        target: raw.target,
+        note: raw.note,
+      }
+    }
+    catch (err) {
+      elog(`readAdvanceRequest: ${errorMessage(err)}`)
+      return null
+    }
+  }
+
+  private clearAdvanceRequest(worktreePath: string): void {
+    try {
+      const reqPath = join(worktreePath, '.code-agent', 'advance-request.json')
+      if (existsSync(reqPath)) rmSync(reqPath)
+    }
+    catch (err) {
+      elog(`clearAdvanceRequest: ${errorMessage(err)}`)
+    }
+  }
+
   // ── UI 元素文件读写 ──
 
   readUIElements(worktreePath: string): Array<Record<string, unknown>> {
@@ -359,8 +411,13 @@ export class WorkflowEngine {
   }
 
   /**
-   * 通用门禁求值器：根据 gate_definitions 中的声明式 checks 判断条件是否满足。
+   * 通用门禁求值器（同步）：根据 gate_definitions 中的声明式 checks 判断条件是否满足。
    * 所有 checks 之间为 AND 关系，全部通过则条件满足。
+   *
+   * 注意：同步版本**跳过 `llm_judge` 类型的 check**（视为满足），仅评估确定性检查。
+   * 用于 state_inference 状态推断、getPhaseGuidance 展示、checkStageGate 等
+   * 启发式 / 非阻断路径，避免把昂贵的 LLM 调用引入同步语境。
+   * 真正的权威阻断路径（entry_gate / completion_check）请用 {@link evaluateGateAsync}。
    */
   private evaluateGate(
     condition: string,
@@ -380,10 +437,100 @@ export class WorkflowEngine {
     }
 
     for (const check of def.checks) {
+      if (check.type === 'llm_judge')
+        continue
       if (!this.evaluateCheck(check, worktreePath, vars))
         return false
     }
     return true
+  }
+
+  /**
+   * 通用门禁求值器（异步）：在确定性 checks 之外，额外评估 `llm_judge` 类型的 check。
+   * 所有 checks 之间仍为 AND 关系。用于 entry_gate / completion_check 等权威阻断路径。
+   */
+  private async evaluateGateAsync(
+    condition: string,
+    worktreePath: string,
+    openspecPath: string,
+    wfConfig: WorkflowConfig = this.config,
+  ): Promise<boolean> {
+    const def = wfConfig.gate_definitions?.[condition]
+    if (!def) {
+      elog(`evaluateGateAsync: condition "${condition}" not found in gate_definitions, returning false`)
+      return false
+    }
+
+    const vars: Record<string, string> = {
+      openspec_path: openspecPath,
+      repo_path: worktreePath,
+    }
+
+    for (const check of def.checks) {
+      if (check.type === 'llm_judge') {
+        const passed = await this.evaluateLlmCheck(check, worktreePath, vars)
+        if (!passed)
+          return false
+        continue
+      }
+      if (!this.evaluateCheck(check, worktreePath, vars))
+        return false
+    }
+    return true
+  }
+
+  /**
+   * 评估单个 `llm_judge` check：读取 context_files 作为证据，调用 LLM 给出 PASS/FAIL。
+   *
+   * 失败开放（fail-open）：缺 Cursor API Key 或调用异常时返回 true 并打日志，
+   * 不让基础设施问题硬卡死工作流；客观底线仍由确定性 check 保证。
+   */
+  private async evaluateLlmCheck(
+    check: GateCheck,
+    worktreePath: string,
+    vars: Record<string, string>,
+  ): Promise<boolean> {
+    if (!check.prompt) {
+      elog('evaluateLlmCheck: missing prompt, treating as pass')
+      return true
+    }
+
+    try {
+      const runtime = loadAgentRuntimeFromSettings(this.settingsRepo)
+      if (!runtime.cursorApiKey) {
+        elog('evaluateLlmCheck: no cursorApiKey, fail-open (pass)')
+        return true
+      }
+
+      const MAX_FILE_CHARS = 8_000
+      const evidence: string[] = []
+      for (const rawPath of check.context_files ?? []) {
+        const rel = this.resolveTemplate(rawPath, vars)
+        const absPath = join(worktreePath, rel)
+        if (!existsSync(absPath)) {
+          evidence.push(`### ${rel}\n（文件不存在）`)
+          continue
+        }
+        let content = readFileSync(absPath, 'utf-8')
+        if (content.length > MAX_FILE_CHARS)
+          content = `${content.slice(0, MAX_FILE_CHARS)}\n…（已截断）`
+        evidence.push(`### ${rel}\n${content}`)
+      }
+
+      const systemPrompt = '你是工作流门禁评审员。根据给定的判定标准与证据文件，判断是否满足标准。'
+        + '只输出一行：以 PASS 或 FAIL 开头，后接一句简短理由。不要输出其它内容。'
+      const userPrompt = `## 判定标准\n${check.prompt}\n\n## 证据\n${evidence.length ? evidence.join('\n\n') : '（无证据文件）'}`
+
+      const reply = await llmCall({ runtime, systemPrompt, userPrompt, cwd: worktreePath })
+      const verdict = reply.trim().toUpperCase()
+      const passed = verdict.startsWith('PASS')
+      elog(`evaluateLlmCheck: prompt="${check.prompt.slice(0, 60)}" verdict=${passed ? 'PASS' : 'FAIL'} reply="${reply.slice(0, 120)}"`)
+      return passed
+    }
+    catch (err) {
+      elog(`evaluateLlmCheck: error, fail-open (pass): ${errorMessage(err)}`)
+      return true
+    }
   }
 
   private resolveTemplate(template: string, vars: Record<string, string>): string {
@@ -681,7 +828,8 @@ export class WorkflowEngine {
       const loopTarget = findPhaseById(wf.stages, phase.loop_target)
       if (loopTarget) {
         this.taskRepo.updatePhase(repoTaskId, loopTarget.stage.id, loopTarget.phase.id, 'running')
-        await this.executePhase(repoTaskId, loopTarget.phase, loopTarget.stage)
+        const followUp = `用户已确认推进，已进入阶段「${loopTarget.phase.name}」。请按工作流 Skill 总览继续，完成后调用 advance-phase 工具。`
+        await this.executePhase(repoTaskId, loopTarget.phase, loopTarget.stage, followUp)
         return
       }
     }
@@ -694,7 +842,10 @@ export class WorkflowEngine {
     }
 
     this.taskRepo.updatePhase(repoTaskId, next.stage.id, next.phase.id, 'running')
-    await this.executePhase(repoTaskId, next.phase, next.stage)
+    // 单会话模式：以 follow-up user message 复用现有 CLI sessionId，避免重新发送
+    // 完整 system prompt（skill 总览已在初始会话里）。
+    const followUp = `用户已确认推进，已进入阶段「${next.phase.name}」。请按工作流 Skill 总览继续，完成后调用 advance-phase 工具。`
+    await this.executePhase(repoTaskId, next.phase, next.stage, followUp)
   }
 
   async suspendTask(repoTaskId: string): Promise<void> {
@@ -1009,7 +1160,8 @@ export class WorkflowEngine {
       throw new Error(`Phase ${task.current_phase} not found in workflow config`)
 
     this.taskRepo.updatePhase(repoTaskId, found.stage.id, found.phase.id, 'running')
-    await this.executePhase(repoTaskId, found.phase, found.stage, undefined, { skipEntryGate: true })
+    const followUp = `用户请求重试阶段「${found.phase.name}」，请按 skill 指引继续，完成后调用 advance-phase 工具。`
+    await this.executePhase(repoTaskId, found.phase, found.stage, followUp, { skipEntryGate: true })
   }
 
   async resetTask(repoTaskId: string): Promise<void> {
@@ -1044,185 +1196,11 @@ export class WorkflowEngine {
     this.taskRepo.updatePhase(repoTaskId, firstStage.id, firstPhase.id, 'pending')
   }
 
-  async resetCurrentPhase(repoTaskId: string): Promise<void> {
-    const task = this.taskRepo.findById(repoTaskId)
-    if (!task) throw new Error(`Task not found: ${repoTaskId}`)
-    elog(`resetCurrentPhase: task=${repoTaskId} current_stage=${task.current_stage} current_phase=${task.current_phase} status=${task.phase_status}`)
-
-    await this.rollbackToPhase(repoTaskId, task.current_stage, task.current_phase)
-  }
-
-  async rollbackToPhase(
-    repoTaskId: string,
-    targetStageId: string,
-    targetPhaseId: string,
-    options?: { pauseAfterRollback?: boolean },
-  ): Promise<void> {
-    elog(`rollbackToPhase: task=${repoTaskId} targetStage=${targetStageId} targetPhase=${targetPhaseId} pause=${options?.pauseAfterRollback ?? false}`)
-    const task = this.taskRepo.findById(repoTaskId)
-    if (!task)
-      throw new Error(`Task not found: ${repoTaskId}`)
-
-    const wf = this.resolveConfigForTask(repoTaskId)
-    const target = findPhaseInStages(wf.stages, targetStageId, targetPhaseId)
-    if (!target)
-      throw new Error(`Phase "${targetPhaseId}" not found in stage "${targetStageId}"`)
-
-    const current = findPhaseById(wf.stages, task.current_phase)
-    if (current) {
-      const targetFlat = target.stageIdx * 10000 + target.phaseIdx
-      const currentFlat = current.stageIdx * 10000 + current.phaseIdx
-      if (targetFlat > currentFlat)
-        throw new Error(`Cannot roll forward: target "${targetStageId}/${targetPhaseId}" is after current "${task.current_stage}/${task.current_phase}"`)
-    }
-
-    await this.cancelCurrentAgent(repoTaskId)
-    this.liveOutputs.delete(repoTaskId)
-    this.liveActivityLogs.delete(repoTaskId)
-
-    const isCurrentPhase = targetStageId === task.current_stage
-      && targetPhaseId === task.current_phase
-
-    if (!isCurrentPhase) {
-      let resetSha: string | null = null
-      if (target.stageIdx === 0 && target.phaseIdx === 0) {
-        resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
-      }
-      else {
-        const allPhases = flattenPhases(wf)
-        const flatIdx = allPhases.findIndex(
-          p => p.id === targetPhaseId && p.stageId === targetStageId,
-        )
-        for (let i = flatIdx - 1; i >= 0 && !resetSha; i--) {
-          resetSha = this.commitRepo.get(repoTaskId, allPhases[i].id)
-        }
-        if (!resetSha)
-          resetSha = this.commitRepo.get(repoTaskId, INITIAL_PHASE_ID)
-      }
-
-      if (!resetSha) {
-        resetSha = await getMergeBase(task.worktree_path)
-        if (resetSha) this.commitRepo.save(repoTaskId, INITIAL_PHASE_ID, resetSha)
-      }
-
-      if (resetSha) {
-        try {
-          await stashIfDirty(task.worktree_path, `auto-stash before rollback to ${targetStageId}/${targetPhaseId}`)
-          await resetHard(task.worktree_path, resetSha)
-        }
-        catch (e) { process.stderr.write(`[workflow] git reset failed on rollback: ${e}\n`) }
-      }
-    }
-
-    const phasesToClear = this.collectPhaseIdsAfter(target.stageIdx, target.phaseIdx, wf)
-    this.msgRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
-    this.runRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
-    this.commitRepo.deleteByTaskAndPhases(repoTaskId, phasesToClear)
-    await this.cleanupAssignmentsForPhases(repoTaskId, phasesToClear)
-
-    if (options?.pauseAfterRollback) {
-      this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'waiting_input')
-      this.msgRepo.create({
-        repo_task_id: repoTaskId,
-        phase_id: targetPhaseId,
-        role: 'system',
-        content: `已回滚到阶段「${target.phase.name}」，等待你的输入后继续。`,
-      })
-    }
-    else {
-      this.taskRepo.updatePhase(repoTaskId, targetStageId, targetPhaseId, 'running')
-      await this.executePhase(repoTaskId, target.phase, target.stage, undefined, { skipEntryGate: true })
-    }
-  }
-
-  async rollbackToStage(repoTaskId: string, targetStageId: string, options?: { pauseAfterRollback?: boolean }): Promise<void> {
-    const wf = this.resolveConfigForTask(repoTaskId)
-    const stage = wf.stages.find(s => s.id === targetStageId)
-    if (!stage)
-      throw new Error(`Stage "${targetStageId}" not found`)
-    await this.rollbackToPhase(repoTaskId, targetStageId, stage.phases[0].id, options)
-  }
-
-  async rollbackToMessage(repoTaskId: string, messageId: string): Promise<void> {
-    elog(`rollbackToMessage: task=${repoTaskId} messageId=${messageId}`)
-    const task = this.taskRepo.findById(repoTaskId)
-    if (!task)
-      throw new Error(`Task not found: ${repoTaskId}`)
-
-    const msg = this.msgRepo.findById(messageId)
-    if (!msg || msg.repo_task_id !== repoTaskId)
-      throw new Error(`Message not found or does not belong to task: ${messageId}`)
-
-    await this.cancelCurrentAgent(repoTaskId)
-    this.liveOutputs.delete(repoTaskId)
-    this.liveActivityLogs.delete(repoTaskId)
-
-    this.msgRepo.deleteAfterMessage(repoTaskId, msg.phase_id, msg.created_at)
-    this.runRepo.deleteByTaskPhaseAfterTime(repoTaskId, msg.phase_id, msg.created_at)
-
-    const wf = this.resolveConfigForTask(repoTaskId)
-    const found = findPhaseById(wf.stages, msg.phase_id)
-    const phaseName = found?.phase.name ?? msg.phase_id
-
-    if (found) {
-      const laterPhases = this.collectPhaseIdsAfter(
-        found.stageIdx, found.phaseIdx + 1, wf,
-      )
-      if (laterPhases.length) {
-        this.msgRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
-        this.runRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
-        this.commitRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
-        await this.cleanupAssignmentsForPhases(repoTaskId, laterPhases)
-      }
-    }
-
-    this.msgRepo.create({
-      repo_task_id: repoTaskId,
-      phase_id: msg.phase_id,
-      role: 'system',
-      content: `已回退到指定消息，阶段「${phaseName}」等待你的输入后继续。`,
-    })
-
-    const stageId = found?.stage.id ?? task.current_stage
-    this.taskRepo.updatePhase(repoTaskId, stageId, msg.phase_id, 'waiting_input')
-  }
-
-  async retryFromPrompt(repoTaskId: string, messageId: string): Promise<void> {
-    elog(`retryFromPrompt: task=${repoTaskId} messageId=${messageId}`)
-    const task = this.taskRepo.findById(repoTaskId)
-    if (!task)
-      throw new Error(`Task not found: ${repoTaskId}`)
-
-    const msg = this.msgRepo.findById(messageId)
-    if (!msg || msg.repo_task_id !== repoTaskId)
-      throw new Error(`Message not found or does not belong to task: ${messageId}`)
-
-    await this.cancelCurrentAgent(repoTaskId)
-    this.liveOutputs.delete(repoTaskId)
-    this.liveActivityLogs.delete(repoTaskId)
-
-    this.msgRepo.deleteAfterMessage(repoTaskId, msg.phase_id, msg.created_at)
-    this.runRepo.deleteByTaskPhaseAfterTime(repoTaskId, msg.phase_id, msg.created_at)
-
-    const wf = this.resolveConfigForTask(repoTaskId)
-    const found = findPhaseById(wf.stages, msg.phase_id)
-    if (!found)
-      throw new Error(`Phase ${msg.phase_id} not found in workflow config`)
-
-    const laterPhases = this.collectPhaseIdsAfter(
-      found.stageIdx, found.phaseIdx + 1, wf,
-    )
-    if (laterPhases.length) {
-      this.msgRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
-      this.runRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
-      this.commitRepo.deleteByTaskAndPhases(repoTaskId, laterPhases)
-      await this.cleanupAssignmentsForPhases(repoTaskId, laterPhases)
-    }
-
-    const { stage, phase } = found
-    this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
-    await this.executePhase(repoTaskId, phase, stage)
-  }
+  /**
+   * Phase 级回滚 / 单消息级回滚已在单会话模式下移除。
+   * 唯一支持的"回退"操作是 `resetTask`（整任务清空 + git reset + 重新启动会话）。
+   * orchestrator 的 `rollbackAssignment`（worker 级）保留，与工作流回滚是不同维度。
+   */
 
   getFullConfig(): WorkflowConfig {
     return this.config
@@ -1620,11 +1598,12 @@ export class WorkflowEngine {
         ? repoForTask.local_path
         : task.worktree_path
       this.clearPhaseSignal(phaseCwd)
+      this.clearAdvanceRequest(phaseCwd)
       this.clearUIElements(phaseCwd)
       const wf = this.resolveConfigForTask(repoTaskId)
 
       if (phase.entry_gate && !options?.skipEntryGate) {
-        const gatePassed = this.evaluateGate(
+        const gatePassed = await this.evaluateGateAsync(
           phase.entry_gate,
           phaseCwd,
           task.openspec_path,
@@ -1646,7 +1625,13 @@ export class WorkflowEngine {
 
       const requirement = this.reqRepo.findById(task.requirement_id)
 
-      const previousSessionId = this.runRepo.findLastSessionId(repoTaskId, phase.id)
+      // 单会话模式：sessionId 在任务级别共享（跨 phase）。
+      // - requirement phase 仍按旧逻辑（每个 phase 一个独立会话）
+      // - 工作流 stage 内的所有 phase 复用同一个 sessionId
+      const isRequirementStage = stage.id === '_requirements'
+      const previousSessionId = isRequirementStage
+        ? this.runRepo.findLastSessionId(repoTaskId, phase.id)
+        : this.runRepo.findLastSessionIdForTask(repoTaskId)
       const isResume = !!previousSessionId && !!userMessage
 
       const MAX_HISTORY_CHARS = 30_000
@@ -1713,6 +1698,27 @@ export class WorkflowEngine {
       const planMode = options?.planMode
       if (planMode) this.pendingPlanMode.add(repoTaskId)
 
+      // 仅在工作流首次启动（非 requirement stage、且任务尚无 sessionId）时注入
+      // 全工作流 skill 总览 + 工作流地图。这构成单会话模式的 system prompt 头部。
+      const shouldInjectWorkflowBundle = !isRequirementStage && !previousSessionId
+      let workflowBundle = undefined as ReturnType<typeof buildWorkflowSkillBundle> | undefined
+      let workflowOverview: string | undefined
+      if (shouldInjectWorkflowBundle) {
+        const templateVars: Record<string, string> = {
+          openspec_path: task.openspec_path,
+          change_id: task.change_id,
+          branch_name: task.branch_name,
+          repo_path: phaseCwd,
+          requirement_title: reqInfo?.title ?? '',
+          requirement_description: reqInfo?.description ?? '',
+          requirement_doc_url: reqInfo?.docUrl ?? '',
+          requirement_source_url: reqInfo?.sourceUrl ?? '',
+        }
+        workflowBundle = buildWorkflowSkillBundle(wf.stages, templateVars, ctxDeps)
+        workflowOverview = buildWorkflowOverview(wf.stages, wf.gate_definitions)
+        elog(`executePhase: injecting workflow skill bundle (${workflowBundle.length} entries) + overview for task=${repoTaskId}`)
+      }
+
       const context = isResume
         ? buildPhaseContext(
             phase,
@@ -1749,6 +1755,8 @@ export class WorkflowEngine {
             toolPrompts,
             undefined,
             planMode,
+            workflowBundle,
+            workflowOverview,
           )
 
       const phaseAgentCfg = this.getPhaseAgentConfig(phase.id)
@@ -1792,41 +1800,30 @@ export class WorkflowEngine {
           elog(`executePhase: resolved ${mcpServers.length} MCP server(s) from YAML mcp_servers for ${stage.id}/${phase.id}`)
       }
 
-      const configWriter = getConfigWriter(effectiveCliType)
-      const cwd = phaseCwd
-
+      // SDK local agent 默认 settingSources=[] 不读项目 .cursor/mcp.json，
+      // 因此把 MCP server 以 inline 形式注入 context，由 CursorSdkProvider 透传给 Agent.create。
       if (mcpServers.length === 0) {
         elog(`executePhase: no MCP servers for ${stage.id}/${phase.id}`)
       } else {
         const serverConfigs: McpServerConfig[] = await Promise.all(mcpServers.map(s => this.buildMcpServerConfig(s)))
-        configWriter.backup(cwd)
-        configWriter.write(cwd, serverConfigs)
-        const mcpConfigPath = configWriter.getConfigPath(cwd)
-        elog(`executePhase: injected ${mcpServers.length} MCP server(s) for ${stage.id}/${phase.id} (cliType=${effectiveCliType}, configPath=${mcpConfigPath}, servers=${mcpServers.map(s => s.name).join(',')})`)
+        context.sdkMcpServers = toSdkMcpServers(serverConfigs)
+        elog(`executePhase: inline ${mcpServers.length} MCP server(s) for ${stage.id}/${phase.id} (servers=${mcpServers.map(s => s.name).join(',')})`)
       }
 
       const MAX_ACTIVITY_SIZE = 50 * 1024
-      let result: PhaseResult
-      try {
-        result = await provider.run(context, {
-          onChunk: (chunk) => {
-            const current = this.liveOutputs.get(repoTaskId) ?? ''
-            this.liveOutputs.set(repoTaskId, current + chunk)
-          },
-          onActivity: (entry) => {
-            let current = this.liveActivityLogs.get(repoTaskId) ?? ''
-            current += entry
-            if (current.length > MAX_ACTIVITY_SIZE)
-              current = current.slice(-MAX_ACTIVITY_SIZE)
-            this.liveActivityLogs.set(repoTaskId, current)
-          },
-        })
-      } finally {
-        if (mcpServers.length > 0) {
-          configWriter.restore(cwd)
-          elog(`executePhase: restored MCP config for ${stage.id}/${phase.id}`)
-        }
-      }
+      const result: PhaseResult = await provider.run(context, {
+        onChunk: (chunk) => {
+          const current = this.liveOutputs.get(repoTaskId) ?? ''
+          this.liveOutputs.set(repoTaskId, current + chunk)
+        },
+        onActivity: (entry) => {
+          let current = this.liveActivityLogs.get(repoTaskId) ?? ''
+          current += entry
+          if (current.length > MAX_ACTIVITY_SIZE)
+            current = current.slice(-MAX_ACTIVITY_SIZE)
+          this.liveActivityLogs.set(repoTaskId, current)
+        },
+      })
       this.activeProviders.delete(repoTaskId)
 
       const sessionId = (provider as any).sessionId ?? undefined
@@ -1838,7 +1835,7 @@ export class WorkflowEngine {
           repo_task_id: repoTaskId,
           phase_id: phase.id,
           role: 'assistant',
-          content: this.stripPhaseSignals(result.output),
+          content: result.output,
         })
       }
 
@@ -1882,12 +1879,20 @@ export class WorkflowEngine {
     result: PhaseResult,
   ): Promise<void> {
     const wf = this.resolveConfigForTask(repoTaskId)
-    const agentSignal = this.parsePhaseSignal(result.output)
     const shouldAutoAdvance = this.pendingAdvance.get(repoTaskId) === phase.id
     if (this.pendingAdvance.has(repoTaskId)) this.pendingAdvance.delete(repoTaskId)
     const isPlanMode = this.pendingPlanMode.has(repoTaskId)
     if (isPlanMode) this.pendingPlanMode.delete(repoTaskId)
-    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} agentSignal=${agentSignal} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} autoAdvance=${shouldAutoAdvance} planMode=${isPlanMode} error=${result.error?.slice(0, 200) ?? 'none'}`)
+
+    // 优先读取 agent 通过 advance-phase 工具写入的推进请求。
+    // 若存在则用 advanceRequest 主导后续状态机迁移；不存在则回落到旧的文本信号兼容路径。
+    const taskForAdvance = this.taskRepo.findById(repoTaskId)
+    const advanceCwd = phase.id === 'create-branch' && taskForAdvance
+      ? (this.repoRepo.findById(taskForAdvance.repo_id)?.local_path ?? taskForAdvance.worktree_path)
+      : taskForAdvance?.worktree_path
+    const advanceRequest = advanceCwd ? this.readAdvanceRequest(advanceCwd) : null
+    if (advanceCwd) this.clearAdvanceRequest(advanceCwd)
+    elog(`handlePhaseResult: stage=${stage.id} phase=${phase.id} status=${result.status} advanceRequest=${advanceRequest ? `mode=${advanceRequest.mode} target=${advanceRequest.target ?? '-'}` : 'none'} requires_confirm=${phase.requires_confirm} completion_check=${phase.completion_check ?? 'none'} autoAdvance=${shouldAutoAdvance} planMode=${isPlanMode} error=${result.error?.slice(0, 200) ?? 'none'}`)
 
     if (result.status === 'failed' || result.status === 'cancelled') {
       // Provider 层已经处理了 "agent 已表达完成意图但进程异常退出" 的场景（信号覆盖退出码）。
@@ -1924,7 +1929,32 @@ export class WorkflowEngine {
       return
     }
 
-    if (result.status === 'pending_input' || agentSignal === 'pending_input') {
+    // advance-phase 工具的两个直接终止路径：pending_input / terminal。
+    // next / target 则继续走下面的统一 gate 校验 + 推进流程（视同 agent 声明完成）。
+    if (advanceRequest?.mode === 'pending_input') {
+      const note = advanceRequest.note ? `：${advanceRequest.note}` : ''
+      this.msgRepo.create({
+        repo_task_id: repoTaskId,
+        phase_id: phase.id,
+        role: 'system',
+        content: `Agent 主动挂起，等待你的反馈后继续${note}`,
+      })
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
+      return
+    }
+    if (advanceRequest?.mode === 'terminal') {
+      this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'completed')
+      this.taskRepo.markWorkflowCompleted(repoTaskId)
+      try { this.taskRepo.markPendingMerge(repoTaskId) }
+      catch (err) { elog(`markPendingMerge failed: ${errorMessage(err)}`) }
+      return
+    }
+
+    // 单会话模式下：advance-request 的 next / target 视为 agent 完成本阶段的权威信号。
+    const agentDeclaredComplete = advanceRequest?.mode === 'next'
+      || advanceRequest?.mode === 'target'
+
+    if (result.status === 'pending_input') {
       if (!shouldAutoAdvance) {
         this.msgRepo.create({
           repo_task_id: repoTaskId,
@@ -1973,21 +2003,49 @@ export class WorkflowEngine {
     if (phase.completion_check) {
       const task = this.taskRepo.findById(repoTaskId)
       if (task) {
-        const passed = this.evaluateGate(
+        const passed = await this.evaluateGateAsync(
           phase.completion_check,
           task.worktree_path,
           task.openspec_path,
           wf,
         )
-        elog(`handlePhaseResult: completion_check="${phase.completion_check}" passed=${passed} agentSignal=${agentSignal}`)
+        elog(`handlePhaseResult: completion_check="${phase.completion_check}" passed=${passed} advanceMode=${advanceRequest?.mode ?? '-'}`)
         if (!passed) {
           const gateDef = wf.gate_definitions?.[phase.completion_check]
           const desc = gateDef?.description ?? phase.completion_check
+
+          // Agent 通过 advance-phase 工具显式声明完成但 gate 不过：把错误回传 agent 并立即 re-spawn，
+          // 不打扰用户。这是单会话模式下 agent 自驱推进的核心反馈回路。
+          // A1: 连续失败超过上限则停止 re-spawn，转 waiting_input 交还用户，避免死循环。
+          if (advanceRequest && (advanceRequest.mode === 'next' || advanceRequest.mode === 'target')) {
+            if (this.bumpGateFailAndExceeded(repoTaskId, phase.id)) {
+              this.clearGateFailCount(repoTaskId, phase.id)
+              this.msgRepo.create({
+                repo_task_id: repoTaskId,
+                phase_id: phase.id,
+                role: 'system',
+                content: `阶段「${phase.name}」的完成条件「${desc}」已连续 ${WorkflowEngine.MAX_GATE_FAILS} 次未通过自动校验，已暂停自动推进。请人工检查产出后反馈继续。`,
+              })
+              this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
+              return
+            }
+            const feedback = `❌ advance-phase 校验失败：阶段「${phase.name}」的完成条件「${desc}」当前不满足。请检查产出（运行验证命令 / 查看必要文件 / 修正代码）后，重新调用 advance-phase 工具。`
+            this.msgRepo.create({
+              repo_task_id: repoTaskId,
+              phase_id: phase.id,
+              role: 'system',
+              content: feedback,
+            })
+            this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+            await this.executePhase(repoTaskId, phase, stage, feedback)
+            return
+          }
+
           this.msgRepo.create({
             repo_task_id: repoTaskId,
             phase_id: phase.id,
             role: 'system',
-            content: agentSignal === 'complete'
+            content: agentDeclaredComplete
               ? `Agent 声明已完成，但完成条件「${desc}」未通过验证，请检查产出后反馈。`
               : `阶段「${phase.name}」产出未就绪（${desc}），请反馈后继续。`,
           })
@@ -1997,8 +2055,73 @@ export class WorkflowEngine {
       }
     }
 
+    // confirm_files 文件存在性校验（同 completion_check 反馈回路逻辑）
+    if (phase.confirm_files?.length && advanceRequest && (advanceRequest.mode === 'next' || advanceRequest.mode === 'target')) {
+      const taskForFiles = this.taskRepo.findById(repoTaskId)
+      if (taskForFiles) {
+        const missing = this.validateConfirmFiles(
+          phase.confirm_files,
+          taskForFiles.worktree_path,
+          taskForFiles.openspec_path,
+          taskForFiles.change_id,
+        )
+        if (missing.length) {
+          if (this.bumpGateFailAndExceeded(repoTaskId, phase.id)) {
+            this.clearGateFailCount(repoTaskId, phase.id)
+            this.msgRepo.create({
+              repo_task_id: repoTaskId,
+              phase_id: phase.id,
+              role: 'system',
+              content: `阶段「${phase.name}」要求的产出文件已连续 ${WorkflowEngine.MAX_GATE_FAILS} 次缺失，已暂停自动推进。请人工补齐以下文件后反馈继续：\n${missing.map(f => `- ${f}`).join('\n')}`,
+            })
+            this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'waiting_input')
+            return
+          }
+          const feedback = `❌ advance-phase 校验失败：阶段「${phase.name}」要求的产出文件缺失：\n${missing.map(f => `- ${f}`).join('\n')}\n\n请生成上述文件后重新调用 advance-phase 工具。`
+          this.msgRepo.create({
+            repo_task_id: repoTaskId,
+            phase_id: phase.id,
+            role: 'system',
+            content: feedback,
+          })
+          this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+          await this.executePhase(repoTaskId, phase, stage, feedback)
+          return
+        }
+      }
+    }
+
+    // 走到这里说明本 phase 的门禁（completion_check / confirm_files）已通过，清零失败计数。
+    this.clearGateFailCount(repoTaskId, phase.id)
+
+    // A2: advance-request 的 target 模式优先于 requires_confirm——agent 显式指定跳转目标
+    // （激活 optional / 跳过）时，校验已过即直接跳转，不再二次等待用户确认。
+    if (advanceRequest?.mode === 'target' && advanceRequest.target) {
+      const targetFound = findPhaseById(wf.stages, advanceRequest.target)
+      if (!targetFound) {
+        const feedback = `❌ advance-phase target=${advanceRequest.target} 未找到，请确认 phase id 后重试。`
+        this.msgRepo.create({
+          repo_task_id: repoTaskId,
+          phase_id: phase.id,
+          role: 'system',
+          content: feedback,
+        })
+        this.taskRepo.updatePhase(repoTaskId, stage.id, phase.id, 'running')
+        await this.executePhase(repoTaskId, phase, stage, feedback)
+        return
+      }
+      if (targetFound.phase.optional)
+        this.activatePhase(repoTaskId, targetFound.phase.id)
+      this.taskRepo.updatePhase(repoTaskId, targetFound.stage.id, targetFound.phase.id, 'running')
+      // A3: 透传 agent 在 advance-phase 工具里写入的 note，作为跨阶段的补充说明。
+      const note = advanceRequest.note ? `\n\n> 上一阶段备注：${advanceRequest.note}` : ''
+      const followUp = `已进入阶段「${targetFound.phase.name}」。请按工作流 Skill 总览中对应 phase 的指引继续，完成后再次调用 advance-phase 工具。${note}`
+      await this.executePhase(repoTaskId, targetFound.phase, targetFound.stage, followUp)
+      return
+    }
+
     if (phase.requires_confirm && !shouldAutoAdvance) {
-      if (agentSignal !== 'complete') {
+      if (!agentDeclaredComplete) {
         this.msgRepo.create({
           repo_task_id: repoTaskId,
           phase_id: phase.id,
@@ -2044,7 +2167,26 @@ export class WorkflowEngine {
     }
 
     this.taskRepo.updatePhase(repoTaskId, next.stage.id, next.phase.id, 'running')
-    await this.executePhase(repoTaskId, next.phase, next.stage)
+    // 单会话模式下，自动推进到下一 phase 时通过 follow-up user message 触发 resume，
+    // 避免重新注入完整 system prompt（让 agent 复用现有会话）。
+    // A3: 透传 agent 写入的 note。
+    const note = advanceRequest?.note ? `\n\n> 上一阶段备注：${advanceRequest.note}` : ''
+    const followUp = `已进入阶段「${next.phase.name}」。请按工作流 Skill 总览中对应 phase 的指引继续，完成后再次调用 advance-phase 工具。${note}`
+    await this.executePhase(repoTaskId, next.phase, next.stage, followUp)
+  }
+
+  /**
+   * A1: 记录某 phase 的 advance-phase 门禁连续失败次数，返回是否已达上限。
+   */
+  private bumpGateFailAndExceeded(repoTaskId: string, phaseId: string): boolean {
+    const key = `${repoTaskId}:${phaseId}`
+    const n = (this.gateFailCounts.get(key) ?? 0) + 1
+    this.gateFailCounts.set(key, n)
+    return n >= WorkflowEngine.MAX_GATE_FAILS
+  }
+
+  private clearGateFailCount(repoTaskId: string, phaseId: string): void {
+    this.gateFailCounts.delete(`${repoTaskId}:${phaseId}`)
   }
 
   // ── 阶段导航 ──
@@ -2113,23 +2255,6 @@ export class WorkflowEngine {
 
     return (current.stageIdx * 10000 + current.phaseIdx)
       > (target.stageIdx * 10000 + target.phaseIdx)
-  }
-
-  /**
-   * 从 Agent 输出中解析状态标记。
-   * Agent 应在回复末尾附加 <<PHASE_COMPLETE>> 或 <<PENDING_INPUT>>。
-   */
-  private parsePhaseSignal(output?: string): 'complete' | 'pending_input' | null {
-    if (!output) return null
-    // 扫描末尾 2000 字符以容忍 agent 在信号后追加 token 统计 / shutdown 日志。
-    const tail = output.slice(-2000)
-    if (tail.includes('<<PENDING_INPUT>>')) return 'pending_input'
-    if (tail.includes('<<PHASE_COMPLETE>>')) return 'complete'
-    return null
-  }
-
-  private stripPhaseSignals(text: string): string {
-    return text.replace(/\s*<<(?:PHASE_COMPLETE|PENDING_INPUT)>>\s*/g, '').trimEnd()
   }
 
   /**

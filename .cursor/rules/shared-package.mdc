@@ -1,5 +1,5 @@
 ---
-description: "@code-agent/shared 公共能力强制使用规范（CLI / LLM / lark-cli / MCP / Node HTTP / SQLite / 错误与 JSON / Prompt）"
+description: "@code-agent/shared 公共能力强制使用规范（lark-cli / MCP / Node HTTP / SQLite / 错误与 JSON / Prompt）"
 alwaysApply: true
 ---
 
@@ -12,9 +12,7 @@ alwaysApply: true
 
 | 场景 | 必须使用 | 禁止 |
 |---|---|---|
-| spawn agent CLI（cursor-cli / claude-code / codex） | `@code-agent/shared/cli` 的 `CliRunner.run` + `buildCliArgs` + `buildAgentEnv` + `resolveBinary` | 直接 `child_process.spawn` 拼参数、自写 stream 解析 |
-| 解析 agent CLI stdout（think 标签 / activity / sessionId / token） | `stream-parse.ts` 导出的 `extractStreamText` / `extractActivityEntry` / `extractSessionId` / `extractTokenUsage` / `parseJsonOutput` | 在调用点重写正则、JSON 拆包逻辑 |
-| Anthropic SDK 客户端 / 单轮调用 | `@code-agent/shared/llm` 的 `createLlmClient` + `callAnthropic` | 直接 `new Anthropic()`、自己处理 `content[].text` 与 `usage` |
+| 运行 agent（workflow / orchestrator / review / consult 的 LLM 调用） | `@cursor/sdk` 经 `packages/sidecar/src/providers/` 的 `CursorSdkProvider` / `createCursorSdkProvider`（单轮用 `Agent.prompt`） | 直接 `child_process.spawn` 拼 CLI 参数、`new Anthropic()`、自写 stream 解析 |
 | 调 `lark-cli` 子进程 | `@code-agent/shared/lark` 的 `runLarkCli` / `runLarkCliJson` / `isLarkCliInstalled` | 直接 `execFile('lark-cli', ...)`、自己解析 JSON 输出 |
 | 飞书云文档（Docx / Wiki）增删查改 | `@code-agent/shared/lark` 的 `createDoc` / `fetchDoc` / `overwriteDoc` / `appendDoc` / `fetchLarkDocContent` / `parseLarkDocUrl` | 在 sidecar 内重写文档操作逻辑 |
 | 检查 lark-cli 登录状态 | `getLarkAuthStatus` | 自己跑 `auth status` 解析 |
@@ -28,14 +26,13 @@ alwaysApply: true
 ## sidecar 专属强约束
 
 1. **AgentProvider 实例化**：必须通过 `packages/sidecar/src/providers/factory.ts`
-   的 `loadAgentRuntimeFromSettings` + `createCliProvider` / `createApiProvider`，
-   不允许在新代码里直接 `new ExternalCliProvider(...)` 或 `new ApiProvider(...)`。
+   的 `loadAgentRuntimeFromSettings` + `createCursorSdkProvider`，
+   不允许在新代码里直接 `new CursorSdkProvider(...)` 或绕过工厂直接调 `Agent.create`。
    `WorkflowEngine.resolveProvider` 与 `Orchestrator.resolveProviderForRole` 是已有的两个统一入口。
 
-2. **代理副作用**：CLI provider 的代理通过 `buildAgentEnv` 注入子进程，
-   **不要在新增路径上重复写 `process.env.HTTP_PROXY = ...`**；
-   仅 ApiProvider（走 fetch）路径下需要由 `sidecar/src/index.ts` 的 `syncProcessProxyEnv` 统一同步，
-   其它地方不要写。
+2. **代理副作用**：`@cursor/sdk` 走进程内 connectrpc/http，代理由 `sidecar/src/index.ts` 的
+   `syncProcessProxyEnv` 统一同步到 `process.env.HTTP_PROXY` 等，
+   **不要在新增路径上重复写 `process.env.HTTP_PROXY = ...`**。
 
 3. **review-server HTTP 透传**：sidecar 调 review-server 必须通过
    `packages/sidecar/src/review/client.ts` 的 `ReviewServerClient`，
@@ -71,36 +68,30 @@ alwaysApply: true
 3. **新增导出**必须同时：
    - 在对应 `src/<module>/index.ts` 显式导出（保持类型 + 值分组）
    - 在 `packages/shared/__tests__/<module>/` 添加单元测试
-   - 在 `packages/shared/package.json` 的 `exports` 字段里已声明 subpath（`./util` `./http` `./db` `./cli` `./llm` `./lark` `./mcp`）→ 不要新建 subpath 入口（如确需新建，必须同步更新 `package.json#scripts.build` 的 entry 列表）
+   - 在 `packages/shared/package.json` 的 `exports` 字段里已声明 subpath（`./util` `./http` `./db` `./lark` `./meegle` `./mcp`）→ 不要新建 subpath 入口（如确需新建，必须同步更新 `package.json#scripts.build` 的 entry 列表）
 
 ## 反例 / 触发提醒
 
 写出下列任一模式时立即停下，改用公共能力：
 
 - `child_process.spawn('cursor-agent', ...)` / `spawn('codex', ...)` / `spawn('lark-cli', ...)`
-- `new Anthropic({ apiKey, baseURL })`
+- `new Anthropic({ apiKey, baseURL })` / 绕过 `createCursorSdkProvider` 直接 `Agent.create`
 - `req.on('data', ...)` / `req.on('end', ...)` 自己拼 body
 - `res.writeHead(200, ...)` 后手写 JSON.stringify
 - `new Database(path)` 后再 `db.pragma('journal_mode=WAL')`
 - `fetch(reviewServerBaseUrl + '/api/...')`（在 `apps/` 下）
-- 自写正则提取 `<think>` 标签或 `session_id` 字段
 
 ## 索引：包结构速查
 
 ```
 packages/shared/src/
-  util/   errorMessage / tryParseJson / tryParseJsonLoose / stripJsonFences / PromptBuilder
+  util/   errorMessage / tryParseJson / tryParseJsonLoose / stripJsonFences / PromptBuilder / normalizeSlug
   http/   readBody / sendJson / sendError / parseRequest / applyCors / extractClientIp
   db/     createSqliteConnection
-  cli/    CliRunner / buildCliArgs / buildAgentEnv / buildSniProxyPatch / resolveBinary
-          + stream-parse: extractStreamText / extractActivityEntry / extractActivityEvent
-                          / formatDeltaEntry / extractSessionId
-                          / extractTokenUsage / parseStreamResult / parseJsonOutput
-                          / normalizeLine / stripThinkTags
-  llm/    createLlmClient / callAnthropic
   lark/   parseLarkDocUrl / runLarkCli / runLarkCliJson / isLarkCliInstalled
           / createDoc / fetchDoc / overwriteDoc / appendDoc / fetchLarkDocContent
           / getLarkAuthStatus
+  meegle/ getWorkItem / listMetaFields / updateWorkItem
   mcp/    McpHttpSession / parseMcpResponseText
 ```
 

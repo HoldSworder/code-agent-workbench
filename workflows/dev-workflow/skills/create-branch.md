@@ -57,23 +57,16 @@ git symbolic-ref --short refs/remotes/origin/HEAD
 - 当前 task 模型只支持单飞书链接，多链接请等后续扩展。
 - 解析失败（URL 为空 / 不匹配）：跳到「降级路径」。
 
-## 步骤 4：通过 lark-project MCP 查询任务详情
+## 步骤 4：确定任务名称与迭代
 
-本 phase 已注入 `lark-project` MCP，直接调用其 `get_workitem_brief` 工具：
+需求信息已由 engine 通过飞书项目（meegle）预先拉取并注入到 prompt 顶部「## 需求」段，**直接取用，不要调用任何 MCP 工具**：
 
-```json
-{
-  "work_item_id": "<WORK_ITEM_ID>",
-  "fields": ["名称", "规划迭代", "ID"]
-}
-```
+- `TASK_NAME` ← `{{requirement_title}}`（prompt 已提供的需求标题）
+- `ITER` ← `unknown`（当前 prompt 不提供「规划迭代」信息，分支名走「无迭代」格式）
 
-从返回结果取：
+> 重要：本 phase **未注入任何 MCP**。早期通过 `lark-project` MCP 查询工作项的方式已彻底下线，需求名称改由 engine 直接注入。**严禁**尝试调用 `get_workitem_brief` 等 MCP 工具——会话里不存在该工具，调用会直接导致本次 run 失败。
 
-- `TASK_NAME` ← `名称` 字段
-- 规划迭代字段是一个工作项引用，再次调用 `get_workitem_brief` 拿迭代工作项的 `名称`，从中提取数字部分作为 `ITER`（例：`Sprint124` → `124`、`迭代42` → `42`）
-
-任一步失败：将对应变量置为 `unknown`，继续往下走，**不要**因此终止。
+`TASK_NAME` 为空（极少数情况）：置为 `unknown`，继续往下走，**不要**因此终止。
 
 ## 步骤 5：格式化分支名
 
@@ -132,5 +125,6 @@ WORKTREE_CREATED branch=<BRANCH> path=.worktrees/<SLUG> base=<BASE_REF> work_ite
 - **禁止**用 `git checkout -b` 在主仓库创建分支；必须用 `git worktree add -b ... <base>` 一步完成
 - **禁止**预创建 `.worktrees/<SLUG>` 目录；`git worktree add` 自己负责建目录
 - **禁止**使用 `--force`；同名分支或 worktree 已存在时报错并提示用户处理
-- 飞书 MCP 查询失败：用 `unknown` 占位继续，**不要**终止 phase；无飞书链接：走降级路径
+- **禁止**调用任何 MCP 工具（本 phase 未注入 MCP，`get_workitem_brief` 等不存在，调用会使 run 失败）
+- 需求标题缺失：用 `unknown` 占位继续，**不要**终止 phase；无飞书链接：走降级路径
 - 失败时输出明确错误并退出；engine 的 post-phase 钩子会检测到「没有新 worktree」并把任务标为失败

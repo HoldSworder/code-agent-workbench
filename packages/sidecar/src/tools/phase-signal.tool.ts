@@ -1,22 +1,5 @@
-import { resolve, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { WorkflowTool, ToolInjectionContext } from './types'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-function resolveScriptPath(): string {
-  const devPath = resolve(__dirname, '..', '..', '..', '..', 'tools', 'phase-signal', 'run.mjs')
-  const prodPath = resolve(__dirname, '..', '..', '..', 'tools', 'phase-signal', 'run.mjs')
-  try {
-    // eslint-disable-next-line ts/no-require-imports
-    const { existsSync } = require('node:fs') as typeof import('node:fs')
-    if (existsSync(devPath)) return devPath
-    if (existsSync(prodPath)) return prodPath
-  }
-  catch { /* fallback */ }
-  return devPath
-}
+import { resolveToolScript } from './resolve-script'
 
 export const phaseSignalTool: WorkflowTool = {
   id: 'phase-signal',
@@ -30,7 +13,7 @@ export const phaseSignalTool: WorkflowTool = {
   },
 
   resolveScript(_ctx: ToolInjectionContext): string | null {
-    return resolveScriptPath()
+    return resolveToolScript('phase-signal', 'run.mjs')
   },
 
   getPromptSection(ctx: ToolInjectionContext, scriptAbsPath: string): string {

@@ -1,7 +1,6 @@
 import type Database from 'better-sqlite3'
-import type { SniProxyPatch } from '@code-agent/shared/cli'
 import type { AgentProvider, RunOptions } from '../providers/types'
-import { createCliProvider, loadAgentRuntimeFromSettings } from '../providers/factory'
+import { createCursorSdkProvider, loadAgentRuntimeFromSettings } from '../providers/factory'
 import { SettingsRepository } from '../db/repositories/settings.repo'
 import { OrchestratorRepository } from './repository'
 import { LeaderLoop } from './leader'
@@ -15,7 +14,6 @@ export interface OrchestratorOptions {
   teamYamlPath: string
   repoPath: string
   defaultBranch?: string
-  sniProxyPatch?: SniProxyPatch
   onChunk?: RunOptions['onChunk']
   onEvent?: (event: string, data?: unknown) => void
 }
@@ -151,12 +149,9 @@ export class Orchestrator {
   // ── Provider factory (1A: independent from WorkflowEngine) ──
 
   private resolveProviderForRole(role: RoleConfig): AgentProvider {
-    const runtime = loadAgentRuntimeFromSettings(this.settings, {
-      sniProxyPatch: this.options.sniProxyPatch,
-    })
-    return createCliProvider({
+    const runtime = loadAgentRuntimeFromSettings(this.settings)
+    return createCursorSdkProvider({
       runtime,
-      agentOverride: role.provider,
       modelOverride: role.model || undefined,
     })
   }

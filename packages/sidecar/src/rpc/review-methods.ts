@@ -13,7 +13,7 @@ import { ReviewServerClient } from '../review/client'
 import { listViewItems } from '../review/meegle-view'
 import type { NormalizedViewItem } from '../review/meegle-view'
 import { detectStoryPointFields, flattenFieldList, type DetectStoryPointFieldsResult, type StoryPointFieldRef } from '../review/story-point-detector'
-import { isCliProvider, loadAgentRuntimeFromSettings, type AgentRuntimeSettings } from '../providers/factory'
+import { loadAgentRuntimeFromSettings, type AgentRuntimeSettings } from '../providers/factory'
 
 export type { LarkIdentityResult }
 
@@ -37,25 +37,17 @@ export function registerReviewMethods(server: RpcServer, db: Database.Database):
   const settingsRepo = new SettingsRepository(db)
 
   /**
-   * 实时从设置解析 LLM runtime（CLI provider 或 custom-api），避免 sidecar 启动后无法热更新。
+   * 实时从设置解析 LLM runtime（cursor-sdk），避免 sidecar 启动后无法热更新。
    * 返回值传给 review LLM 流程（design 生成 / 故事点评估）。
    */
   function resolveLlmRuntime(): AgentRuntimeSettings {
     return loadAgentRuntimeFromSettings(settingsRepo)
   }
 
-  /**
-   * 双分支前置校验：
-   * - custom-api：必须配置 apiKey，否则提示去设置页填；
-   * - CLI provider：runCliSingleShot 自身会兜底报「CLI 未在 PATH」错误，这里不强制校验，
-   *   避免重复 spawn 一次纯探测请求。
-   */
+  /** 前置校验：cursor-sdk 必须配置 Cursor API Key。 */
   function assertLlmConfigured(rt: AgentRuntimeSettings): void {
-    if (rt.provider === 'custom-api' && !rt.apiKey) {
-      throw new Error('当前 agent.provider 为 custom-api，请到桌面端「设置」页填写 agent.apiKey 后重试。')
-    }
-    if (!isCliProvider(rt.provider) && rt.provider !== 'custom-api') {
-      throw new Error(`未识别的 agent.provider：${String(rt.provider)}；请在桌面端「设置」页选择 cursor-cli/claude-code/codex 或 custom-api。`)
+    if (!rt.cursorApiKey) {
+      throw new Error('未配置 Cursor API Key，请到桌面端「设置」页填写后重试。')
     }
   }
 

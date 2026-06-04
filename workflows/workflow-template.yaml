@@ -75,6 +75,10 @@ description: >-
 #   file_section_matches     — 文件中 after 标记之后的内容匹配 pattern（正则）
 #   file_section_not_matches — 文件中 after 标记之后的内容不匹配 pattern
 #   command_succeeds  — 在 worktree 中执行 command，exit 0 = 通过
+#   llm_judge         — 由 LLM 判定语义/质量条件（prompt = 判定标准，
+#                       context_files = 喂给 LLM 的证据文件，可选）。
+#                       仅在 entry_gate / completion_check 的权威路径生效；
+#                       缺 Cursor API Key 或调用异常时 fail-open（视为通过）。
 #
 # gate_definitions:
 #   has_spec_files:
@@ -100,6 +104,16 @@ description: >-
 #     checks:
 #       - type: command_succeeds
 #         command: "git diff --quiet && git diff --cached --quiet"
+#
+#   spec_quality_ok:
+#     description: proposal/spec 质量达标（客观存在性 + LLM 质量判定混合）
+#     checks:
+#       - type: exists
+#         path: "{{openspec_path}}/proposal.md"
+#       - type: llm_judge
+#         prompt: "proposal.md 是否清晰描述了背景、目标与验收标准？覆盖不全则判 FAIL。"
+#         context_files:
+#           - "{{openspec_path}}/proposal.md"
 
 # ============================================================
 # guardrail_definitions — 护栏定义（可选）

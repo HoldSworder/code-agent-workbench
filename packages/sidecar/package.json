@@ -10,9 +10,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.82.0",
-    "@blowmage/cursor-agent-acp": "^0.7.1",
     "@code-agent/shared": "workspace:*",
+    "@cursor/sdk": "^1.0.15",
     "better-sqlite3": "^12.8.0",
     "undici": "^8.0.2",
     "yaml": "^2.8.3",

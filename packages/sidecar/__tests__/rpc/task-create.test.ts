@@ -12,12 +12,15 @@ import * as gitOps from '../../src/git/operations'
 const WORKFLOW_YAML = `
 name: test
 description: test workflow
-phases:
-  - id: design
-    name: 设计
-    requires_confirm: false
-    provider: api
-    skill: skills/design.md
+stages:
+  - id: main
+    name: 主阶段
+    phases:
+      - id: design
+        name: 设计
+        requires_confirm: false
+        provider: api
+        skill: skills/design.md
 `
 
 describe('task.create RPC', () => {
